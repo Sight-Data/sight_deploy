@@ -49,7 +49,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-TOOL_VERSION = "2.0.0"
+TOOL_VERSION = "2.0.1"
 CONF_DIR = Path(os.environ.get("SIGHT_DEPLOY_HOME") or (Path.home() / ".sight-deploy"))
 FROZEN = getattr(sys, "frozen", False)
 # 程序所在目录：打包后是 exe/.app 所在目录（用来找同目录下的安装包），源码运行是本文件目录
@@ -1189,7 +1189,8 @@ class Remote:
             return None
         if isinstance(j, dict) and "status" not in j and isinstance(j.get("data"), dict):
             j = j["data"]  # 兼容被统一响应体包装的情况
-        return j if isinstance(j, dict) else None
+        # 必须是产品的健康检查结果：端口上是别的程序（如返回 {"code":401,...} 的统一响应体）时不算
+        return j if isinstance(j, dict) and "status" in j else None
 
     def app_version(self, port):
         st, body = self.http_get(port, "/api/app/version")
@@ -1479,6 +1480,17 @@ for p in $(pgrep -f -- "$JAR" 2>/dev/null); do
   else netstat -ltnp 2>/dev/null | grep " $p/" | awk '{print $4}'; fi | sed -E 's/.*[:.]([0-9]+)$/pid_port=\1/'
 done
 if [ -f "$D/data/work/database.config" ]; then echo "dbconf=$(tr -d '\n' < "$D/data/work/database.config")"; fi
+# 外部配置文件里的 server.port（按 Spring Boot 的优先级顺序输出，取第一个）
+for f in "$D/config/application.properties" "$D/config/application.yml" "$D/config/application.yaml" \
+         "$D/application.properties" "$D/application.yml" "$D/application.yaml"; do
+  [ -f "$f" ] || continue
+  case "$f" in
+    *.properties) sed -n -E 's/^[[:space:]]*server\.port[[:space:]]*[=:][[:space:]]*([0-9]+).*/cfgport=\1/p' "$f" | head -1 ;;
+    *) awk '/^server\.port:/{gsub(/[^0-9]/,"",$2); if($2!=""){print "cfgport="$2; exit}}
+            /^server:/{s=1; next} /^[^[:space:]#]/{s=0}
+            s && /^[[:space:]]+port:/{gsub(/[^0-9]/,"",$2); if($2!=""){print "cfgport="$2; exit}}' "$f" ;;
+  esac
+done
 [ -f "$D/__MARKER__" ] && echo "marker=$(tr -d '\n' < "$D/__MARKER__")"
 d="$D"; df -Pk "$d" 2>/dev/null | awk 'NR==2{print "disk_free_mb=" int($4/1024)}'
 true
@@ -1544,7 +1556,7 @@ def inspect_install(r, product, install_dir):
     args0 = (as_list(kv.get("pid_args")) or [""])[0]
     m = re.search(r"--spring\.profiles\.active=(\S+)", args0)
     inst["profile"] = inst["marker"].get("profile") or (m.group(1) if m else "prod")
-    # 端口：进程环境 > unit/drop-in > 进程参数 > 标记文件 > 默认
+    # 端口：进程环境 > unit/drop-in > 进程参数 > 安装目录下的配置文件 > 标记文件 > 默认
     port = None
     texts = as_list(kv.get("unitline")) + as_list(kv.get("pid_args"))
     if proc_env.get("SERVER_PORT"):
@@ -1555,7 +1567,17 @@ def inspect_install(r, product, install_dir):
             if m:
                 port = int(m.group(1))
                 break
-    inst["port"] = port or inst["marker"].get("port") or p["port"]
+    port = port or _int((as_list(kv.get("cfgport")) or [""])[0]) or inst["marker"].get("port") or p["port"]
+    # 进程在运行：以它实际监听的端口为准。推断出的端口可能根本不是它的（比如默认端口被同机别的程序占着），
+    # 拿别人的接口当健康检查，会得出「未初始化」之类的错误结论。
+    lps = inst["listen_ports"]
+    if lps and port not in lps:
+        real = next((x for x in lps if r.health(x)), None)
+        if real is None and len(lps) == 1:
+            real = lps[0]
+        if real:
+            port = real
+    inst["port"] = port
     # 数据库
     inst["db"] = classify_db(kv.get("dbconf"), texts, install_dir)
     # 版本（读 jar 的 MANIFEST，经 SFTP 随机读取，几 KB 流量）
@@ -2185,7 +2207,7 @@ def do_install(ctx, r, pkg):
         show_logs(r, product, inst_dir, use_systemd)
         raise DeployError("服务没能正常启动", "看上面的日志；修正后可在产品卡上点「启动」或「重启」")
     open_firewall(r, env, port)
-    url_path = "/" if h and h.get("bootstrapped") else "/setup"
+    url_path = "/setup" if h and h.get("bootstrapped") is False else "/"
     url = "http://%s:%d%s" % (r.host, port, url_path)
     reach = client_can_reach(r.host, port)
     step("安装完成")
@@ -2700,7 +2722,7 @@ def job_status(ctx, p):
             running = bool(inst["pids"]) or inst["active"] == "active"
             bdir = backup_dir_for(ctx, r, prod, inst["dir"])
             bs = list_backups(r, bdir, prod)
-            boot = bool(h and h.get("bootstrapped"))
+            boot = h.get("bootstrapped") if h else None  # 拿不到就是「不知道」，界面不提示未初始化
             item = {"product": prod, "name": P["name"], "installed": True, "version": inst["version"],
                     "dir": inst["dir"], "owner": inst["owner"],
                     "service": "systemd" if inst["unit"] else "process", "active": inst["active"] or "",
@@ -3332,6 +3354,11 @@ class Handler(BaseHTTPRequestHandler):
 def _shutdown():
     time.sleep(0.3)
     LOG.write("===== 退出 =====")
+    for fn in _TRAY_CLEANUP:
+        try:
+            fn()
+        except Exception:
+            pass
     try:  # 只删自己写的（防止两个实例同时启动时互删）
         f = CONF_DIR / "instance.json"
         if json.loads(f.read_text(encoding="utf-8")).get("pid") == os.getpid():
@@ -3427,6 +3454,167 @@ def _open_browser(url):
             pass
 
 
+_TRAY_CLEANUP = []  # 退出前要做的收尾（删托盘图标；不删的话图标会残留到鼠标划过才消失）
+
+
+def _win_tray(url):
+    """Windows：在任务栏通知区（右下角）放一个图标，右键菜单「打开操作界面 / 退出」，双击打开界面。
+    打包后的 exe 没有任何窗口，没有这个图标用户既看不出程序在运行，也关不掉它。
+    只用 Win32 API（ctypes），不引入额外依赖；任何一步失败都只记日志，不影响主程序。"""
+    import ctypes
+    from ctypes import wintypes as W
+    u32, s32, k32 = ctypes.windll.user32, ctypes.windll.shell32, ctypes.windll.kernel32
+    LRESULT = ctypes.c_ssize_t
+    WNDPROC = ctypes.WINFUNCTYPE(LRESULT, W.HWND, W.UINT, W.WPARAM, W.LPARAM)
+
+    class WNDCLASSW(ctypes.Structure):
+        _fields_ = [("style", W.UINT), ("lpfnWndProc", WNDPROC), ("cbClsExtra", ctypes.c_int),
+                    ("cbWndExtra", ctypes.c_int), ("hInstance", W.HINSTANCE), ("hIcon", W.HICON),
+                    ("hCursor", W.HANDLE), ("hbrBackground", W.HBRUSH), ("lpszMenuName", W.LPCWSTR),
+                    ("lpszClassName", W.LPCWSTR)]
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", W.DWORD), ("Data2", W.WORD), ("Data3", W.WORD), ("Data4", ctypes.c_ubyte * 8)]
+
+    class NOTIFYICONDATAW(ctypes.Structure):
+        _fields_ = [("cbSize", W.DWORD), ("hWnd", W.HWND), ("uID", W.UINT), ("uFlags", W.UINT),
+                    ("uCallbackMessage", W.UINT), ("hIcon", W.HICON), ("szTip", W.WCHAR * 128),
+                    ("dwState", W.DWORD), ("dwStateMask", W.DWORD), ("szInfo", W.WCHAR * 256),
+                    ("uVersion", W.UINT), ("szInfoTitle", W.WCHAR * 64), ("dwInfoFlags", W.DWORD),
+                    ("guidItem", GUID), ("hBalloonIcon", W.HICON)]
+
+    u32.DefWindowProcW.argtypes = [W.HWND, W.UINT, W.WPARAM, W.LPARAM]
+    u32.DefWindowProcW.restype = LRESULT
+    u32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+    u32.RegisterClassW.restype = W.ATOM
+    u32.CreateWindowExW.argtypes = [W.DWORD, W.LPCWSTR, W.LPCWSTR, W.DWORD, ctypes.c_int, ctypes.c_int,
+                                    ctypes.c_int, ctypes.c_int, W.HWND, W.HMENU, W.HINSTANCE, W.LPVOID]
+    u32.CreateWindowExW.restype = W.HWND
+    u32.RegisterWindowMessageW.argtypes = [W.LPCWSTR]
+    u32.RegisterWindowMessageW.restype = W.UINT
+    u32.LoadIconW.argtypes = [W.HINSTANCE, W.LPVOID]
+    u32.LoadIconW.restype = W.HICON
+    s32.ExtractIconW.argtypes = [W.HINSTANCE, W.LPCWSTR, W.UINT]
+    s32.ExtractIconW.restype = W.HICON
+    s32.Shell_NotifyIconW.argtypes = [W.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
+    s32.Shell_NotifyIconW.restype = W.BOOL
+    k32.GetModuleHandleW.argtypes = [W.LPCWSTR]
+    k32.GetModuleHandleW.restype = W.HMODULE
+    u32.CreatePopupMenu.restype = W.HMENU
+    u32.AppendMenuW.argtypes = [W.HMENU, W.UINT, ctypes.c_size_t, W.LPCWSTR]
+    u32.SetMenuDefaultItem.argtypes = [W.HMENU, W.UINT, W.UINT]
+    u32.TrackPopupMenu.argtypes = [W.HMENU, W.UINT, ctypes.c_int, ctypes.c_int, ctypes.c_int, W.HWND, W.LPVOID]
+    u32.TrackPopupMenu.restype = W.BOOL
+    u32.DestroyMenu.argtypes = [W.HMENU]
+    u32.GetCursorPos.argtypes = [ctypes.POINTER(W.POINT)]
+    u32.SetForegroundWindow.argtypes = [W.HWND]
+    u32.PostMessageW.argtypes = [W.HWND, W.UINT, W.WPARAM, W.LPARAM]
+    u32.MessageBoxW.argtypes = [W.HWND, W.LPCWSTR, W.LPCWSTR, W.UINT]
+    u32.GetMessageW.argtypes = [ctypes.POINTER(W.MSG), W.HWND, W.UINT, W.UINT]
+    u32.GetMessageW.restype = W.BOOL
+    u32.TranslateMessage.argtypes = [ctypes.POINTER(W.MSG)]
+    u32.DispatchMessageW.argtypes = [ctypes.POINTER(W.MSG)]
+    u32.DispatchMessageW.restype = LRESULT
+
+    WM_APP_TRAY, WM_NULL = 0x8001, 0x0000
+    WM_LBUTTONDBLCLK, WM_RBUTTONUP = 0x0203, 0x0205
+    NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
+    NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_INFO = 0x1, 0x2, 0x4, 0x10
+    ID_OPEN, ID_QUIT = 1, 2
+    title = "Sight 部署助手"
+    hinst = k32.GetModuleHandleW(None)
+    taskbar_created = u32.RegisterWindowMessageW("TaskbarCreated")  # 资源管理器重启后要重新加图标
+
+    nid = NOTIFYICONDATAW()
+    nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+    nid.uID = 1
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+    nid.uCallbackMessage = WM_APP_TRAY
+    nid.hIcon = (s32.ExtractIconW(hinst, sys.executable, 0) if FROZEN else None) or u32.LoadIconW(None, 32512)
+    nid.szTip = "%s %s（运行中）" % (title, TOOL_VERSION)
+
+    def quit_():
+        if APP.busy() and u32.MessageBoxW(nid.hWnd, "有任务正在进行，现在退出会中断它。\n确定要退出吗？", title,
+                                          0x4 | 0x30 | 0x40000) != 6:  # MB_YESNO|MB_ICONWARNING|MB_TOPMOST；6=IDYES
+            return
+        LOG.write("  [托盘] 退出")
+        threading.Thread(target=_shutdown, daemon=True).start()
+
+    def menu(hwnd):
+        m = u32.CreatePopupMenu()
+        u32.AppendMenuW(m, 0, ID_OPEN, "打开操作界面")
+        u32.AppendMenuW(m, 0x800, 0, None)  # 分隔线
+        u32.AppendMenuW(m, 0, ID_QUIT, "退出")
+        u32.SetMenuDefaultItem(m, ID_OPEN, 0)
+        pt = W.POINT()
+        u32.GetCursorPos(ctypes.byref(pt))
+        u32.SetForegroundWindow(hwnd)  # 不先置前，菜单点别处不会自动收起
+        cmd = u32.TrackPopupMenu(m, 0x0100 | 0x0020, pt.x, pt.y, 0, hwnd, None)  # TPM_RETURNCMD|TPM_RIGHTBUTTON
+        u32.PostMessageW(hwnd, WM_NULL, 0, 0)
+        u32.DestroyMenu(m)
+        if cmd == ID_OPEN:
+            _open_browser(url)
+        elif cmd == ID_QUIT:
+            quit_()
+
+    def wndproc(hwnd, msg, wp, lp):
+        try:
+            if msg == WM_APP_TRAY:
+                ev = lp & 0xFFFF
+                if ev == WM_LBUTTONDBLCLK:
+                    _open_browser(url)
+                elif ev == WM_RBUTTONUP:
+                    menu(hwnd)
+                return 0
+            if msg == taskbar_created and taskbar_created:
+                s32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid))
+                return 0
+        except Exception as e:
+            LOG.write("  [托盘] %s" % e)
+        return u32.DefWindowProcW(hwnd, msg, wp, lp)
+
+    proc = WNDPROC(wndproc)
+    wc = WNDCLASSW()
+    wc.lpfnWndProc = proc
+    wc.hInstance = hinst
+    wc.lpszClassName = "SightDeployTray"
+    if not u32.RegisterClassW(ctypes.byref(wc)):
+        raise OSError("RegisterClassW 失败")
+    hwnd = u32.CreateWindowExW(0, wc.lpszClassName, title, 0, 0, 0, 0, 0, None, None, hinst, None)
+    if not hwnd:
+        raise OSError("CreateWindowExW 失败")
+    nid.hWnd = hwnd
+    if not s32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)):
+        raise OSError("Shell_NotifyIconW 失败")
+    _TRAY_CLEANUP.append(lambda: s32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid)))
+    # 启动提示（Win10/11 显示为通知横幅）：告诉用户程序在后台、去哪里找
+    nid.uFlags = NIF_INFO
+    nid.szInfoTitle = "%s 已在后台运行" % title
+    nid.szInfo = "操作界面在浏览器里。双击右下角的这个图标可以重新打开界面，右键可以退出程序。"
+    nid.dwInfoFlags = 0x1 | 0x10  # NIIF_INFO | NIIF_NOSOUND
+    s32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+    LOG.write("  [托盘] 图标已加到任务栏通知区")
+    msg = W.MSG()
+    while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+        u32.TranslateMessage(ctypes.byref(msg))
+        u32.DispatchMessageW(ctypes.byref(msg))
+    _ = proc  # 回调对象必须活到消息循环结束
+
+
+def _start_tray(url):
+    if os.name != "nt":
+        return
+
+    def run():
+        try:
+            _win_tray(url)
+        except Exception as e:
+            LOG.write("  [托盘] 没能创建任务栏图标：%s" % e)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 def main():
     global APP
     # Windows 无控制台打包时 stdout / stderr 为 None；用 utf-8 打开空设备（默认编码是系统代码页，写中文会抛异常）
@@ -3472,6 +3660,7 @@ def main():
     _say("Sight 部署助手 %s 已启动：%s" % (TOOL_VERSION, url))
     _say("（浏览器没自动打开的话，把上面的地址复制到浏览器；关闭浏览器 10 分钟后程序自动退出）")
     threading.Thread(target=_watchdog, daemon=True).start()
+    _start_tray(url)
     if not no_browser:
         threading.Timer(0.5, _open_browser, args=(url,)).start()
     LOG.write("开始处理网页请求")
