@@ -3105,8 +3105,9 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "SightDeploy/" + TOOL_VERSION
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, *a):
-        pass
+    def log_message(self, fmt, *a):
+        if os.environ.get("SIGHT_DEPLOY_DEBUG"):  # 排查用：记录每个请求
+            LOG.write("  [http] %s %s" % (self.client_address[0], fmt % a))
 
     # ---------------------------------------------------------------- 工具
     def _json(self, obj, code=200):
@@ -3448,6 +3449,7 @@ def main():
     threading.Thread(target=_watchdog, daemon=True).start()
     if not no_browser:
         threading.Timer(0.5, _open_browser, args=(url,)).start()
+    LOG.write("开始处理网页请求")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

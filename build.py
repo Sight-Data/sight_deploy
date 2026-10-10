@@ -109,39 +109,69 @@ def _plist_set(plist, kv):
         plistlib.dump(d, f)
 
 
-def smoke(target):
-    """启动打包产物（不开浏览器），确认能起服务、能读到界面和 /api/state。"""
+def smoke(target=None, cmd=None, label="打包产物"):
+    """启动程序（不开浏览器），确认能起服务、能读到界面和 /api/state、能正常退出。
+    失败时把程序自己的运行日志打出来，方便在 CI 上排查。"""
     if os.environ.get("SKIP_SMOKE"):
         return
-    say("冒烟自检")
-    exe = target / "Contents" / "MacOS" / APP_NAME if target.suffix == ".app" else target
+    say("冒烟自检（%s）" % label)
+    if cmd is None:
+        exe = target / "Contents" / "MacOS" / APP_NAME if target.suffix == ".app" else target
+        cmd = [str(exe)]
     home = Path(tempfile.mkdtemp(prefix="sight-deploy-smoke-"))
     env = dict(os.environ, SIGHT_DEPLOY_HOME=str(home))
     port = "17999"
-    p = subprocess.Popen([str(exe), "--no-browser", "--port", port], env=env,
+    p = subprocess.Popen([str(c) for c in cmd] + ["--no-browser", "--port", port], env=env,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    base = "http://127.0.0.1:%s" % port
+
+    def get(path, token=None, data=None, timeout=15):
+        req = urllib.request.Request(base + path, data=data, method="POST" if data is not None else "GET",
+                                     headers=dict({"X-Token": token} if token else {},
+                                                  **({"Content-Type": "application/json"} if data is not None else {})))
+        return opener.open(req, timeout=timeout).read().decode("utf-8")
+
+    def dump_log():
+        for f in sorted((home / "logs").glob("*.log")) if (home / "logs").is_dir() else []:
+            print("---- %s（最后 60 行）----" % f.name, flush=True)
+            print("\n".join(f.read_text(encoding="utf-8", errors="replace").splitlines()[-60:]), flush=True)
+        print("---- 进程状态：%s ----" % ("运行中" if p.poll() is None else "已退出，退出码 %s" % p.returncode), flush=True)
+
     try:
         inst = home / "instance.json"
-        for _ in range(60):
-            if inst.exists():
-                break
+        t0 = time.time()
+        while not inst.exists():
             if p.poll() is not None:
-                raise SystemExit("打包产物启动失败（退出码 %s）" % p.returncode)
+                dump_log()
+                raise SystemExit("%s启动失败（退出码 %s）" % (label, p.returncode))
+            if time.time() - t0 > 60:
+                dump_log()
+                raise SystemExit("%s 60 秒内没有起来" % label)
             time.sleep(0.5)
-        else:
-            raise SystemExit("打包产物 30 秒内没有起来")
         token = json.loads(inst.read_text(encoding="utf-8"))["token"]
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        html = opener.open("http://127.0.0.1:%s/?t=%s" % (port, token), timeout=10).read().decode("utf-8")
+        last = None
+        while time.time() - t0 < 120:  # 杀毒软件扫描等原因首次响应可能慢，给足时间
+            try:
+                get("/api/ping", token, timeout=10)
+                break
+            except Exception as e:
+                last = e
+                time.sleep(2)
+        else:
+            dump_log()
+            raise SystemExit("%s的网页服务没有响应：%s" % (label, last))
+        print("  服务已响应（%.1f 秒）" % (time.time() - t0), flush=True)
+        html = get("/?t=%s" % token)
         assert "Sight 部署助手" in html, "界面文件没有打进包里"
-        req = urllib.request.Request("http://127.0.0.1:%s/api/state" % port, headers={"X-Token": token})
-        st = json.loads(opener.open(req, timeout=10).read().decode("utf-8"))
+        st = json.loads(get("/api/state", token))
         assert st.get("version"), st
-        req = urllib.request.Request("http://127.0.0.1:%s/api/shutdown" % port, data=b"{}", method="POST",
-                                     headers={"X-Token": token, "Content-Type": "application/json"})
-        opener.open(req, timeout=10).read()
-        p.wait(timeout=15)
+        get("/api/shutdown", token, data=b"{}")
+        p.wait(timeout=20)
         print("  界面、接口、退出均正常", flush=True)
+    except (AssertionError, OSError, ValueError) as e:
+        dump_log()
+        raise SystemExit("%s冒烟自检失败：%s" % (label, e))
     finally:
         if p.poll() is None:
             p.kill()
@@ -172,6 +202,8 @@ def main():
     ver = tool_version()
     say("Sight 部署助手 %s 打包" % ver)
     py = ensure_venv()
+    if os.environ.get("SMOKE_SOURCE"):  # 先用源码方式跑一遍，区分「代码问题」还是「打包问题」
+        smoke(cmd=[py, HERE / "sight_deploy.py"], label="源码")
     work, target = build(py, ver)
     try:
         smoke(target)
