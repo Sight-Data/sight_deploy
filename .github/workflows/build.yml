@@ -1,0 +1,117 @@
+name: Build
+
+# 打 tag（v*）时在 GitHub 托管的 Windows / macOS 真机上打包（PyInstaller 不能交叉编译），
+# 并把产物挂到该 tag 的 Release；也可以在 Actions 页手动 "Run workflow"（只出构建产物，不建 Release）。
+#
+# 版本号以 sight_deploy.py 里的 TOOL_VERSION 为准：发新版先改 TOOL_VERSION、提交，再打同名 tag（如 v2.0.1），
+# tag 与 TOOL_VERSION 对不上时构建直接失败。
+#
+# 产物文件名一律英文（GitHub Artifact / Release 对中文文件名支持不可靠）；程序本身仍叫「Sight部署助手」。
+# 官网（www.sightdata.top）的下载项由 sight-data 主仓库的 scripts/sight-deploy/fetch-release.sh 从 Release 拉取后发布。
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # 打 tag 触发时需要创建 Release 并上传产物
+
+env:
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: "1"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 静态检查
+        run: |
+          pip install -q paramiko pyflakes
+          python -m pyflakes sight_deploy.py build.py web/mock_server.py
+      - name: tag 与 TOOL_VERSION 一致
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          ver=$(python -c "import re;print(re.search(r'^TOOL_VERSION = \"([^\"]+)\"', open('sight_deploy.py', encoding='utf-8').read(), re.M).group(1))")
+          echo "tag=${GITHUB_REF_NAME}  TOOL_VERSION=${ver}"
+          test "${GITHUB_REF_NAME#v}" = "$ver" || { echo "::error::tag ${GITHUB_REF_NAME} 与 sight_deploy.py 的 TOOL_VERSION ${ver} 不一致"; exit 1; }
+      - name: 源码方式启动冒烟（起服务 → 读界面 → 读状态 → 退出）
+        run: |
+          export SIGHT_DEPLOY_HOME=$(mktemp -d)
+          python sight_deploy.py --no-browser --port 17999 &
+          for i in $(seq 1 30); do [ -f "$SIGHT_DEPLOY_HOME/instance.json" ] && break; sleep 1; done
+          T=$(python -c "import json,os;print(json.load(open(os.environ['SIGHT_DEPLOY_HOME']+'/instance.json'))['token'])")
+          curl -sf "http://127.0.0.1:17999/?t=$T" | grep -q "Sight 部署助手"
+          curl -sf -H "X-Token: $T" http://127.0.0.1:17999/api/state | grep -q '"version"'
+          curl -sf -X POST -H "X-Token: $T" -H "Content-Type: application/json" -d '{}' http://127.0.0.1:17999/api/shutdown
+
+  windows:
+    needs: check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 打包 exe（含冒烟自检）
+        id: build
+        run: python build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: ${{ steps.build.outputs.asset }}
+          if-no-files-found: error
+
+  macos:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest      # Apple 芯片
+            arch: arm64
+          - runner: macos-15-intel    # Intel；runner 不可用时不影响发版
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.arch == 'x86_64' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 打包 .app（含冒烟自检）
+        id: build
+        env:
+          MAC_TARGET_ARCH: ${{ matrix.arch }}
+        run: python3 build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-${{ matrix.arch }}
+          path: ${{ steps.build.outputs.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: [check, windows, macos]
+    if: startsWith(github.ref, 'refs/tags/') && !cancelled() && needs.windows.result == 'success' && needs.macos.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - run: ls -la artifacts
+      - name: 创建 / 更新 Release 并挂上产物
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          body: |
+            **下载哪个？**
+            - Windows：`sight-deploy-*-windows-x64.exe`，双击运行
+            - Mac（Apple 芯片）：`sight-deploy-*-mac-arm64.zip`；Intel 芯片：`sight-deploy-*-mac-x86_64.zip`。解压后打开「Sight部署助手.app」（未签名，第一次需右键 → 打开）
+
+            国内也可以在官网下载：https://www.sightdata.top/downloads
