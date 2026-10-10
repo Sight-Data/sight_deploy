@@ -90,6 +90,9 @@ jobs:
         id: build
         env:
           MAC_TARGET_ARCH: ${{ matrix.arch }}
+          # 只用预编译 wheel：新版 cryptography 可能没有 Intel Mac 的 wheel，pip 会从源码编译并链接
+          # 系统里更新的 OpenSSL，打进包后与随包的 libssl 对不上（_SSL_get0_group_name 找不到）
+          PIP_ONLY_BINARY: cryptography,bcrypt,pynacl,cffi
         run: python3 build.py
       - uses: actions/upload-artifact@v4
         with:
