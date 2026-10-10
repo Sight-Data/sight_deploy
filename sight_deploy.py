@@ -369,8 +369,12 @@ def ensure_deps():
         import paramiko as _p  # noqa
         paramiko = _p
         return
-    except ImportError:
-        pass
+    except ImportError as e:
+        if FROZEN:
+            # 打包版里 sys.executable 是程序自己：绝不能再去 "sys.executable -m pip"，否则会无限自我拉起
+            import traceback
+            LOG.write("导入 paramiko 失败：\n" + traceback.format_exc())
+            _fatal("程序文件不完整（缺少 SSH 组件：%s）。请重新下载 Sight 部署助手。" % e)
     # 只有「源码运行」才会走到这里（打包版已内置 paramiko），此时有控制台，直接在控制台提示
     print("需要 Python 库 paramiko（SSH 连接用），正在自动安装 …", flush=True)
     base = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check"]
@@ -3380,6 +3384,27 @@ def _existing_instance():
     return None
 
 
+def _say(msg):
+    """往控制台打一行。打包成无控制台程序时 stdout 可能是空设备 / 不支持中文，任何异常都吞掉。"""
+    try:
+        print(msg, flush=True)
+    except Exception:
+        pass
+
+
+def _fatal(msg):
+    """无法继续运行：写日志、尽量让用户看到（Windows 无控制台时弹框），然后退出。"""
+    LOG.write("致命错误：" + msg)
+    _say(msg)
+    if os.name == "nt" and FROZEN:
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, msg, "Sight 部署助手", 0x10)
+        except Exception:
+            pass
+    sys.exit(1)
+
+
 def _open_browser(url):
     import webbrowser
     opened = False
@@ -3404,10 +3429,11 @@ def _open_browser(url):
 
 def main():
     global APP
-    if sys.stdout is None:  # Windows 无控制台打包时 stdout 为 None
-        sys.stdout = open(os.devnull, "w")
+    # Windows 无控制台打包时 stdout / stderr 为 None；用 utf-8 打开空设备（默认编码是系统代码页，写中文会抛异常）
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
     if sys.stderr is None:
-        sys.stderr = open(os.devnull, "w")
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
     no_browser = "--no-browser" in sys.argv
     port_arg = None
     if "--port" in sys.argv:
@@ -3415,7 +3441,7 @@ def main():
     CONF_DIR.mkdir(parents=True, exist_ok=True)
     url = _existing_instance()
     if url:
-        print("Sight 部署助手已在运行：%s" % url, flush=True)
+        _say("Sight 部署助手已在运行：%s" % url)
         if not no_browser:
             _open_browser(url)
         return 0
@@ -3431,8 +3457,7 @@ def main():
         except OSError:
             continue
     if not httpd:
-        print("无法启动本机服务（端口被占用）", flush=True)
-        return 1
+        _fatal("无法启动本机服务（端口都被占用了）")
     httpd.daemon_threads = True
     APP.port = httpd.server_address[1]
     APP.httpd = httpd
@@ -3444,8 +3469,8 @@ def main():
     except OSError:
         pass
     LOG.write("网页地址：http://127.0.0.1:%d/" % APP.port)
-    print("Sight 部署助手 %s 已启动：%s" % (TOOL_VERSION, url), flush=True)
-    print("（浏览器没自动打开的话，把上面的地址复制到浏览器；关闭浏览器 10 分钟后程序自动退出）", flush=True)
+    _say("Sight 部署助手 %s 已启动：%s" % (TOOL_VERSION, url))
+    _say("（浏览器没自动打开的话，把上面的地址复制到浏览器；关闭浏览器 10 分钟后程序自动退出）")
     threading.Thread(target=_watchdog, daemon=True).start()
     if not no_browser:
         threading.Timer(0.5, _open_browser, args=(url,)).start()
@@ -3457,5 +3482,16 @@ def main():
     _shutdown()
 
 
+def _entry():
+    try:
+        return main()
+    except SystemExit:
+        raise
+    except BaseException:  # 打包成无控制台程序时，未捕获的异常会弹出看不懂的对话框并卡住：记日志后给人话
+        import traceback
+        LOG.write(traceback.format_exc())
+        _fatal("程序启动失败，详见日志：%s" % (LOG.path or CONF_DIR / "logs"))
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_entry())
