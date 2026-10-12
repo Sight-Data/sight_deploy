@@ -50,7 +50,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-TOOL_VERSION = "2.1.0"
+TOOL_VERSION = "2.1.1"
 CONF_DIR = Path(os.environ.get("SIGHT_DEPLOY_HOME") or (Path.home() / ".sight-deploy"))
 FROZEN = getattr(sys, "frozen", False)
 # 程序所在目录：打包后是 exe/.app 所在目录（用来找同目录下的安装包），源码运行是本文件目录
@@ -2703,7 +2703,8 @@ SITE_BASE = (os.environ.get("SIGHT_DEPLOY_SITE") or "https://www.sightdata.top")
 GH_REPO = "Sight-Data/sight_deploy"
 GH_DL_PREFIX = os.environ.get("GH_DL_PREFIX", "")  # 国内访问 GitHub 慢时的下载加速前缀
 SITE_PRODUCT_IDS = {"sight-report": "dl-report", "sight-wall": "dl-wall"}
-SITE_TOOL_IDS = {"windows-x64": "dl-deploy-win", "mac-arm64": "dl-deploy-mac", "mac-x86_64": "dl-deploy-mac"}
+SITE_TOOL_IDS = {"windows-x64": "dl-deploy-win", "windows7-x64": "dl-deploy-win7",
+                 "mac-arm64": "dl-deploy-mac", "mac-x86_64": "dl-deploy-mac"}
 ONLINE_TTL = 600  # 秒：同一次运行里，重复检查直接用缓存
 _online = {"at": 0.0, "data": None}
 _online_lock = threading.Lock()
@@ -2747,13 +2748,24 @@ def _net_err(e):
     return txt or type(e).__name__
 
 
+def legacy_windows():
+    """Windows 7 / 8（内核 < 6.3）：Python 3.9+ 打的版本跑不了，要用 Python 3.8 打的「Win7 兼容版」。"""
+    try:
+        v = sys.getwindowsversion()
+        return sys.platform == "win32" and (v.major, v.minor) < (6, 3)
+    except Exception:
+        return False
+
+
 def tool_platform():
     forced = os.environ.get("SIGHT_DEPLOY_PLATFORM")  # 调试用：windows-x64 / mac-arm64 / mac-x86_64
     if forced:
         return forced
     m = platform.machine().lower()
     if sys.platform == "win32":
-        return "windows-x64" if m in ("amd64", "x86_64", "x64") else None
+        if m not in ("amd64", "x86_64", "x64"):
+            return None
+        return "windows7-x64" if legacy_windows() else "windows-x64"
     if sys.platform == "darwin":
         return "mac-arm64" if m in ("arm64", "aarch64") else "mac-x86_64"
     return None
@@ -2781,7 +2793,7 @@ def _online_from_site():
                           "url": "%s/downloads/file/%s" % (SITE_BASE, did), "updated": d.get("updatedAt") or "",
                           "pan_url": d.get("baiduPanUrl") or "", "pan_code": d.get("baiduPanCode") or ""}
     tool, plat = None, tool_platform()
-    cands = [by.get(i) for i in ("dl-deploy-win", "dl-deploy-mac") if by.get(i) and by[i].get("version")]
+    cands = [by.get(i) for i in ("dl-deploy-win", "dl-deploy-win7", "dl-deploy-mac") if by.get(i) and by[i].get("version")]
     if cands:
         latest = max((str(d["version"]) for d in cands), key=parse_version)
         mine = by.get(SITE_TOOL_IDS.get(plat)) if plat else None
@@ -3762,6 +3774,19 @@ def _fatal(msg):
 def _open_browser(url):
     import webbrowser
     opened = False
+    if legacy_windows():  # Win7 默认浏览器多半是打不开本页面的 IE：优先用装了的 Chrome / Firefox
+        for env_, rel in (("ProgramFiles", r"Google\Chrome\Application\chrome.exe"),
+                          ("ProgramFiles(x86)", r"Google\Chrome\Application\chrome.exe"),
+                          ("LOCALAPPDATA", r"Google\Chrome\Application\chrome.exe"),
+                          ("ProgramFiles", r"Mozilla Firefox\firefox.exe"),
+                          ("ProgramFiles(x86)", r"Mozilla Firefox\firefox.exe")):
+            exe = os.path.join(os.environ.get(env_) or "", rel)
+            if os.environ.get(env_) and os.path.isfile(exe):
+                try:
+                    subprocess.Popen([exe, url])
+                    return
+                except OSError:
+                    pass
     try:
         opened = webbrowser.open(url, new=1)
     except Exception:

@@ -17,6 +17,7 @@ PyInstaller 不能跨平台打包：Windows 版要在 Windows 上打，Mac 版�
   PIP_INDEX_URL       换 pip 源（如 https://pypi.tuna.tsinghua.edu.cn/simple）
   MAC_TARGET_ARCH     Mac 目标架构：arm64 / x86_64 / universal2（默认本机架构；universal2 需要 python.org 的通用版 Python）
   SKIP_SMOKE=1        跳过冒烟自检
+  WIN7=1              打 Win7 兼容版（要求 Python 3.8；产物名 ...-windows7-x64.exe）
 """
 import json
 import os
@@ -35,8 +36,10 @@ OUT = HERE / "dist"
 VENV = HERE / ".build-venv"
 APP_NAME = "Sight部署助手"   # .app / exe 内部名称
 ASSET = "sight-deploy"       # 发布文件名前缀（英文）
-PYINSTALLER = "pyinstaller==6.11.1"
-PARAMIKO = "paramiko>=3.4,<6"
+WIN7 = bool(os.environ.get("WIN7"))  # Win7 兼容版：必须用 Python 3.8 打（3.9 起不再支持 Win7）
+PYINSTALLER = "pyinstaller==6.9.0" if WIN7 else "pyinstaller==6.11.1"
+PARAMIKO = "paramiko>=3.4,<4" if WIN7 else "paramiko>=3.4,<6"
+EXTRA_PIP = ["cryptography>=41,<43"] if WIN7 else []  # 旧版 cryptography 自带的 OpenSSL / 运行库对 Win7 更保险
 
 
 def say(msg):
@@ -63,7 +66,7 @@ def ensure_venv():
         venv.EnvBuilder(with_pip=True, clear=True).create(VENV)
     py = venv_python()
     run([py, "-m", "pip", "install", "-q", "--disable-pip-version-check", "--upgrade", "pip"])
-    run([py, "-m", "pip", "install", "-q", "--disable-pip-version-check", PARAMIKO, PYINSTALLER, "certifi"])  # certifi：在线检查更新用的 HTTPS 根证书（Mac 的 python.org 构建没有系统证书）
+    run([py, "-m", "pip", "install", "-q", "--disable-pip-version-check", PARAMIKO, PYINSTALLER, "certifi"] + EXTRA_PIP)  # certifi：在线检查更新用的 HTTPS 根证书（Mac 的 python.org 构建没有系统证书）
     return py
 
 
@@ -189,7 +192,7 @@ def package(target, ver):
         # 用 ditto 打 zip：保留 .app 的符号链接与权限（Python zipfile 会弄坏 .app）
         run(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", target, out])
     elif sysname == "Windows":
-        out = OUT / ("%s-%s-windows-x64.exe" % (ASSET, ver))
+        out = OUT / ("%s-%s-windows%s-x64.exe" % (ASSET, ver, "7" if WIN7 else ""))
         shutil.copy2(target, out)
     else:
         out = OUT / ("%s-%s-linux-%s" % (ASSET, ver, platform.machine()))
@@ -199,6 +202,8 @@ def package(target, ver):
 
 
 def main():
+    if WIN7 and (platform.system() != "Windows" or tuple(platform.python_version_tuple()[:2]) != ("3", "8")):
+        raise SystemExit("WIN7=1 只能在 Windows 上用 Python 3.8 打包（当前 %s %s）" % (platform.system(), platform.python_version()))
     ver = tool_version()
     say("Sight 部署助手 %s 打包" % ver)
     py = ensure_venv()

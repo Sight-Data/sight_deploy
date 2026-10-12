@@ -33,6 +33,7 @@
 | 系统 | 文件 | 说明 |
 |---|---|---|
 | Windows 10 / 11 | `sight-deploy-<版本>-windows-x64.exe` | 单文件，双击运行 |
+| Windows 7 / 8 | `sight-deploy-<版本>-windows7-x64.exe` | Win7 兼容版（Python 3.8 构建）。系统自带的 IE 打不开操作界面，需要装 Chrome 109 或 Firefox ESR 115；程序会优先用它们打开 |
 | macOS（Apple 芯片） | `sight-deploy-<版本>-mac-arm64.zip` | 解压后打开「Sight部署助手.app」 |
 | macOS（Intel） | `sight-deploy-<版本>-mac-x86_64.zip` | 同上 |
 
@@ -114,6 +115,8 @@ python3 sight_deploy.py --no-browser --port 17880       # 只起服务，地址�
 2. 打同名 tag 并推送（如 `git tag v2.0.1 && git push origin v2.0.1`）。
 
 GitHub Actions 会在 Windows / macOS 真机上打包、冒烟自检，然后发布到 Releases。tag 和 `TOOL_VERSION` 对不上时构建会直接失败。
+
+Win7 兼容版：`WIN7=1 python build.py`，必须用 Python 3.8 在 Windows 上打；CI 里是独立任务（`windows7`），失败不会拦住其他版本发布。
 
 本地打包（PyInstaller 不能跨平台：Windows 版在 Windows 上打，Mac 版在 Mac 上打）：
 

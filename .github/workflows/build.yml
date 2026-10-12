@@ -69,6 +69,30 @@ jobs:
           path: ${{ steps.build.outputs.asset }}
           if-no-files-found: error
 
+  windows7:
+    # Win7 / Win8 兼容版：Python 3.9 起不再支持 Win7，这个版本固定用 3.8 打包。失败不影响正式发版。
+    needs: check
+    runs-on: windows-2022
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+      - name: 打包 Win7 兼容版 exe（先源码冒烟，再打包并对 exe 冒烟）
+        id: build
+        env:
+          WIN7: "1"
+          SMOKE_SOURCE: "1"
+          SIGHT_DEPLOY_DEBUG: "1"
+          PIP_ONLY_BINARY: cryptography,bcrypt,pynacl,cffi
+        run: python build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows7-x64
+          path: ${{ steps.build.outputs.asset }}
+          if-no-files-found: error
+
   macos:
     needs: check
     strategy:
@@ -101,7 +125,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [check, windows, macos]
+    needs: [check, windows, windows7, macos]
     if: startsWith(github.ref, 'refs/tags/') && !cancelled() && needs.windows.result == 'success' && needs.macos.result == 'success'
     runs-on: ubuntu-latest
     steps:
@@ -117,7 +141,8 @@ jobs:
           generate_release_notes: true
           body: |
             **下载哪个？**
-            - Windows：`sight-deploy-*-windows-x64.exe`，双击运行
+            - Windows 10 / 11：`sight-deploy-*-windows-x64.exe`，双击运行
+            - Windows 7 / 8：`sight-deploy-*-windows7-x64.exe`（Python 3.8 构建；需要另装 Chrome 109 或 Firefox ESR 115 来打开界面）
             - Mac（Apple 芯片）：`sight-deploy-*-mac-arm64.zip`；Intel 芯片：`sight-deploy-*-mac-x86_64.zip`。解压后打开「Sight部署助手.app」（未签名，第一次需右键 → 打开）
 
             国内也可以在官网下载：https://www.sightdata.top/downloads
