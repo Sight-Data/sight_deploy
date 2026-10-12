@@ -64,6 +64,10 @@ SightReport / SightWall 的产品安装包同样在[官网下载中心](https://
   - 启动后检查健康状态并核对版本号，失败时一键回滚，程序和数据一起恢复。
   - 用外部数据库时会提醒先备份数据库。
   - 可以多选服务器依次滚动升级，某台失败时会询问是否继续处理剩下的。
+- **在线检查更新**：启动时（可在设置里关闭）联网查询官网下载中心，只读取版本信息，不上传任何数据。
+  - 部署助手有新版本时，页面顶部提示，点一下就下载到「下载」文件夹（断点续传）。
+  - 服务器上的 SightReport / SightWall 低于官网最新版时，在产品卡上标出；点「升级」会预选最新版，没下载过的自动从官网下载并校验，再部署。
+  - 左下角「检查更新」随时手动检查，并汇总哪些服务器可升级。连不上官网（内网）时不影响使用，仍可用本机的安装包。
 - **日常运维**：启动、停止、重启；查看日志（可实时跟踪）；回滚到任意一份升级备份。回滚前会先把当前状态另存一份，回滚本身也能撤销。
 
 ## 安全
@@ -72,6 +76,7 @@ SightReport / SightWall 的产品安装包同样在[官网下载中心](https://
 - 本机保存的数据都在 `~/.sight-deploy/`：
   - `hosts.json`：服务器列表，敏感字段用 Fernet 加密。
   - `.key`：加密密钥，与本机绑定，配置文件拷到别的电脑上解不开。设环境变量 `SIGHT_DEPLOY_PASSPHRASE` 可以再加一层口令。
+- 联网只有一件事：访问官网下载中心（`https://www.sightdata.top`）读版本信息、按你的操作下载安装包 / 新版工具；查不到时才退到 GitHub Release。内网环境可在设置里关闭「启动时自动检查更新」。
   - `logs/`：操作日志，不含任何密码，出问题时发给技术支持即可。
 - sudo 密码通过标准输入传给 sudo，不出现在命令行、进程列表或日志里。
 
@@ -98,6 +103,7 @@ python3 sight_deploy.py --no-browser --port 17880       # 只起服务，地址�
 ```
 
 - 只改界面时用假后端：`python3 web/mock_server.py 8765`，令牌是 `mocktoken123`。
+- 调试在线检查：`SIGHT_DEPLOY_SITE=http://127.0.0.1:端口` 指向自己的假官网（只要实现 `/api/downloads` 和 `/downloads/file/<id>`）；`SIGHT_DEPLOY_PLATFORM=windows-x64|mac-arm64|mac-x86_64` 模拟平台。`mock_server.py --offline` 看连不上官网的界面。
 - 前后端接口约定见 [`docs/API.md`](docs/API.md)。改接口时 `docs/API.md`、`sight_deploy.py`、`web/index.html` 三处一起改。
 
 ## 打包与发版

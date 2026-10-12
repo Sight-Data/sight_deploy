@@ -192,6 +192,20 @@ svg{width:1em;height:1em;flex:none;vertical-align:-.125em}
 .tag{font-size:11.5px;line-height:18px;padding:0 7px;border-radius:9px;background:var(--accent-bg);color:var(--accent);font-weight:600}
 .tag.gray{background:#e8ecf2;color:#68768a}
 .group-t{font-size:12px;color:var(--muted);margin:10px 2px 4px}
+.pk.online .fi{background:var(--accent-bg);color:var(--accent)}
+.pk.online .pd{font-family:var(--sans)}
+.tag.new{background:var(--ok-bg);color:var(--ok)}
+.onl-line{display:flex;gap:8px;align-items:center;color:var(--muted);font-size:13px;padding:6px 4px}
+.upd{display:flex;gap:12px;align-items:center;background:var(--accent-bg);border:1px solid #c4d7f5;border-radius:12px;padding:11px 16px;margin:0 0 18px;text-align:left}
+.upd>svg{font-size:20px;color:var(--accent)}
+.upd .ut{flex:1;min-width:0;line-height:1.5}
+.upd .ut span{display:block;color:var(--ink2);font-size:12.5px}
+.empty .upd{margin:0 0 28px}
+.sumrow{display:flex;gap:10px;align-items:center;padding:8px 0;border-top:1px solid var(--line)}
+.sumrow:first-child{border-top:0}
+.sumrow .k{width:118px;color:var(--muted);flex:none}
+.sumrow .v{flex:1;min-width:0}
+
 .drop{margin-top:10px;border:1.5px dashed #aebfdc;border-radius:12px;padding:14px;text-align:center;color:var(--ink2);background:#fafcff;cursor:pointer;transition:background .12s,border-color .12s}
 .drop.over{background:var(--accent-bg);border-color:var(--accent)}
 .drop small{display:block;color:var(--muted);margin-top:2px}
@@ -535,6 +549,7 @@ function openBrowser(kind, startDir, onPick) {
 /* opts: kind 'package'|'jdk'|'key', prefer: product id, onChange(sel) ; returns {el, get()} */
 function buildPicker(opts) {
   var kind = opts.kind || 'package', sel = null, items = [], uploading = false;
+  var localDone = kind === 'key', onlineDone = kind !== 'package', onlineWait = false;
   var listEl = h('div', { class: 'plist' });
   var selEl = h('div', { class: 'sel' });
   var drop = h('div', { class: 'drop', tabindex: '0', role: 'button' });
@@ -549,7 +564,7 @@ function buildPicker(opts) {
   function setSel(s) {
     sel = s;
     Array.prototype.forEach.call(listEl.querySelectorAll('.pk'), function (b) { b.classList.toggle('on', b.getAttribute('data-path') === (s && s.path)); });
-    selEl.innerHTML = s ? '已选择：<b>' + esc(s.name) + '</b>' + (s.size ? '（' + fmtSize(s.size) + '）' : '') : '<span style="color:var(--muted)">尚未选择' + noun + '</span>';
+    selEl.innerHTML = s ? '已选择：<b>' + esc(s.name) + '</b>' + (s.online ? '（官网最新' + (s.size_text ? '，' + esc(s.size_text) : '') + '；点「下一步」自动下载）' : s.size ? '（' + fmtSize(s.size) + '）' : '') : '<span style="color:var(--muted)">尚未选择' + noun + '</span>';
     selEl.title = s ? s.path : '';
     if (opts.onChange) opts.onChange(s);
   }
@@ -562,15 +577,47 @@ function buildPicker(opts) {
     b.addEventListener('click', function () { setSel(p); });
     return b;
   }
+  function onlineItems() {
+    if (kind !== 'package' || !S.online || !S.online.products) return [];
+    var res = [];
+    Object.keys(S.online.products).forEach(function (pid) {
+      if (opts.prefer && pid !== opts.prefer) return;
+      var o = S.online.products[pid];
+      if (items.some(function (p) { return p.product === pid && p.version && verCmp(p.version, o.latest) === 0; })) return; // 本机已有同版本
+      res.push({ online: true, path: 'online:' + pid, product: pid, version: o.latest, name: o.file_name || (pid + '-' + o.latest + '.zip'), size: 0, size_text: o.size_text, mtime: 0, dir: '' });
+    });
+    return res;
+  }
+  function onlineItem(p) {
+    var b = h('button', { class: 'pk online', type: 'button', 'data-path': p.path, html:
+      '<div class="fi">' + ico('upload') + '</div><div class="pm"><div class="pn">' + esc(productName(p.product) + ' ' + p.version) +
+      '<span class="tag new">官网最新</span></div><div class="pd">从官网下载中心下载，选中后点「下一步」自动下载并校验</div></div><div class="ps">' + esc(p.size_text || '') + '<small>需要联网</small></div>' });
+    b.addEventListener('click', function () { setSel(p); });
+    return b;
+  }
+  function onlineHeader() {
+    if (kind !== 'package') return;
+    if (!S.online && onlineWait) { listEl.appendChild(h('div', { class: 'onl-line', html: '<span class="spin"></span>正在查询官网最新版本…' })); return; }
+    if (!S.online) {
+      var q = h('button', { class: 'btn sm', type: 'button' }, ['查询官网最新版本']);
+      q.addEventListener('click', function () { onlineWait = true; renderList(); loadOnline(false).then(function () { onlineWait = false; onlineDone = true; renderList(); autoPick(); }); });
+      listEl.appendChild(h('div', { class: 'onl-line' }, [q, h('span', null, ['（已关闭启动时自动检查）'])]));
+      return;
+    }
+    var oi = onlineItems();
+    if (oi.length) { listEl.appendChild(h('div', { class: 'group-t', style: 'margin-top:0' }, ['官网最新版（点「下一步」时下载）'])); oi.forEach(function (p) { listEl.appendChild(onlineItem(p)); }); }
+    else if (S.online.error && !Object.keys(S.online.products || {}).length) listEl.appendChild(h('div', { class: 'onl-line', html: ico('warn') + '<span>无法连接官网，只能使用本机上的安装包。</span>' }));
+  }
   function renderList() {
     listEl.innerHTML = '';
-    if (!items.length) { listEl.appendChild(h('div', { class: 'side-empty', style: 'padding:8px 4px' }, ['没有在「下载」「桌面」等位置自动找到' + noun + '。可以拖入文件，或点「浏览…」。'])); return; }
+    onlineHeader();
+    if (!items.length) { listEl.appendChild(h('div', { class: 'side-empty', style: 'padding:8px 4px' }, ['没有在「下载」「桌面」等位置自动找到' + noun + '。可以拖入文件，或点「浏览…」。'])); if (sel) setSel(sel); return; }
     var sorted = items.slice().sort(function (a, b) { return b.mtime - a.mtime; });
     var pri = opts.prefer ? sorted.filter(function (p) { return p.product === opts.prefer; }) : sorted;
     var rest = opts.prefer ? sorted.filter(function (p) { return p.product !== opts.prefer; }) : [];
     if (opts.prefer) {
       var pn = S.state.products[opts.prefer] ? S.state.products[opts.prefer].name : opts.prefer;
-      listEl.appendChild(h('div', { class: 'group-t', style: 'margin-top:0' }, ['适用于 ' + pn + ' 的安装包']));
+      listEl.appendChild(h('div', { class: 'group-t', style: listEl.children.length ? '' : 'margin-top:0' }, ['本机上适用于 ' + pn + ' 的安装包']));
       if (!pri.length) listEl.appendChild(h('div', { class: 'side-empty', style: 'padding:4px' }, ['没有自动找到，可以拖入文件或点「浏览…」。']));
       if (rest.length) { /* heading added below */ }
     }
@@ -580,15 +627,22 @@ function buildPicker(opts) {
   }
   if (kind !== 'key') {
     listEl.innerHTML = '<div class="side-empty" style="padding:8px 4px"><span class="spin"></span> 正在查找本机上的' + noun + '…</div>';
+    if (kind === 'package') {
+      if (S.online) onlineDone = true;
+      else if (autoCheckOn()) { onlineWait = true; loadOnline(false).then(function () { onlineWait = false; onlineDone = true; renderList(); autoPick(); }); }
+      else onlineDone = true;
+    }
     api('GET', kind === 'jdk' ? '/api/jdks' : '/api/packages').then(function (r) {
-      items = r || [];
-      renderList();
-      if (!sel && items.length && opts.autoSelect) {
-        var first = (opts.prefer && items.filter(function (p) { return p.product === opts.prefer; }).sort(function (a, b) { return b.mtime - a.mtime; })[0]) || null;
-        if (first) setSel(first);
-      }
-    }, function () { items = []; renderList(); });
+      items = r || []; localDone = true; renderList(); autoPick();
+    }, function () { items = []; localDone = true; renderList(); autoPick(); });
   } else listEl.style.display = 'none';
+  /* 预选：本机包和官网最新版里版本最高的；同版本优先用本机的（不用下载） */
+  function autoPick() {
+    if (sel || !opts.autoSelect || !opts.prefer || !localDone || !onlineDone) return;
+    var c = items.filter(function (p) { return p.product === opts.prefer; }).concat(onlineItems());
+    c.sort(function (a, b) { return verCmp(b.version, a.version) || ((a.online ? 1 : 0) - (b.online ? 1 : 0)) || (b.mtime - a.mtime); });
+    if (c[0]) setSel(c[0]);
+  }
   if (kind === 'key') drop.style.display = 'none';
   setSel(null);
   browseBtn.addEventListener('click', function () {
@@ -634,6 +688,68 @@ function buildPicker(opts) {
 /* ---------- global state ---------- */
 var S = { state: null, sel: null, status: {}, statusErr: {}, statusAt: {}, loading: null };
 var J = null; // current local job
+S.online = null; S.onlineP = null;
+
+/* ---------- online (官网下载中心) ---------- */
+function verParts(v) { var m = /^\d+(?:\.\d+)*/.exec(String(v || '').trim().replace(/^[vV]/, '')); return m ? m[0].split('.').map(Number) : []; }
+function verCmp(a, b) {
+  a = verParts(a); b = verParts(b);
+  for (var i = 0; i < Math.max(a.length, b.length); i++) { var x = a[i] || 0, y = b[i] || 0; if (x !== y) return x > y ? 1 : -1; }
+  return 0;
+}
+function loadOnline(force) {
+  if (S.onlineP) return S.onlineP;
+  S.onlineP = api('GET', '/api/online' + (force ? '?refresh=1' : '')).then(function (r) { S.online = r; return r; },
+    function (e) { if (DEAD) throw e; S.online = { error: e.message, products: {}, tool: null }; return S.online; })
+    .then(function (r) { S.onlineP = null; return r; }, function (e) { S.onlineP = null; throw e; });
+  return S.onlineP;
+}
+function onlineNewer(pid, installed) {
+  var o = S.online && S.online.products && S.online.products[pid];
+  return o && installed && verCmp(o.latest, installed) > 0 ? o : null;
+}
+function autoCheckOn() { return !(S.state && S.state.settings && S.state.settings.auto_check === false); }
+function updateBannerHtml() {
+  var t = S.online && S.online.tool;
+  if (!t || !t.update || lsGet('sd_skip_ver') === t.latest) return '';
+  return '<div class="upd">' + ico('up') + '<div class="ut"><b>Sight 部署助手有新版本 ' + esc(t.latest) + '</b>（当前 ' + esc(t.current) + '）' +
+    '<span>' + (t.can_download ? '下载后退出当前程序，运行新版本即可，服务器信息会保留。' : '请到官网下载中心获取适合这台电脑的版本。') + '</span></div>' +
+    (t.can_download ? '<button class="btn primary sm" type="button" data-job="1" data-act="updtool">下载新版本</button>'
+      : '<a class="btn sm" href="' + esc(t.page) + '" target="_blank" rel="noopener">打开下载中心</a>') +
+    '<button class="btn sm ghost" type="button" data-act="skipupd" title="这个版本不再提醒">忽略此版本</button></div>';
+}
+function downloadTool() {
+  var t = S.online && S.online.tool; if (!t) return;
+  startJob('download_tool', {}, { title: '下载 Sight 部署助手 ' + t.latest, closeLabel: '完成', failTitle: '下载没有完成', noRefresh: true });
+}
+function checkUpdates() {
+  toast('正在检查更新…');
+  loadOnline(true).then(function (r) { renderSide(); renderMain(); showCheckResult(r); });
+}
+function showCheckResult(r) {
+  var t = r.tool, prods = r.products || {}, rows = [];
+  function row(k, v) { return h('div', { class: 'sumrow' }, [h('div', { class: 'k' }, [k]), h('div', { class: 'v', html: v })]); }
+  if (r.error && !t && !Object.keys(prods).length) {
+    openModal({ title: '无法连接官网', icon: 'warn', body: h('div', null, [detailList([r.error, '请确认这台电脑能访问 ' + (r.site || 'www.sightdata.top') + '；内网电脑可以在别处下载后，把文件拷过来。'])]),
+      dismiss: true, actions: [{ label: '关闭', onClick: function (M) { M.close(); } }, { label: '打开下载中心', kind: 'primary', onClick: function (M) { window.open((r.site || 'https://www.sightdata.top') + '/downloads', '_blank', 'noopener'); } }] });
+    return;
+  }
+  if (t) rows.push(row('Sight 部署助手', t.update ? '<span class="tag new">有新版本</span> ' + esc(t.latest) + '（当前 ' + esc(t.current) + '）' : '已是最新（' + esc(t.current) + '）'));
+  Object.keys(prods).forEach(function (pid) {
+    var o = prods[pid], need = [], any = false;
+    S.state.hosts.forEach(function (hs) {
+      var res = S.status[hs.name], pr = res ? res.products.filter(function (x) { return x.product === pid && x.installed; })[0] : (hs.products || {})[pid];
+      if (pr) any = true;
+      if (pr && pr.version && verCmp(o.latest, pr.version) > 0) need.push(hs.name + ' ' + pr.version);
+    });
+    rows.push(row(productName(pid), '官网最新 <b>' + esc(o.latest) + '</b>' + (o.size_text ? '（' + esc(o.size_text) + '）' : '') +
+      (need.length ? '<div style="color:var(--warn);font-size:13px;margin-top:2px">可升级：' + esc(need.join('、')) + '</div>' : any ? '<div style="color:var(--ok);font-size:13px;margin-top:2px">已安装的服务器都是最新（按上次查询的版本）</div>' : '')));
+  });
+  var body = h('div', null, rows);
+  var acts = [{ label: '关闭', onClick: function (M) { M.close(); } }];
+  if (t && t.update && t.can_download) acts.push({ label: '下载新版部署助手', kind: 'primary', job: true, onClick: function (M) { M.close(); downloadTool(); } });
+  openModal({ title: '检查更新', sub: '数据来自官网下载中心', icon: 'check', body: body, dismiss: true, actions: acts });
+}
 
 function isBusy() { return !!(J || (S.state && S.state.busy)); }
 function applyBusy() {
@@ -937,6 +1053,10 @@ function resultSummary(j) {
     });
     wrap.appendChild(box);
   }
+  if (j.kind === 'download_tool' && r.path) {
+    wrap.appendChild(h('div', { class: 'small', style: 'color:var(--ink2);font-size:13px;margin-top:4px;word-break:break-all' }, ['已保存到：' + r.path]));
+    wrap.appendChild(h('ol', { style: 'margin:6px 0 0;padding-left:20px;color:var(--ink2);font-size:13px' }, (r.howto || []).map(function (x) { return h('li', null, [x]); })));
+  }
   return wrap;
 }
 function bannerText(j) {
@@ -945,6 +1065,8 @@ function bannerText(j) {
     case 'deploy': return '安装 / 升级已完成';
     case 'rollback': return '回滚已完成';
     case 'service': return '操作已完成';
+    case 'download_package': return (r.reused ? '本机已有这个版本的安装包' : '安装包已下载并校验') + (r.version ? '：' + r.version : '');
+    case 'download_tool': return '新版本 ' + (r.version || '') + ' 已下载';
     case 'add_host': return '服务器已添加：' + (r.name || '');
     case 'edit_host': return '密码已更新';
     case 'test_host': return r.root ? '连接正常，当前账号具有 root 权限' : '连接正常，但当前账号不是 root，部分操作会要求 sudo 密码';
@@ -985,6 +1107,7 @@ function panelDone(j) {
       acts.push({ label: lbl, kind: '', onClick: function () { window.open(x.url, '_blank', 'noopener'); } });
     });
   }
+  if (j.ok && j.kind === 'download_tool') acts.push({ label: '在文件夹中显示', onClick: function () { api('POST', '/api/reveal', {}).catch(function (e) { toast(e.message); }); } });
   acts.push({ label: j.o.closeLabel && j.ok ? j.o.closeLabel : '关闭', key: 'close', kind: 'primary', onClick: function () { closePanel(j); } });
   p.M.setActions(acts);
   p.M.enterKey = 'close';
@@ -1021,21 +1144,21 @@ function renderSide() {
       (chips ? '<div class="chips">' + chips + '</div>' : '') + '</button>';
   }).join('');
   side.innerHTML =
-    '<div class="brand"><div class="logo">' + ico('logo') + '</div><div><b>Sight 部署助手</b><small>版本 ' + esc(st.version || '') + '</small></div></div>' +
+    '<div class="brand"><div class="logo">' + ico('logo') + '</div><div><b>Sight 部署助手</b><small>版本 ' + esc(st.version || '') + (S.online && S.online.tool && S.online.tool.update ? ' · <a href="#" data-act="updtool" style="color:var(--ok);font-weight:600">有新版本</a>' : '') + '</small></div></div>' +
     '<div class="side-h"><span>服务器（' + st.hosts.length + '）</span></div>' +
     '<div id="hostlist">' + (hosts || '<div class="side-empty">还没有服务器。<br>先添加一台，才能安装或升级。</div>') + '</div>' +
     '<div class="side-add"><button class="btn" type="button" data-act="addhost">' + ico('plus') + '添加服务器</button></div>' +
-    '<div class="side-foot"><div class="row"><button class="btn" type="button" data-act="settings">设置</button><button class="btn" type="button" data-act="quit">退出程序</button></div>' +
+    '<div class="side-foot"><div class="row"><button class="btn" type="button" data-act="settings">设置</button><button class="btn" type="button" data-act="checkupdate">检查更新</button><button class="btn" type="button" data-act="quit">退出</button></div>' +
     '<div class="logp"><span>本地运行日志</span><button class="btn sm ghost" type="button" data-act="copylog" title="复制日志路径">' + ico('copy') + '复制路径</button></div>' +
     '<div class="logpath" title="' + esc(st.log_path || '') + '">' + esc(st.log_path || '') + '</div>' +
     '<div class="links"><a href="https://www.sightdata.top" target="_blank" rel="noopener">Sight Data 官网</a>' +
-    '<a href="https://www.sightdata.top/downloads" target="_blank" rel="noopener">下载更新</a>' +
+    '<a href="https://www.sightdata.top/downloads" target="_blank" rel="noopener">下载中心</a>' +
     '<a href="https://github.com/Sight-Data/sight_deploy" target="_blank" rel="noopener">GitHub</a></div></div>';
   applyBusy();
 }
 
 function renderEmpty() {
-  return '<div class="empty"><h1>欢迎使用 Sight 部署助手</h1>' +
+  return '<div class="empty">' + updateBannerHtml() + '<h1>欢迎使用 Sight 部署助手</h1>' +
     '<p class="lead">在你的电脑上，通过 SSH 把 SightReport / SightWall 安装到客户的 Linux 服务器，或升级到新版本。<br>不需要手工敲命令，三步就能完成。</p>' +
     '<div class="steps3">' +
     '<div class="step3"><div class="n">1</div><b>添加服务器</b><span>填写服务器地址、账号和密码（或私钥）。程序会先测试连接，并安全保存在本机。</span></div>' +
@@ -1074,8 +1197,10 @@ function productCard(p, hostRec) {
     if (p.db_reachable === false) note('bad', 'x', '数据库无法连接，请检查数据库服务和连接配置。');
     if (p.healthy && p.reachable === false) note('warn', 'bang', '本机暂时无法访问这个地址，可能是服务器防火墙或网络策略限制了端口 ' + esc(p.port) + '。');
   }
+  var nw = onlineNewer(id, p.version);
+  if (nw) note('info', 'up', '官网有新版本 <b>' + esc(nw.latest) + '</b>（当前 ' + esc(p.version) + '）。点「升级」会自动选中最新版，下载后再部署。');
   var isOn = p.running || p.active === 'active';
-  return '<div class="card"><div class="ch"><div class="pico">' + ico('box') + '</div><div><h2>' + esc(pn) + '</h2><div class="ver">版本 ' + esc(p.version || '未知') + '</div></div><div class="sp"></div>' + badge + '</div>' +
+  return '<div class="card"><div class="ch"><div class="pico">' + ico('box') + '</div><div><h2>' + esc(pn) + '</h2><div class="ver">版本 ' + esc(p.version || '未知') + (onlineNewer(id, p.version) ? ' <span class="tag new">官网有 ' + esc(onlineNewer(id, p.version).latest) + '</span>' : '') + '</div></div><div class="sp"></div>' + badge + '</div>' +
     '<dl class="kvs">' +
     '<dt>访问地址</dt><dd>' + (p.url ? '<a href="' + esc(p.url) + '" target="_blank" rel="noopener">' + esc(p.url) + ' ' + ico('ext') + '</a>' : '-') + '</dd>' +
     '<dt>安装目录</dt><dd><span class="mono">' + esc(p.dir || '-') + '</span>' + (p.owner ? '　属主 ' + esc(p.owner) : '') + '</dd>' +
@@ -1121,7 +1246,7 @@ function renderMain() {
       '<button class="btn" type="button" data-job="1" data-act="editpw">修改' + (hs.auth === 'key' ? '密钥口令' : '密码') + '</button>' +
       '<button class="btn" type="button" data-job="1" data-act="deploy" data-p="">仍要安装 / 升级</button></div></div></div>';
   } else body = skeletonCards();
-  main.innerHTML = '<div class="wrap">' + head + body + '</div>';
+  main.innerHTML = '<div class="wrap">' + updateBannerHtml() + head + body + '</div>';
   applyBusy();
 }
 function renderAll() {
@@ -1175,12 +1300,19 @@ function deployFlow(hostName, productId) {
     M1 = openModal({
       title: productId ? '选择 ' + productName(productId) + ' 安装包' : '选择安装包', sub: '第 1 步，共 2 步', cls: 'w760', body: body, dismiss: true, enter: 'next',
       actions: [{ label: '取消', onClick: function (M) { M.close(); } },
-        { label: '下一步', key: 'next', kind: 'primary', disabled: !pk.get(), onClick: function (M) { M.close(); step2(); } }]
+        { label: '下一步', key: 'next', kind: 'primary', disabled: !pk.get(), onClick: function (M) { var s0 = pk.get(); if (s0.online && isBusy()) { toast('正在读取服务器状态，请等几秒再点「下一步」'); return; } M.close(); if (s0.online) fetchThenStep2(s0); else step2(s0); } }]
     });
     $('.mb', M1.md).style.minHeight = '320px';
   }
-  function step2() {
-    var pkg = pk.get(), picked = {}; picked[hostName] = true;
+  function fetchThenStep2(s0) {
+    var pn0 = productName(s0.product);
+    startJob('download_package', { product: s0.product }, {
+      title: '下载 ' + pn0 + ' ' + s0.version, closeLabel: '下一步：选择服务器', failTitle: '下载没有完成', noRefresh: true,
+      onClose: function (j) { if (j.ok && j.result) step2(j.result); else step1(); }
+    }).then(function (j) { if (!j) step1(); });
+  }
+  function step2(pkg) {
+    var picked = {}; picked[hostName] = true;
     var list = h('div', { class: 'hostpick' }), n = S.state.hosts.length;
     S.state.hosts.forEach(function (hs) {
       var cb = h('input', { type: 'checkbox' }); cb.checked = !!picked[hs.name];
@@ -1447,18 +1579,21 @@ function deleteHost(hs) {
 function openSettings() {
   var s = S.state.settings;
   function num(v, mn, mx) { var i = h('input', { class: 'inp', type: 'number', min: mn, max: mx }); i.value = v; return i; }
-  var kb = num(s.keep_backups, 1, 50), ht = num(s.health_timeout, 30, 3600);
+  var kb = num(s.keep_backups, 1, 50), ht = num(s.health_timeout, 60, 3600);
+  var ac = h('input', { type: 'checkbox' }); ac.checked = s.auto_check !== false;
   var body = h('div', null, [
     h('div', { class: 'fld' }, [h('label', { class: 'l' }, ['升级时保留的备份份数']), kb, h('div', { class: 'help' }, ['每次升级前自动备份，超过这个份数时删除最旧的备份。每份备份约占几十 MB 磁盘。'])]),
-    h('div', { class: 'fld' }, [h('label', { class: 'l' }, ['等待服务就绪的时间（秒）']), ht, h('div', { class: 'help' }, ['启动或升级后，等待服务通过健康检查的最长时间。服务器较慢或数据量大时可以调大，默认 300 秒。'])])]);
+    h('div', { class: 'fld' }, [h('label', { class: 'l' }, ['等待服务就绪的时间（秒）']), ht, h('div', { class: 'help' }, ['启动或升级后，等待服务通过健康检查的最长时间。服务器较慢或数据量大时可以调大，默认 300 秒。'])]),
+    h('div', { class: 'fld' }, [h('label', { class: 'sw', style: 'padding:0' }, [ac, h('span', { class: 'tr' }), h('span', { style: 'font-weight:600' }, ['启动时自动检查更新'])]),
+      h('div', { class: 'help' }, ['打开程序时联网查询官网：部署助手有没有新版本、SightReport / SightWall 的最新版本。只读取版本信息，不上传任何数据。内网电脑可以关掉，需要时点左下角「检查更新」。'])])]);
   var err = h('div', { class: 'qerr hidden' }); body.insertBefore(err, body.firstChild);
   openModal({
     title: '设置', body: body, dismiss: true, enter: 'ok',
     actions: [{ label: '取消', onClick: function (M) { M.close(); } }, { label: '保存', key: 'ok', kind: 'primary', onClick: function (M) {
       var a = parseInt(kb.value, 10), b = parseInt(ht.value, 10);
       if (!(a >= 1 && a <= 50)) { err.classList.remove('hidden'); err.innerHTML = ico('warn') + '<span>备份份数请填 1-50 之间的整数。</span>'; kb.focus(); return; }
-      if (!(b >= 30 && b <= 3600)) { err.classList.remove('hidden'); err.innerHTML = ico('warn') + '<span>等待时间请填 30-3600 之间的整数（秒）。</span>'; ht.focus(); return; }
-      api('POST', '/api/settings', { keep_backups: a, health_timeout: b }).then(function () { M.close(); toast('设置已保存'); return refreshState(); }, function (e) { err.classList.remove('hidden'); err.innerHTML = ico('warn') + '<span>' + esc(e.message) + '</span>'; });
+      if (!(b >= 60 && b <= 3600)) { err.classList.remove('hidden'); err.innerHTML = ico('warn') + '<span>等待时间请填 60-3600 之间的整数（秒）。</span>'; ht.focus(); return; }
+      api('POST', '/api/settings', { keep_backups: a, health_timeout: b, auto_check: ac.checked }).then(function () { M.close(); toast('设置已保存'); return refreshState().then(function () { if (autoCheckOn() && !S.online) loadOnline(false).then(function () { renderSide(); renderMain(); }); }); }, function (e) { err.classList.remove('hidden'); err.innerHTML = ico('warn') + '<span>' + esc(e.message) + '</span>'; });
     } }]
   });
 }
@@ -1478,6 +1613,9 @@ document.addEventListener('click', function (e) {
     case 'select': selectHost(t.getAttribute('data-n')); break;
     case 'addhost': openAddHost(); break;
     case 'settings': openSettings(); break;
+    case 'checkupdate': checkUpdates(); break;
+    case 'updtool': e.preventDefault(); downloadTool(); break;
+    case 'skipupd': if (S.online && S.online.tool) { lsSet('sd_skip_ver', S.online.tool.latest); renderMain(); toast('已忽略 ' + S.online.tool.latest + '，之后有更新的版本会再提醒'); } break;
     case 'quit': quitApp(); break;
     case 'copylog': copyText(S.state.log_path || ''); break;
     case 'refresh': startStatus(S.sel); break;
@@ -1502,6 +1640,7 @@ function init() {
   if (!TOKEN) { fatal('warn', '缺少访问凭证', '请通过 Sight 部署助手打开本页面（不要直接收藏或手输地址）。', true); return; }
   refreshState().then(function () {
     renderAll();
+    if (autoCheckOn()) loadOnline(false).then(function () { if (!DEAD) { renderSide(); renderMain(); } }, function () { });
     if (S.state.busy) attachJob(S.state.busy, 'unknown', { title: '正在进行的任务', noRefresh: false });
   }, function (e) { if (!DEAD) fatal('warn', '无法读取状态', e.message, true); });
   beat(); setInterval(beat, 5000);

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Dev-only mock of the Sight 部署助手 API (see ../API.md). Not shipped.
 
-usage: python3 mock_server.py [port] [--empty]
-  --empty   start with no saved hosts (to see the first-run guide)
+usage: python3 mock_server.py [port] [--empty] [--offline]
+  --empty    start with no saved hosts (to see the first-run guide)
+  --offline  官网查询失败（看「无法连接官网」的提示）
 """
 import json, os, sys, threading, time, tempfile, uuid, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,7 +17,7 @@ UPLOAD_DIR = tempfile.mkdtemp(prefix="sd-mock-upload-")
 LOCK = threading.RLock()
 STATE = {
     "version": "2.0.0",
-    "settings": {"keep_backups": 3, "health_timeout": 300},
+    "settings": {"keep_backups": 3, "health_timeout": 300, "auto_check": True},
     "hosts": [] if EMPTY else [
         {"name": "生产-1", "host": "10.0.0.5", "port": 22, "user": "root", "auth": "password",
          "last_used": "2026-10-10 01:16",
@@ -392,7 +393,45 @@ def s_test_host(job):
     return {"root": True}
 
 
-SCRIPTS = {"status": s_status, "deploy": s_deploy, "service": s_service, "logs": s_logs,
+ONLINE = {
+    "checked_at": 0, "source": "site", "error": None, "site": "https://www.sightdata.top",
+    "tool": {"latest": "2.1.0", "current": "2.0.0", "platform": "mac-arm64", "update": True, "can_download": True,
+             "file_name": "Sight部署助手-2.1.0-mac.zip", "size_text": "14.3 MB", "url": "x",
+             "page": "https://www.sightdata.top/downloads"},
+    "products": {"sight-report": {"latest": "2.0.73", "file_name": "sight-report-2.0.73.zip", "size_text": "258M", "url": "x"},
+                 "sight-wall": {"latest": "2.0.70", "file_name": "sight-wall-2.0.70.zip", "size_text": "293M", "url": "x"}},
+}
+
+
+def s_download_package(job):
+    pid = job.params.get("product")
+    o = ONLINE["products"][pid]
+    job.step("查询官网上 %s 的最新版本" % pid)
+    job.sleep(0.5)
+    job.ok_("最新版 %s（%s）" % (o["latest"], o["size_text"]))
+    job.step("下载安装包 %s" % o["file_name"])
+    total = 40_000_000
+    for i in range(1, 21):
+        job.sleep(0.12)
+        job.emit(t="progress", id="p1", label="下载 %s %s" % (pid, o["latest"]), done=total * i // 20, total=total, speed=9_000_000, eta=(20 - i) // 4)
+    job.step("校验安装包完整性")
+    job.sleep(0.4)
+    job.ok_("安装包完整（38.1 MB）")
+    return {"path": UPLOAD_DIR + "/" + o["file_name"], "name": o["file_name"], "size": total, "product": pid,
+            "version": o["latest"], "mtime": int(time.time()), "dir": UPLOAD_DIR, "reused": False}
+
+
+def s_download_tool(job):
+    t = ONLINE["tool"]
+    job.step("下载 %s" % t["file_name"])
+    for i in range(1, 11):
+        job.sleep(0.1)
+        job.emit(t="progress", id="p2", label="下载 Sight 部署助手 %s" % t["latest"], done=i * 1_430_000, total=14_300_000, speed=5_000_000, eta=(10 - i) // 3)
+    return {"path": "/Users/demo/Downloads/" + t["file_name"], "name": t["file_name"], "dir": "/Users/demo/Downloads", "version": t["latest"],
+            "howto": ["先退出当前的部署助手（界面左下角「退出程序」）", "解压 zip，用新的「Sight部署助手.app」替换旧的；第一次打开仍需右键 → 打开"]}
+
+
+SCRIPTS = {"download_package": s_download_package, "download_tool": s_download_tool, "status": s_status, "deploy": s_deploy, "service": s_service, "logs": s_logs,
            "follow_logs": s_follow_logs, "list_backups": s_list_backups, "rollback": s_rollback,
            "add_host": s_add_host, "edit_host": s_edit_host, "test_host": s_test_host}
 
@@ -504,10 +543,19 @@ class H(BaseHTTPRequestHandler):
             if p == "/api/state" and method == "GET":
                 with LOCK:
                     return self._send(200, dict(STATE, busy=BUSY["id"]))
+            if p == "/api/online" and method == "GET":
+                if "--offline" in sys.argv:
+                    return self._send(200, {"error": "无法连接官网（官网：域名解析失败，电脑可能没有联网）", "tool": None, "products": {}, "site": ONLINE["site"]})
+                time.sleep(1.2)
+                return self._send(200, dict(ONLINE, checked_at=int(time.time())))
+            if p == "/api/reveal":
+                self._body()
+                return self._send(200, {"ok": True})
             if p == "/api/settings":
                 d = self._json()
                 with LOCK:
-                    STATE["settings"].update({"keep_backups": int(d["keep_backups"]), "health_timeout": int(d["health_timeout"])})
+                    STATE["settings"].update({"keep_backups": int(d["keep_backups"]), "health_timeout": int(d["health_timeout"]),
+                                              "auto_check": d.get("auto_check") is not False})
                 return self._send(200, {"ok": True})
             if p == "/api/hosts/delete":
                 d = self._json()

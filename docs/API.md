@@ -20,7 +20,7 @@
 {
   "version": "2.0.0",
   "busy": "job-id 或 null",
-  "settings": {"keep_backups": 3, "health_timeout": 300},
+  "settings": {"keep_backups": 3, "health_timeout": 300, "auto_check": true},
   "hosts": [
     {"name": "生产-1", "host": "10.0.0.5", "port": 22, "user": "root", "auth": "password",
      "last_used": "2026-10-10 01:16",
@@ -32,11 +32,31 @@
 ```
 `hosts[].products` 是**上次查到的缓存**，可能过时；真实状态以 `status` 任务结果为准。
 
-`POST /api/settings` `{"keep_backups": 3, "health_timeout": 300}` → `{"ok": true}`
+`POST /api/settings` `{"keep_backups": 3, "health_timeout": 300, "auto_check": true}` → `{"ok": true}`（`auto_check` 可省略：是否在启动时自动联网检查更新，默认开）
 
 `POST /api/hosts/delete` `{"name": "生产-1"}` → `{"ok": true}`（只删本机保存的信息）
 
 `POST /api/shutdown` → `{"ok": true}`，随后进程退出（前端显示「已退出，可以关闭此页面」）。有任务在跑时返回 409。
+
+## 在线检查（官网下载中心）
+
+数据源：官网 `GET <官网>/api/downloads`（只读版本信息，不上传任何数据）；查不到部署助手本身的版本时，再退到 GitHub Release。
+官网地址默认 `https://www.sightdata.top`，环境变量 `SIGHT_DEPLOY_SITE` 可改（调试用假官网）。结果在内存里缓存 10 分钟（失败只缓存 1 分钟）。
+
+`GET /api/online[?refresh=1]` → 网络不通也返回 200，错误放在 `error`：
+```json
+{"checked_at": 1791766419, "source": "site", "error": null, "site": "https://www.sightdata.top",
+ "tool": {"current": "2.1.0", "latest": "2.2.0", "update": true, "can_download": true, "platform": "windows-x64",
+          "file_name": "Sight部署助手-2.2.0-windows-x64.exe", "size_text": "14.4 MB", "page": "https://www.sightdata.top/downloads"},
+ "products": {"sight-report": {"latest": "2.0.73", "file_name": "sight-report-2.0.73.zip", "size_text": "258M",
+                               "pan_url": "", "pan_code": ""},
+              "sight-wall": {"latest": "2.0.70", "...": "..."}}}
+```
+- `tool` 可能为 null（官网和 GitHub 都没连上）；`can_download=false` 表示这个系统没有现成的安装包（如 Linux 源码运行），界面只给「打开下载中心」。
+- Intel Mac 的部署助手只在 GitHub Release 里，下载地址会指向 GitHub（可用环境变量 `GH_DL_PREFIX` 加速）。
+- `products` 里没有的产品，说明官网没有可下载的包。
+
+`POST /api/reveal` → `{"ok": true}`：在文件管理器里显示刚下载的新版部署助手（只认 `download_tool` 保存的那个文件）。
 
 ## 本地文件
 
@@ -78,6 +98,8 @@
 | `follow_logs` | `host, product` | 不会自己结束；通过 `log` 事件推送新行，用户点「停止」→ cancel |
 | `list_backups` | `host, product` | `{"backup_dir": "...", "current_version": "2.0.71", "db_kind": "h2/external/none", "backups": [{"file": "...", "version": "2.0.69", "time": "2026-10-10 01:16", "size": 30000000}]}` |
 | `rollback` | `host, product, file, full(bool)` | `{}` |
+| `download_package` | `product`（`sight-report` / `sight-wall`） | `{"path", "name", "size", "product", "version", "mtime", "dir", "reused"}`：从官网下载该产品最新版到 `~/.sight-deploy/uploads/`（断点续传、zip 完整性校验）；本机常用位置已有同名同大小的包就直接复用（`reused=true`）。拿到的 `path` 直接用于 `deploy` |
+| `download_tool` | 无 | `{"path", "name", "dir", "version", "howto": [...]}`：下载新版部署助手到「下载」目录；已是最新时失败。不会自动替换正在运行的程序 |
 
 `status` 结果：
 ```json
@@ -145,7 +167,7 @@
    - 未安装：灰卡 +「安装」按钮。
    - 已安装：状态徽标（运行中 / 启动中或无响应 / 未运行）、版本、访问地址（可点击，新窗口打开）、目录、端口、服务方式、Java、数据库、健康（未初始化时提示去 /setup）、备份数、磁盘剩余。
      按钮：「升级」「重启」「停止 / 启动」「日志」「回滚」。
-3. **安装 / 升级**：打开「选择安装包」对话框（自动发现列表，按时间倒序，显示产品+版本+大小+目录；「浏览…」文件浏览器；拖入区域，拖进来先上传再选中）；
+3. **安装 / 升级**：打开「选择安装包」对话框（顶部是「官网最新版」条目——选中后点「下一步」才跑 `download_package`，下完再进第 2 步；本机已有同版本时不再显示官网条目；下面是自动发现列表，按时间倒序，显示产品+版本+大小+目录；「浏览…」文件浏览器；拖入区域，拖进来先上传再选中）；
    然后「选择服务器」（默认当前服务器，可多选做滚动升级，说明“多台会依次处理，某台失败会询问是否继续”）→ 开始 `deploy` 任务。
    从产品卡点「安装/升级」时，安装包列表优先显示该产品的包。
 4. **任务面板**：任务开始后弹出大面板（或右侧抽屉）展示时间线：step 为节点，其下 ok/warn/fail/info 行、进度条、live 行、可折叠的 log。
@@ -156,3 +178,8 @@
 7. **添加服务器**：表单（地址、SSH 端口 22、账号 root、登录方式 密码/密钥文件、密码 / 私钥路径（带「浏览…」）+ 私钥密码、名称（默认=地址））→ `add_host` 任务（会做连接测试；任务里可能还会问 sudo 密码）。成功后列表刷新并选中它。
 8. **设置**：升级备份保留份数、等待服务就绪秒数。页脚显示本地日志路径（可复制）与「退出程序」。
 9. 首次打开且没有服务器时，右侧显示引导：三步说明（添加服务器 → 选择安装包 → 一键安装/升级）+ 大号「添加服务器」按钮。
+10. **在线更新提示**：启动后（设置里没关「启动时自动检查更新」）后台调 `GET /api/online`：
+    - 部署助手有新版本 → 页面顶部横幅「下载新版本 / 忽略此版本」，侧栏版本号旁出现「有新版本」；点「下载新版本」跑 `download_tool`，成功后提供「在文件夹中显示」。
+    - 产品卡：已安装版本低于官网最新时，版本旁出现「官网有 X」标签和一条提示；点「升级」自动预选版本最高的包（本机包与官网最新版里选高的，同版本优先用本机的）。
+    - 侧栏「检查更新」：强制刷新（`?refresh=1`）并弹出汇总（部署助手、两个产品的最新版本、哪些已添加的服务器可升级）；连不上官网时说明原因。
+    - 联网失败一律不打断使用：自动检查失败时静默，选包对话框里提示「只能使用本机上的安装包」。

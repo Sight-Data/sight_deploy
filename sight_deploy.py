@@ -34,6 +34,7 @@ import datetime as _dt
 import hashlib
 import json
 import os
+import platform
 import re
 import secrets as _secrets
 import shlex
@@ -49,7 +50,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-TOOL_VERSION = "2.0.1"
+TOOL_VERSION = "2.1.0"
 CONF_DIR = Path(os.environ.get("SIGHT_DEPLOY_HOME") or (Path.home() / ".sight-deploy"))
 FROZEN = getattr(sys, "frozen", False)
 # 程序所在目录：打包后是 exe/.app 所在目录（用来找同目录下的安装包），源码运行是本文件目录
@@ -2685,12 +2686,323 @@ class Ctx:
     def settings(self):
         st = self.store.snapshot().get("settings") or {}
         return {"keep_backups": max(1, _int(st.get("keep_backups") or 3)),
-                "health_timeout": max(60, _int(st.get("health_timeout") or 300))}
+                "health_timeout": max(60, _int(st.get("health_timeout") or 300)),
+                "auto_check": st.get("auto_check") is not False}
 
     def host_product(self, r, product):
         if not r.alias:
             return None
         return ((self.store.get(r.alias) or {}).get("products") or {}).get(product)
+
+
+# =============================================================================
+# 在线检查更新 / 下载（官网下载中心 → GitHub Release 兜底）
+# =============================================================================
+
+SITE_BASE = (os.environ.get("SIGHT_DEPLOY_SITE") or "https://www.sightdata.top").rstrip("/")
+GH_REPO = "Sight-Data/sight_deploy"
+GH_DL_PREFIX = os.environ.get("GH_DL_PREFIX", "")  # 国内访问 GitHub 慢时的下载加速前缀
+SITE_PRODUCT_IDS = {"sight-report": "dl-report", "sight-wall": "dl-wall"}
+SITE_TOOL_IDS = {"windows-x64": "dl-deploy-win", "mac-arm64": "dl-deploy-mac", "mac-x86_64": "dl-deploy-mac"}
+ONLINE_TTL = 600  # 秒：同一次运行里，重复检查直接用缓存
+_online = {"at": 0.0, "data": None}
+_online_lock = threading.Lock()
+
+
+def _ssl_ctx():
+    import ssl
+    try:  # 打包版（尤其 Mac 的 python.org 构建）没有系统根证书，优先用 certifi 自带的
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+def _http_open(url, headers=None, timeout=10, method="GET"):
+    import urllib.request
+    h_ = {"User-Agent": "SightDeploy/%s (%s)" % (TOOL_VERSION, sys.platform)}
+    h_.update(headers or {})
+    return urllib.request.urlopen(urllib.request.Request(url, method=method, headers=h_),
+                                  timeout=timeout, context=_ssl_ctx())
+
+
+def _http_json(url, timeout=8):
+    with _http_open(url, {"Accept": "application/json"}, timeout) as r:
+        return json.loads(r.read(8 << 20).decode("utf-8"))
+
+
+def _net_err(e):
+    """把网络异常翻成人话。"""
+    import urllib.error
+    if isinstance(e, urllib.error.HTTPError):
+        return "服务器返回 HTTP %s" % e.code
+    reason = getattr(e, "reason", e)
+    txt = str(reason)
+    if "CERTIFICATE" in txt.upper():
+        return "证书校验失败（电脑的时间不对，或网络里有代理 / 防火墙在改写 HTTPS）"
+    if isinstance(reason, socket.timeout) or isinstance(e, socket.timeout) or "timed out" in txt:
+        return "连接超时"
+    if isinstance(reason, socket.gaierror) or "getaddrinfo" in txt or "Name or service" in txt:
+        return "域名解析失败，电脑可能没有联网"
+    return txt or type(e).__name__
+
+
+def tool_platform():
+    forced = os.environ.get("SIGHT_DEPLOY_PLATFORM")  # 调试用：windows-x64 / mac-arm64 / mac-x86_64
+    if forced:
+        return forced
+    m = platform.machine().lower()
+    if sys.platform == "win32":
+        return "windows-x64" if m in ("amd64", "x86_64", "x64") else None
+    if sys.platform == "darwin":
+        return "mac-arm64" if m in ("arm64", "aarch64") else "mac-x86_64"
+    return None
+
+
+def _gh_asset_url(ver, plat):
+    return "%shttps://github.com/%s/releases/download/v%s/sight-deploy-%s-%s%s" % (
+        GH_DL_PREFIX, GH_REPO, ver, ver, plat, ".exe" if plat.startswith("windows") else ".zip")
+
+
+def _safe_name(name, fallback):
+    name = os.path.basename((name or "").replace("\\", "/"))
+    name = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", name).strip(" .")
+    return name or fallback
+
+
+def _online_from_site():
+    items = _http_json(SITE_BASE + "/api/downloads")
+    by = {d.get("id"): d for d in items if isinstance(d, dict) and d.get("published") is not False}
+    prods = {}
+    for pid, did in SITE_PRODUCT_IDS.items():
+        d = by.get(did)
+        if d and d.get("localFile") and d.get("version"):
+            prods[pid] = {"latest": str(d["version"]), "file_name": d.get("fileName") or "", "size_text": d.get("fileSize") or "",
+                          "url": "%s/downloads/file/%s" % (SITE_BASE, did), "updated": d.get("updatedAt") or "",
+                          "pan_url": d.get("baiduPanUrl") or "", "pan_code": d.get("baiduPanCode") or ""}
+    tool, plat = None, tool_platform()
+    cands = [by.get(i) for i in ("dl-deploy-win", "dl-deploy-mac") if by.get(i) and by[i].get("version")]
+    if cands:
+        latest = max((str(d["version"]) for d in cands), key=parse_version)
+        mine = by.get(SITE_TOOL_IDS.get(plat)) if plat else None
+        url, fname, size_text = None, "", ""
+        if plat == "mac-x86_64":  # 官网只放了 Apple 芯片版，Intel 版在 GitHub Release
+            url, fname = _gh_asset_url(latest, plat), "sight-deploy-%s-%s.zip" % (latest, plat)
+        elif mine and mine.get("localFile") and str(mine.get("version")) == latest:
+            url, fname, size_text = "%s/downloads/file/%s" % (SITE_BASE, mine["id"]), mine.get("fileName") or "", mine.get("fileSize") or ""
+        tool = {"latest": latest, "url": url, "file_name": fname, "size_text": size_text}
+    return tool, prods
+
+
+def _online_tool_from_github():
+    rel = _http_json("https://api.github.com/repos/%s/releases/latest" % GH_REPO)
+    tag = str(rel.get("tag_name") or "")
+    ver = tag.lstrip("vV")
+    if not parse_version(ver):
+        raise ValueError("GitHub 上没有可用的 Release")
+    plat = tool_platform()
+    url, fname = None, ""
+    for a in rel.get("assets") or []:
+        if plat and ("-%s." % plat) in a.get("name", ""):
+            url, fname = GH_DL_PREFIX + a.get("browser_download_url", ""), a["name"]
+    return {"latest": ver, "url": url, "file_name": fname, "size_text": "", "notes": (rel.get("body") or "")[:1200]}
+
+
+def check_online(force=False):
+    """查官网下载中心（失败再退到 GitHub Release）：部署助手本身和两个产品的最新版本。结果缓存 10 分钟。"""
+    with _online_lock:
+        if not force and _online["data"] and time.time() - _online["at"] < ONLINE_TTL:
+            return _online["data"]
+        res = {"checked_at": int(time.time()), "source": None, "error": None, "site": SITE_BASE,
+               "tool": None, "products": {}}
+        errs = []
+        tool = prods = None
+        try:
+            tool, prods = _online_from_site()
+            res["source"] = "site"
+        except Exception as e:
+            errs.append("官网：" + _net_err(e))
+        if not tool:
+            try:
+                tool = _online_tool_from_github()
+                res["source"] = res["source"] or "github"
+            except Exception as e:
+                errs.append("GitHub：" + _net_err(e))
+        if prods:
+            res["products"] = prods
+        if tool:
+            tool.update(current=TOOL_VERSION, platform=tool_platform(), page=SITE_BASE + "/downloads",
+                        update=parse_version(tool["latest"]) > parse_version(TOOL_VERSION),
+                        can_download=bool(tool.get("url")))
+            res["tool"] = tool
+        if not res["source"]:
+            res["error"] = "无法连接官网（%s）" % "；".join(errs)
+        LOG.write("  [检查更新] source=%s tool=%s products=%s%s" % (
+            res["source"], (tool or {}).get("latest"), {k: v["latest"] for k, v in res["products"].items()},
+            " 错误=" + res["error"] if res["error"] else ""))
+        _online["data"] = res
+        # 失败的结果只缓存 1 分钟，网络恢复后很快能重试
+        _online["at"] = time.time() - (ONLINE_TTL - 60 if res["error"] else 0)
+        return res
+
+
+def _remote_size(url):
+    try:
+        with _http_open(url, method="HEAD", timeout=15) as r:
+            return _int(r.headers.get("Content-Length") or 0) or None
+    except Exception:
+        return None
+
+
+def download_file(url, dest, label, expect_size=None):
+    """断点续传下载：先写 <dest>.part，下完校验大小再改名。中途断网自动续传 3 次；用户点「停止」时保留 .part，下次接着下。"""
+    import urllib.error
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_name(dest.name + ".part")
+    prog, total, tries = None, expect_size, 0
+    while True:
+        have = part.stat().st_size if part.exists() else 0
+        try:
+            try:
+                resp = _http_open(url, {"Range": "bytes=%d-" % have} if have else None, timeout=20)
+            except urllib.error.HTTPError as e:
+                if e.code == 416 and have:  # 本地 .part 比服务器上的还大 / 已经下完：丢掉重来
+                    part.unlink()
+                    continue
+                raise
+            with resp:
+                code = getattr(resp, "status", 200)
+                clen = _int(resp.headers.get("Content-Length") or 0)
+                if code == 206:
+                    m = re.search(r"/(\d+)\s*$", resp.headers.get("Content-Range") or "")
+                    total = int(m.group(1)) if m else (have + clen if clen else total)
+                    mode = "ab"
+                else:  # 服务器不支持续传：从头来
+                    have, mode = 0, "wb"
+                    total = clen or total
+                if prog is None:
+                    prog = Progress(label, total or 0, have)
+                else:
+                    prog.total, prog.start, prog.t0 = max(total or 1, 1), have, time.time()
+                done = have
+                with open(part, mode) as f:
+                    while True:
+                        chunk = resp.read(256 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        done += len(chunk)
+                        prog.update(done)
+            if total and part.stat().st_size != total:
+                raise IOError("下载不完整（%d / %d 字节）" % (part.stat().st_size, total))
+            break
+        except (JobCancelled, UserAbort):
+            raise
+        except urllib.error.HTTPError as e:
+            raise DeployError("下载失败：服务器返回 HTTP %s" % e.code, "请稍后重试，或到官网下载中心手动下载")
+        except Exception as e:
+            tries += 1
+            if tries > 3:
+                raise DeployError("下载中断：%s" % _net_err(e), "网络恢复后重试会接着已下载的部分继续；也可以到官网下载中心手动下载")
+            warn("网络中断（%s），%d 秒后接着下载（第 %d/3 次）…" % (_net_err(e), 2 * tries, tries))
+            for _ in range(2 * tries * 4):
+                check_cancel()
+                time.sleep(0.25)
+    os.replace(part, dest)
+    if prog:
+        prog.finish()
+    return dest
+
+
+def _local_same_file(name, size):
+    """本机常用位置里已经有同名、同大小的包就不重复下载。"""
+    for d in search_dirs():
+        f = d / name
+        try:
+            if f.is_file() and f.stat().st_size == size and zipfile.is_zipfile(f):
+                return f
+        except OSError:
+            continue
+    return None
+
+
+def job_download_package(ctx, p):
+    product = _product_of(p)
+    pn = PRODUCTS[product]["name"]
+    step("查询官网上 %s 的最新版本" % pn)
+    on = check_online(force=True)
+    if on.get("error") and not on["products"]:
+        raise DeployError(on["error"], "请检查这台电脑的网络；也可以手动到 %s/downloads 下载，再把 zip 拖进「选择安装包」窗口" % SITE_BASE)
+    it = on["products"].get(product)
+    if not it:
+        raise DeployError("官网下载中心里没有找到 %s 的安装包" % pn, "请手动获取安装包后拖进窗口")
+    ver = it["latest"]
+    ok("%s 最新版 %s%s" % (pn, ver, "（%s）" % it["size_text"] if it.get("size_text") else ""))
+    name = _safe_name(it.get("file_name"), "%s-%s.zip" % (product, ver))
+    if _guess_pkg(name)[0] != product:  # 文件名对不上就改成程序认得的写法，保证之后能被自动发现
+        name = "%s-%s.zip" % (product, ver)
+    step("下载安装包 %s" % name)
+    size = _remote_size(it["url"])
+    same = _local_same_file(name, size) if size else None
+    if same:
+        ok("本机已经有同版本安装包，不用重复下载：%s" % same)
+        dest = same
+    else:
+        d = CONF_DIR / "uploads"
+        dest = download_file(it["url"], d / name, "下载 %s %s" % (pn, ver), size)
+        step("校验安装包完整性")
+        try:
+            with zipfile.ZipFile(dest) as zf:
+                bad = zf.testzip()
+            if bad:
+                raise zipfile.BadZipFile("%s 损坏" % bad)
+        except zipfile.BadZipFile as e:
+            dest.unlink()
+            raise DeployError("下载的安装包不完整（%s）" % e, "请重试；反复出现请手动到官网下载")
+        ok("安装包完整（%s）" % human_size(dest.stat().st_size))
+    return {"path": str(dest), "name": dest.name, "size": dest.stat().st_size, "product": product, "version": ver,
+            "mtime": int(dest.stat().st_mtime), "dir": str(dest.parent), "reused": bool(same)}
+
+
+def job_download_tool(ctx, p):
+    step("查询 Sight 部署助手的最新版本")
+    on = check_online(force=True)
+    t = on.get("tool")
+    if not t:
+        raise DeployError(on.get("error") or "没有查到新版本", "请手动到 %s/downloads 下载" % SITE_BASE)
+    if not t["update"]:
+        raise DeployError("当前 %s 已经是最新版本" % TOOL_VERSION)
+    if not t.get("url"):
+        raise DeployError("这个系统暂时没有可下载的安装包", "请到 %s/downloads 查看" % SITE_BASE)
+    ok("最新版 %s（当前 %s）" % (t["latest"], TOOL_VERSION))
+    name = _safe_name(t.get("file_name"), "Sight部署助手-%s%s" % (t["latest"], ".exe" if os.name == "nt" else ".zip"))
+    home = Path.home()
+    d = home / "Downloads" if (home / "Downloads").is_dir() else home
+    step("下载 %s" % name)
+    dest = download_file(t["url"], d / name, "下载 Sight 部署助手 %s" % t["latest"], _remote_size(t["url"]))
+    APP.tool_download = str(dest)
+    if (tool_platform() or "").startswith("windows"):
+        howto = ["先退出当前的部署助手（界面左下角「退出程序」，或右下角通知区图标右键 → 退出）", "再双击新下载的 exe 运行；旧版本的 exe 可以删除"]
+    else:
+        howto = ["先退出当前的部署助手（界面左下角「退出程序」）", "解压 zip，用新的「Sight部署助手.app」替换旧的；第一次打开仍需右键 → 打开"]
+    for x in howto:
+        info(x)
+    return {"path": str(dest), "name": dest.name, "dir": str(d), "version": t["latest"], "howto": howto}
+
+
+def reveal_file(path):
+    path = Path(path)
+    try:
+        if os.name == "nt":
+            subprocess.Popen(["explorer", "/select,", str(path)])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path.parent)])
+    except OSError as e:
+        raise DeployError("无法打开文件夹：%s" % e)
+
 
 
 def _product_of(p):
@@ -2891,10 +3203,13 @@ JOB_HANDLERS = {
     "follow_logs": job_follow_logs,
     "list_backups": job_list_backups,
     "rollback": job_rollback,
+    "download_package": job_download_package,
+    "download_tool": job_download_tool,
 }
 JOB_TITLES = {"add_host": "添加服务器", "edit_host": "修改密码", "test_host": "测试连接", "status": "查询状态",
               "deploy": "安装 / 升级", "service": "启停服务", "logs": "查看日志", "follow_logs": "实时日志",
-              "list_backups": "读取备份列表", "rollback": "回滚"}
+              "list_backups": "读取备份列表", "rollback": "回滚",
+              "download_package": "下载安装包", "download_tool": "下载新版部署助手"}
 
 
 class Job:
@@ -2986,6 +3301,7 @@ class App:
         self.last_beat = time.time()
         self.port = None
         self.httpd = None
+        self.tool_download = None
 
     def busy(self):
         j = self.current
@@ -3232,6 +3548,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, "app": "sight-deploy"})
             if u.path == "/api/state":
                 return self._json(api_state())
+            if u.path == "/api/online":
+                return self._json(check_online(force=(qs.get("refresh") or ["0"])[0] == "1"))
             if u.path == "/api/packages":
                 return self._json(api_packages())
             if u.path == "/api/jdks":
@@ -3266,7 +3584,16 @@ class Handler(BaseHTTPRequestHandler):
                     return self._err("备份保留份数请填 1~50")
                 if not 60 <= ht <= 3600:
                     return self._err("等待时间请填 60~3600 秒")
-                APP.store.update_settings({"keep_backups": kb, "health_timeout": ht})
+                upd = {"keep_backups": kb, "health_timeout": ht}
+                if isinstance(body.get("auto_check"), bool):
+                    upd["auto_check"] = body["auto_check"]
+                APP.store.update_settings(upd)
+                return self._json({"ok": True})
+            if u.path == "/api/reveal":
+                f = APP.tool_download
+                if not f or not os.path.exists(f):
+                    return self._err("没有可显示的文件")
+                reveal_file(f)
                 return self._json({"ok": True})
             if u.path == "/api/hosts/delete":
                 if APP.busy():

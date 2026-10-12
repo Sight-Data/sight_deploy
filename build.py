@@ -63,7 +63,7 @@ def ensure_venv():
         venv.EnvBuilder(with_pip=True, clear=True).create(VENV)
     py = venv_python()
     run([py, "-m", "pip", "install", "-q", "--disable-pip-version-check", "--upgrade", "pip"])
-    run([py, "-m", "pip", "install", "-q", "--disable-pip-version-check", PARAMIKO, PYINSTALLER])
+    run([py, "-m", "pip", "install", "-q", "--disable-pip-version-check", PARAMIKO, PYINSTALLER, "certifi"])  # certifi：在线检查更新用的 HTTPS 根证书（Mac 的 python.org 构建没有系统证书）
     return py
 
 
