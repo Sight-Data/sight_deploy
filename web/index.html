@@ -1300,7 +1300,7 @@ function deployFlow(hostName, productId) {
     M1 = openModal({
       title: productId ? '选择 ' + productName(productId) + ' 安装包' : '选择安装包', sub: '第 1 步，共 2 步', cls: 'w760', body: body, dismiss: true, enter: 'next',
       actions: [{ label: '取消', onClick: function (M) { M.close(); } },
-        { label: '下一步', key: 'next', kind: 'primary', disabled: !pk.get(), onClick: function (M) { var s0 = pk.get(); if (s0.online && isBusy()) { toast('正在读取服务器状态，请等几秒再点「下一步」'); return; } M.close(); if (s0.online) fetchThenStep2(s0); else step2(s0); } }]
+        { label: '下一步', key: 'next', kind: 'primary', disabled: !pk.get(), onClick: function (M) { var s0 = pk.get(); if (productId && s0.product && s0.product !== productId) { toast('这是 ' + productName(s0.product) + ' 的安装包，不能用来升级 ' + productName(productId) + '，请重新选择'); return; } if (s0.online && isBusy()) { toast('正在读取服务器状态，请等几秒再点「下一步」'); return; } M.close(); if (s0.online) fetchThenStep2(s0); else step2(s0); } }]
     });
     $('.mb', M1.md).style.minHeight = '320px';
   }
@@ -1340,7 +1340,7 @@ function deployFlow(hostName, productId) {
       var names = S.state.hosts.map(function (x) { return x.name; }).filter(function (k) { return picked[k]; });
       if (!names.length) return;
       M.close();
-      startJob('deploy', { hosts: names, package: pkg.path }, {
+      startJob('deploy', { hosts: names, package: pkg.path, product: productId || null }, {
         title: '安装 / 升级 · ' + pkg.name, productName: pkg.product ? productName(pkg.product) : (productId ? productName(productId) : '系统'), failTitle: '安装 / 升级没有完成'
       });
     }

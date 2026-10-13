@@ -50,7 +50,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-TOOL_VERSION = "2.1.1"
+TOOL_VERSION = "2.1.2"
 CONF_DIR = Path(os.environ.get("SIGHT_DEPLOY_HOME") or (Path.home() / ".sight-deploy"))
 FROZEN = getattr(sys, "frozen", False)
 # 程序所在目录：打包后是 exe/.app 所在目录（用来找同目录下的安装包），源码运行是本文件目录
@@ -1762,6 +1762,28 @@ def svc_functions(product, inst_dir, owner, unit, profile, env):
 D=%(d)s; J=%(j)s; SVC=%(svc)s; UNIT=%(unit)s; OWNER=%(owner)s
 TAROPT=""; tar --version 2>/dev/null | grep -q GNU && TAROPT="--anchored --no-wildcards-match-slash"
 say(){ echo ">> $*"; }
+# 服务器没有 tar / gzip（精简系统、离线环境常见）时用目录复制备份：cp_copy 源目录 目标目录 是否含data(1/0)
+# 跳过项与 tar 备份的 BACKUP_EXCLUDES 一致；data 是符号链接时只复制链接本身（与 tar 行为相同）
+cp_copy(){
+  mkdir -p "$2" || return 1
+  ( cd "$1" || exit 1
+    for e in .[!.]* ..?* *; do
+      [ -e "$e" ] || [ -L "$e" ] || continue
+      case "$e" in logs|.sight-staging|*.pid|*.bak.*|*.jar.new) continue;; esac
+      if [ "$e" = data ] && [ ! -L data ]; then
+        [ "$3" = 1 ] || continue
+        mkdir -p "$2/data" || exit 1
+        for f in data/.[!.]* data/..?* data/*; do
+          [ -e "$f" ] || [ -L "$f" ] || continue
+          case "${f#data/}" in backups|cache*|temp) continue;; esac
+          cp -a "$f" "$2/data/" || exit 1
+        done
+      elif [ "$e" = data ] && [ "$3" != 1 ]; then continue
+      else
+        cp -a "$e" "$2/" || exit 1
+      fi
+    done )
+}
 jar_pids(){
   R=$(readlink -f "$D")
   for p in $(pgrep -f -- "$J" 2>/dev/null); do
@@ -1793,6 +1815,12 @@ start_svc(){
 ''' % {"d": shlex.quote(inst_dir), "j": shlex.quote(jar), "svc": shlex.quote(product),
        "unit": "1" if unit else "0", "owner": shlex.quote(owner or "root"),
        "start_q": shlex.quote(start_cmd.replace("$SS", "$(command -v setsid)"))}
+
+
+def have_archive_tools(r):
+    """服务器上是否同时有 tar 和 gzip（没有时备份 / 回滚改用目录复制，不依赖网络安装）。"""
+    code, o, _ = r.run("command -v tar >/dev/null 2>&1 && command -v gzip >/dev/null 2>&1 && echo yes", sudo=True)
+    return "yes" in o
 
 
 def tar_excludes():
@@ -2390,18 +2418,24 @@ def do_upgrade(ctx, r, pkg, inst):
         env = probe_env(r, product, inst_dir, port)
         new_java_home = java_home_of(resolve_java(r, env, need_java))
 
+    # 备份方式：有 tar+gzip 用压缩包；没有（离线服务器常见）改用目录复制，无需联网安装任何东西
+    use_tar = have_archive_tools(r)
+    if not use_tar:
+        warn("服务器没有 tar / gzip：本次改用目录复制方式备份（不压缩，占用空间约等于程序 + data/ 的完整大小）")
+
     # 备份规划（备份盘不够时让用户换个目录，比如挂载的数据盘）
     bdir = backup_dir_for(ctx, r, product, inst_dir)
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     while True:
         est = estimate_backup(r, inst_dir, bdir)
-        if est["free_kb"] >= est["size_kb"] // 2 + pkg.total_size() // 1024 + 200 * 1024:
+        if est["free_kb"] >= (est["size_kb"] // 2 if use_tar else est["size_kb"]) + pkg.total_size() // 1024 + 200 * 1024:
             break
         fail("备份目录 %s 所在磁盘剩余 %s，不够存放备份（最多 %s）" % (
             bdir, human_size(est["free_kb"] * 1024), human_size(est["size_kb"] * 1024)))
         bdir = ask("换一个空间充足的备份目录（服务器上的绝对路径）", bdir,
                    validator=lambda v: None if v.startswith("/") and " " not in v else "请填不含空格的绝对路径").rstrip("/")
-    bfile = posix_join(bdir, "%s-%s-%s.tar.gz" % (product, re.sub(r"[^\w.]", "_", inst["version"]), stamp))
+    bfile = posix_join(bdir, "%s-%s-%s.%s" % (product, re.sub(r"[^\w.]", "_", inst["version"]), stamp,
+                                              "tar.gz" if use_tar else "dir"))
 
     plan = [("产品", pkg.name), ("版本", "%s → %s" % (inst["version"], pkg.version)),
             ("服务器", r.label()), ("安装目录", "%s（运行账号 %s）" % (inst_dir, inst["owner"])),
@@ -2453,18 +2487,18 @@ def do_upgrade(ctx, r, pkg, inst):
     s += r'''
 B=%(b)s; BD=%(bd)s
 finish(){ echo "$1" > "$ST"; }
-restore_old(){ tar $TAROPT -xzf "$B" -C "$D" --exclude=./data; start_svc; }
+%(restore)s
 say "停止服务 …"
 if ! stop_svc; then say "服务停止失败（服务未改动）"; start_svc; finish FAIL:stop; exit 1; fi
 say "服务已停止，开始备份（程序 + data/）…"
 mkdir -p "$BD"
-( umask 077; exec tar -czf "$B.tmp" -C "$D" %(ex)s . ); rc=$?
-if [ $rc -gt 1 ] || [ ! -s "$B.tmp" ]; then
-  rm -f "$B.tmp"; say "备份失败（tar 退出码 $rc），正在重新启动旧版本 …"; start_svc; finish FAIL:backup; exit 1
+%(backup)s
+if %(bad)s; then
+  rm -rf "$B.tmp"; say "备份失败（tar 退出码 $rc），正在重新启动旧版本 …"; start_svc; finish FAIL:backup; exit 1
 fi
-mv -f "$B.tmp" "$B"
+rm -rf "$B"; mv -f "$B.tmp" "$B"
 %(meta)s
-say "备份完成：$(du -h "$B" | cut -f1)"
+say "备份完成：$(du -sh "$B" | cut -f1)"
 say "替换程序文件 …"
 if ! { %(copy)s; }; then
   say "替换失败（磁盘满或权限问题？），从备份恢复程序文件并启动旧版本 …"
@@ -2479,6 +2513,11 @@ if ! start_svc; then
 fi
 finish OK
 ''' % {"b": shlex.quote(bfile), "bd": shlex.quote(bdir), "ex": tar_excludes(),
+       "restore": ('restore_old(){ tar $TAROPT -xzf "$B" -C "$D" --exclude=./data; start_svc; }' if use_tar
+                   else 'restore_old(){ cp_copy "$B" "$D" 0; start_svc; }'),
+       "backup": ('( umask 077; exec tar -czf "$B.tmp" -C "$D" %s . ); rc=$?' % tar_excludes() if use_tar
+                  else 'rm -rf "$B.tmp"; ( umask 077; cp_copy "$D" "$B.tmp" 1 ); rc=$?'),
+       "bad": ('[ $rc -gt 1 ] || [ ! -s "$B.tmp" ]' if use_tar else '[ $rc -ne 0 ] || [ ! -d "$B.tmp" ]'),
        "meta": heredoc(bfile + ".json", meta),
        "copy": copy_files_script(pkg, staging, inst_dir, inst["owner"]),
        "marker": heredoc(posix_join(inst_dir, MARKER), marker), "markername": MARKER,
@@ -2565,12 +2604,12 @@ df -Pk "$d" | awk 'NR==2{print "free_kb=" $4}'
 
 
 def list_backups(r, bdir, product):
-    code, o, _ = r.run("ls -1t %s/%s-*.tar.gz 2>/dev/null | while read f; do echo \"$f|$(du -k \"$f\" | cut -f1)\"; done"
-                       % (shlex.quote(bdir), product), sudo=True)
+    code, o, _ = r.run("ls -1dt %s/%s-*.tar.gz %s/%s-*.dir 2>/dev/null | while read f; do echo \"$f|$(du -sk \"$f\" | cut -f1)\"; done"
+                       % (shlex.quote(bdir), product, shlex.quote(bdir), product), sudo=True)
     res = []
     for line in o.splitlines():
         f, _, kb = line.partition("|")
-        m = re.search(r"-(\d[\w.]*)-(\d{8}-\d{6})\.tar\.gz$", f)
+        m = re.search(r"-(\d[\w.]*)-(\d{8}-\d{6})\.(?:tar\.gz|dir)$", f)
         res.append({"file": f, "size": _int(kb) * 1024, "version": m.group(1) if m else "?",
                     "time": _dt.datetime.strptime(m.group(2), "%Y%m%d-%H%M%S").strftime("%Y-%m-%d %H:%M")
                     if m else "?"})
@@ -2581,7 +2620,7 @@ def prune_backups(r, bdir, product, keep_n, keep):
     bs = list_backups(r, bdir, product)
     old = [b["file"] for b in bs[keep_n:] if b["file"] != keep]
     if old:
-        r.run("rm -f %s" % " ".join(shlex.quote(f) + " " + shlex.quote(f + ".json") for f in old), sudo=True)
+        r.run("rm -rf %s" % " ".join(shlex.quote(f) + " " + shlex.quote(f + ".json") for f in old), sudo=True)
         info(dim("已清理 %d 份较早的备份（保留最近 %d 份）" % (len(old), keep_n)))
 
 
@@ -2597,32 +2636,41 @@ def do_rollback_file(ctx, r, product, inst, bfile, full, snapshot=True):
         r.run("mkdir -p %s" % shlex.quote(staging), check=True)
     else:
         r.mkdirs(staging)
+    use_tar = have_archive_tools(r)
+    if bfile.endswith(".tar.gz") and not use_tar:
+        raise DeployError("服务器没有 tar / gzip，无法解开压缩包备份 %s" % bfile.rsplit("/", 1)[-1],
+                          "请先在服务器上安装 tar 和 gzip（离线可用系统光盘 / 内网源里的 rpm、deb 包），再回滚")
     snap = ""
     if full and snapshot:
-        snap = posix_join(posixdir(bfile), "%s-%s-%s.tar.gz" % (
-            product, re.sub(r"[^\w.]", "_", inst["version"]), _dt.datetime.now().strftime("%Y%m%d-%H%M%S")))
+        snap = posix_join(posixdir(bfile), "%s-%s-%s.%s" % (
+            product, re.sub(r"[^\w.]", "_", inst["version"]), _dt.datetime.now().strftime("%Y%m%d-%H%M%S"),
+            "tar.gz" if use_tar else "dir"))
     s = svc_functions(product, inst["dir"], inst["owner"], inst["unit"], inst["profile"], start_env_of(inst))
     s += r'''
 B=%(b)s; SNAP=%(snap)s
 finish(){ echo "$1" > "$ST"; }
-[ -s "$B" ] || { say "备份文件不存在：$B"; finish FAIL:nofile; exit 1; }
+[ -s "$B" ] || [ -d "$B" ] || { say "备份文件不存在：$B"; finish FAIL:nofile; exit 1; }
 say "停止服务 …"
 stop_svc || { say "服务停止失败（未做改动）"; start_svc; finish FAIL:stop; exit 1; }
 if [ -n "$SNAP" ]; then
   say "先把当前状态另存一份：$SNAP"
-  ( umask 077; exec tar -czf "$SNAP.tmp" -C "$D" %(ex_all)s . ); rc=$?
-  if [ $rc -gt 1 ] || [ ! -s "$SNAP.tmp" ]; then
-    rm -f "$SNAP.tmp"; say "另存失败（磁盘空间不足？），已取消回滚并重新启动服务"; start_svc; finish FAIL:snapshot; exit 1
+  %(snap_cmd)s
+  if %(snap_bad)s; then
+    rm -rf "$SNAP.tmp"; say "另存失败（磁盘空间不足？），已取消回滚并重新启动服务"; start_svc; finish FAIL:snapshot; exit 1
   fi
-  mv -f "$SNAP.tmp" "$SNAP"
+  rm -rf "$SNAP"; mv -f "$SNAP.tmp" "$SNAP"
 fi
 say "从备份恢复 …"
-if ! tar $TAROPT -xzf "$B" -C "$D" %(ex)s; then say "解压失败，尝试启动服务 …"; start_svc; finish FAIL:extract; exit 1; fi
+if ! %(extract)s; then say "解压失败，尝试启动服务 …"; start_svc; finish FAIL:extract; exit 1; fi
 say "启动服务 …"
 start_svc || { finish FAIL:start; exit 1; }
 finish OK
-''' % {"b": shlex.quote(bfile), "snap": shlex.quote(snap), "ex_all": tar_excludes(),
-       "ex": "" if full else "--exclude=./data"}
+''' % {"b": shlex.quote(bfile), "snap": shlex.quote(snap),
+       "snap_cmd": ('( umask 077; exec tar -czf "$SNAP.tmp" -C "$D" %s . ); rc=$?' % tar_excludes() if use_tar
+                    else 'rm -rf "$SNAP.tmp"; ( umask 077; cp_copy "$D" "$SNAP.tmp" 1 ); rc=$?'),
+       "snap_bad": ('[ $rc -gt 1 ] || [ ! -s "$SNAP.tmp" ]' if use_tar else '[ $rc -ne 0 ] || [ ! -d "$SNAP.tmp" ]'),
+       "extract": ('cp_copy "$B" "$D" %d' % (1 if full else 0)) if bfile.endswith(".dir") else
+                  ('tar $TAROPT -xzf "$B" -C "$D" %s' % ("" if full else "--exclude=./data"))}
     status = run_detached(r, staging, "rollback", s)
     if status != "OK":
         show_logs(r, product, inst["dir"], inst["unit"])
@@ -2939,6 +2987,22 @@ def _local_same_file(name, size):
     return None
 
 
+def _check_zip_product(path, product):
+    """zip 里必须有该产品的 jar（sight-wall.jar / sight-report.jar），防止官网条目或本机同名文件拿错包。"""
+    jar = PRODUCTS[product]["jar"]
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = [n.rsplit("/", 1)[-1] for n in zf.namelist()]
+    except zipfile.BadZipFile as e:
+        raise DeployError("安装包不是有效的 zip（%s）" % e)
+    if jar in names:
+        return
+    other = [PRODUCTS[k]["name"] for k, v in PRODUCTS.items() if v["jar"] in names]
+    raise DeployError("下载到的安装包不是 %s 的（里面%s）" % (
+        PRODUCTS[product]["name"], "是 " + "、".join(other) if other else "没有 " + jar),
+        "已丢弃这个文件，没有部署任何东西；请到官网下载中心核对，或手动选择正确的安装包")
+
+
 def job_download_package(ctx, p):
     product = _product_of(p)
     pn = PRODUCTS[product]["name"]
@@ -2973,6 +3037,13 @@ def job_download_package(ctx, p):
             dest.unlink()
             raise DeployError("下载的安装包不完整（%s）" % e, "请重试；反复出现请手动到官网下载")
         ok("安装包完整（%s）" % human_size(dest.stat().st_size))
+    try:
+        _check_zip_product(dest, product)
+    except DeployError:
+        if not same:
+            dest.unlink()
+        raise
+    ok("确认是 %s 的安装包" % pn)
     return {"path": str(dest), "name": dest.name, "size": dest.stat().st_size, "product": product, "version": ver,
             "mtime": int(dest.stat().st_mtime), "dir": str(dest.parent), "reused": bool(same)}
 
@@ -3079,8 +3150,12 @@ def job_deploy(ctx, p):
     if not hosts:
         raise DeployError("请选择至少一台服务器")
     pkg = load_package(p.get("package") or "")
+    want = p.get("product")  # 用户点的是哪个产品的「升级」；从「安装 / 升级」总入口进来时为空
     results = []
     try:
+        if want in PRODUCTS and pkg.product != want:
+            raise DeployError("选错了安装包：这是 %s 的包，但你要升级的是 %s（没有对服务器做任何改动）" % (
+                pkg.name, PRODUCTS[want]["name"]), "请重新选择 %s 的安装包" % PRODUCTS[want]["name"])
         for i, name in enumerate(hosts, 1):
             if len(hosts) > 1:
                 step("第 %d/%d 台：%s" % (i, len(hosts), name))
@@ -3193,7 +3268,7 @@ def job_rollback(ctx, p):
         inst = _get_install(ctx, r, product)
         bfile = str(p.get("file") or "")
         bdir = backup_dir_for(ctx, r, product, inst["dir"])
-        if not bfile.startswith(bdir + "/") or not bfile.endswith(".tar.gz") or "/.." in bfile:
+        if not bfile.startswith(bdir + "/") or not bfile.endswith((".tar.gz", ".dir")) or "/.." in bfile:
             raise DeployError("备份文件不在备份目录里：%s" % bfile)
         full = bool(p.get("full"))
         if full and inst["db"]["kind"] == "external":
