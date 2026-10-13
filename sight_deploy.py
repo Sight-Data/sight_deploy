@@ -2512,7 +2512,7 @@ if ! start_svc; then
   say "启动命令失败，恢复旧版本程序文件并启动 …"; stop_svc; restore_old; finish FAIL:start; exit 1
 fi
 finish OK
-''' % {"b": shlex.quote(bfile), "bd": shlex.quote(bdir), "ex": tar_excludes(),
+''' % {"b": shlex.quote(bfile), "bd": shlex.quote(bdir),
        "restore": ('restore_old(){ tar $TAROPT -xzf "$B" -C "$D" --exclude=./data; start_svc; }' if use_tar
                    else 'restore_old(){ cp_copy "$B" "$D" 0; start_svc; }'),
        "backup": ('( umask 077; exec tar -czf "$B.tmp" -C "$D" %s . ); rc=$?' % tar_excludes() if use_tar
