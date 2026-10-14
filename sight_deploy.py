@@ -50,7 +50,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-TOOL_VERSION = "2.1.4"
+TOOL_VERSION = "2.1.5"
 CONF_DIR = Path(os.environ.get("SIGHT_DEPLOY_HOME") or (Path.home() / ".sight-deploy"))
 FROZEN = getattr(sys, "frozen", False)
 # 程序所在目录：打包后是 exe/.app 所在目录（用来找同目录下的安装包），源码运行是本文件目录
@@ -4048,6 +4048,43 @@ def _start_tray(url):
     threading.Thread(target=run, daemon=True).start()
 
 
+def _mac_untranslocate(exe=None):
+    """macOS：从「下载」里直接打开的未公证应用会被系统放进 AppTranslocation 沙盒运行。
+    本程序没有 Dock 图标，用户看不到它已在运行，再次双击就会弹「应用程序无法打开。-47」。
+    这里找到应用原来所在的位置并清掉它的隔离属性，之后再打开就是正常启动（程序自己会转到已运行的网页）。
+    只处理自己；任何一步失败都静默跳过，不影响启动。"""
+    try:
+        exe = exe or sys.executable
+        if sys.platform != "darwin" or "/AppTranslocation/" not in exe:
+            return None
+        import ctypes, ctypes.util
+        sec = ctypes.CDLL(ctypes.util.find_library("Security"))
+        cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+        cf.CFURLCreateFromFileSystemRepresentation.restype = ctypes.c_void_p
+        cf.CFURLCreateFromFileSystemRepresentation.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_bool]
+        cf.CFURLGetFileSystemRepresentation.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_char_p, ctypes.c_long]
+        cf.CFURLGetFileSystemRepresentation.restype = ctypes.c_bool
+        sec.SecTranslocateCreateOriginalPathForURL.restype = ctypes.c_void_p
+        sec.SecTranslocateCreateOriginalPathForURL.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        app = exe.split(".app/")[0] + ".app"
+        raw = app.encode("utf-8")
+        url = cf.CFURLCreateFromFileSystemRepresentation(None, raw, len(raw), True)
+        orig = sec.SecTranslocateCreateOriginalPathForURL(url, None)
+        if not orig:
+            return None
+        buf = ctypes.create_string_buffer(4096)
+        if not cf.CFURLGetFileSystemRepresentation(orig, True, buf, 4096):
+            return None
+        path = buf.value.decode("utf-8")
+        if not path.endswith(".app") or not os.path.isdir(path):
+            return None
+        subprocess.run(["/usr/bin/xattr", "-dr", "com.apple.quarantine", path],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+        return path
+    except Exception:
+        return None
+
+
 def main():
     global APP
     # Windows 无控制台打包时 stdout / stderr 为 None；用 utf-8 打开空设备（默认编码是系统代码页，写中文会抛异常）
@@ -4059,6 +4096,7 @@ def main():
     port_arg = None
     if "--port" in sys.argv:
         port_arg = _int(sys.argv[sys.argv.index("--port") + 1])
+    _mac_untranslocate()
     CONF_DIR.mkdir(parents=True, exist_ok=True)
     url = _existing_instance()
     if url:
