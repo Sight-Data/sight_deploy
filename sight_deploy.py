@@ -2478,6 +2478,13 @@ def do_upgrade(ctx, r, pkg, inst):
             dropin_env["PATH"] = new_java_home + "/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         else:
             start_env["PATH"] = new_java_home + "/bin:/usr/local/bin:/usr/bin:/bin"
+    if inst["unit"] and port != P["port"]:
+        # 端口改过（外部配置文件 / JVM 参数）时，要把真实端口告诉启动脚本的端口预检查（CHECK_PORT）。
+        # 否则预检查只看产品默认端口（report 9091 / wall 9090），默认端口恰好被别的程序占着时，
+        # 新版本会被自己的预检查拦下，systemd 反复重启仍失败（升级后「服务未就绪」）。
+        if dropin_env is None:
+            dropin_env = read_dropin(r, product)
+        dropin_env.setdefault("CHECK_PORT", str(port))
     marker = marker_json(product, pkg.version, port, profile, start_env,
                          new_java_home or inst["marker"].get("java_home"), inst["marker"])
     meta = json.dumps({"product": product, "version": inst["version"], "upgraded_to": pkg.version,
