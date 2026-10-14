@@ -4059,7 +4059,6 @@ def _mac_menubar(url):
     """macOS：在菜单栏（屏幕右上角）放一个图标，菜单「打开操作界面 / 退出」，对应 Windows 的任务栏通知区图标。
     本程序没有 Dock 图标，没有它用户就找不到退出的地方。
     会进入 Cocoa 事件循环，必须在主线程调用，正常情况下不返回；缺 PyObjC 等原因失败时抛异常，由调用方降级。"""
-    import objc  # noqa: F401
     from AppKit import (NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicyAccessory,
                         NSImage, NSMenu, NSMenuItem, NSStatusBar, NSVariableStatusItemLength)
     from Foundation import NSObject
