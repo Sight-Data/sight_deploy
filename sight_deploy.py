@@ -50,7 +50,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-TOOL_VERSION = "2.1.3"
+TOOL_VERSION = "2.1.4"
 CONF_DIR = Path(os.environ.get("SIGHT_DEPLOY_HOME") or (Path.home() / ".sight-deploy"))
 FROZEN = getattr(sys, "frozen", False)
 # 程序所在目录：打包后是 exe/.app 所在目录（用来找同目录下的安装包），源码运行是本文件目录
@@ -3495,6 +3495,12 @@ def api_fs(qs):
         return {"dir": "", "parent": None, "shortcuts": _fs_shortcuts(kind),
                 "entries": [{"name": x, "path": x, "is_dir": True} for x in drives]}
     p = Path(d).expanduser()
+    if not p.is_dir() and (qs.get("dir") or [""])[0].startswith("online:"):
+        # 「官网最新」是虚拟条目（online:<产品>），不是真实路径：回退到默认文件夹，不报错
+        p = Path.home() / "Downloads"
+        if not p.is_dir():
+            p = Path.home()
+        d = str(p)
     if not p.is_dir():
         raise DeployError("文件夹不存在：%s" % d)
     exts = {"package": (".zip", ".jar"), "jdk": (".tar.gz", ".tgz")}.get(kind)

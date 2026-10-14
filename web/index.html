@@ -646,7 +646,7 @@ function buildPicker(opts) {
   if (kind === 'key') drop.style.display = 'none';
   setSel(null);
   browseBtn.addEventListener('click', function () {
-    openBrowser(kind, sel ? sel.path.replace(/[\\\/][^\\\/]*$/, '') : null, function (en) {
+    openBrowser(kind, sel && !sel.online ? sel.path.replace(/[\\\/][^\\\/]*$/, '') : null, function (en) {
       var p = { path: en.path, name: en.name, size: en.size, mtime: en.mtime || 0, dir: en.path.replace(/[\\\/][^\\\/]*$/, '') };
       if (!items.some(function (x) { return x.path === p.path; }) && kind !== 'key') { items.unshift(p); renderList(); }
       setSel(p);
