@@ -98,6 +98,16 @@ def build(py, ver):
         # LSUIElement：不在 Dock 里显示图标（程序本身没有窗口，界面在浏览器里）
         _plist_set(plist, {"LSUIElement": True, "CFBundleShortVersionString": ver, "CFBundleVersion": ver,
                            "CFBundleDisplayName": APP_NAME})
+        # 改过 Info.plist 后必须整包重新签名，否则签名失效，用户下载后 macOS 会报「已损坏，无法打开」
+        # （PyInstaller 在 Apple 芯片上做的是 ad-hoc 签名，改完 plist 就对不上了）。
+        # 有 Developer ID 证书时设 MAC_SIGN_IDENTITY="Developer ID Application: xxx (TEAMID)"，否则用 ad-hoc。
+        ident = os.environ.get("MAC_SIGN_IDENTITY") or "-"
+        say("重新签名 .app（%s）" % ("Developer ID" if ident != "-" else "ad-hoc"))
+        sign = ["codesign", "--force", "--deep", "--sign", ident]
+        if ident != "-":
+            sign += ["--options", "runtime", "--timestamp"]
+        run(sign + [str(app)])
+        run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app)])
         return work, app
     exe = dist / (APP_NAME + (".exe" if os.name == "nt" else ""))
     return work, exe

@@ -143,6 +143,6 @@ jobs:
             **下载哪个？**
             - Windows 10 / 11：`sight-deploy-*-windows-x64.exe`，双击运行
             - Windows 7 / 8：`sight-deploy-*-windows7-x64.exe`（Python 3.8 构建；需要另装 Chrome 109 或 Firefox ESR 115 来打开界面）
-            - Mac（Apple 芯片）：`sight-deploy-*-mac-arm64.zip`；Intel 芯片：`sight-deploy-*-mac-x86_64.zip`。解压后打开「Sight部署助手.app」（未签名，第一次需右键 → 打开）
+            - Mac（Apple 芯片）：`sight-deploy-*-mac-arm64.zip`；Intel 芯片：`sight-deploy-*-mac-x86_64.zip`。解压后打开「Sight部署助手.app」（未做 Apple 公证；若提示「已损坏」或无法打开，在终端执行 `xattr -cr 解压后的app路径` 后再打开）
 
             国内也可以在官网下载：https://www.sightdata.top/downloads
