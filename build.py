@@ -39,7 +39,9 @@ ASSET = "sight-deploy"       # 发布文件名前缀（英文）
 WIN7 = bool(os.environ.get("WIN7"))  # Win7 兼容版：必须用 Python 3.8 打（3.9 起不再支持 Win7）
 PYINSTALLER = "pyinstaller==6.9.0" if WIN7 else "pyinstaller==6.11.1"
 PARAMIKO = "paramiko>=3.4,<4" if WIN7 else "paramiko>=3.4,<6"
-EXTRA_PIP = ["cryptography>=41,<43"] if WIN7 else []  # 旧版 cryptography 自带的 OpenSSL / 运行库对 Win7 更保险
+EXTRA_PIP = ["cryptography>=41,<43"] if WIN7 else []
+if platform.system() == "Darwin":  # 菜单栏图标（退出入口）用 PyObjC；只装 Cocoa 子集，体积小
+    EXTRA_PIP = EXTRA_PIP + ["pyobjc-framework-Cocoa>=10"]  # 旧版 cryptography 自带的 OpenSSL / 运行库对 Win7 更保险
 
 
 def say(msg):
@@ -78,6 +80,7 @@ def build(py, ver):
             "--name", APP_NAME, "--distpath", work / "dist", "--workpath", work / "build", "--specpath", work,
             "--add-data", "%s%sweb" % (HERE / "web" / "index.html", sep),
             "--hidden-import", "paramiko", "--collect-submodules", "paramiko",
+            *(["--hidden-import", "objc", "--hidden-import", "AppKit", "--hidden-import", "Foundation"] if sysname == "Darwin" else []),
             "--exclude-module", "tkinter"]
     if sysname == "Darwin":
         args += ["--windowed", "--onedir", "--osx-bundle-identifier", "com.sight.deploy"]

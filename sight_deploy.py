@@ -50,7 +50,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-TOOL_VERSION = "2.1.5"
+TOOL_VERSION = "2.1.6"
 CONF_DIR = Path(os.environ.get("SIGHT_DEPLOY_HOME") or (Path.home() / ".sight-deploy"))
 FROZEN = getattr(sys, "frozen", False)
 # 程序所在目录：打包后是 exe/.app 所在目录（用来找同目录下的安装包），源码运行是本文件目录
@@ -4048,6 +4048,70 @@ def _start_tray(url):
     threading.Thread(target=run, daemon=True).start()
 
 
+def _mac_menubar(url):
+    """macOS：在菜单栏（屏幕右上角）放一个图标，菜单「打开操作界面 / 退出」，对应 Windows 的任务栏通知区图标。
+    本程序没有 Dock 图标，没有它用户就找不到退出的地方。
+    会进入 Cocoa 事件循环，必须在主线程调用，正常情况下不返回；缺 PyObjC 等原因失败时抛异常，由调用方降级。"""
+    import objc  # noqa: F401
+    from AppKit import (NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicyAccessory,
+                        NSImage, NSMenu, NSMenuItem, NSStatusBar, NSVariableStatusItemLength)
+    from Foundation import NSObject
+
+    class _Delegate(NSObject):
+        def openUI_(self, sender):
+            _open_browser(url)
+
+        def quitApp_(self, sender):
+            if APP.busy():
+                NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+                al = NSAlert.alloc().init()
+                al.setMessageText_("有任务正在进行，现在退出会中断它")
+                al.setInformativeText_("确定要退出 Sight 部署助手吗？")
+                al.addButtonWithTitle_("退出")
+                al.addButtonWithTitle_("取消")
+                if al.runModal() != NSAlertFirstButtonReturn:
+                    return
+            LOG.write("  [菜单栏] 退出")
+            _shutdown()
+
+        def applicationShouldHandleReopen_hasVisibleWindows_(self, app, flag):
+            _open_browser(url)
+            return True
+
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)  # 不在 Dock 显示（与 LSUIElement 一致）
+    delegate = _Delegate.alloc().init()
+    app.setDelegate_(delegate)
+
+    item = NSStatusBar.systemStatusBar().statusItemWithLength_(NSVariableStatusItemLength)
+    button = item.button()
+    img = None
+    if hasattr(NSImage, "imageWithSystemSymbolName_accessibilityDescription_"):  # macOS 11+
+        img = NSImage.imageWithSystemSymbolName_accessibilityDescription_("shippingbox", "Sight 部署助手")
+    if img is not None:
+        img.setTemplate_(True)
+        button.setImage_(img)
+    else:
+        button.setTitle_("部署助手")
+    button.setToolTip_("Sight 部署助手 %s（运行中）" % TOOL_VERSION)
+
+    menu = NSMenu.alloc().init()
+    head = menu.addItemWithTitle_action_keyEquivalent_("Sight 部署助手 %s" % TOOL_VERSION, None, "")
+    head.setEnabled_(False)
+    mi = menu.addItemWithTitle_action_keyEquivalent_("打开操作界面", "openUI:", "")
+    mi.setTarget_(delegate)
+    menu.addItem_(NSMenuItem.separatorItem())
+    mq = menu.addItemWithTitle_action_keyEquivalent_("退出", "quitApp:", "q")
+    mq.setTarget_(delegate)
+    item.setMenu_(menu)
+    LOG.write("  [菜单栏] 已创建菜单栏图标")
+    _MAC_KEEP.extend([app, delegate, item, menu])  # 持有引用，防止被回收后图标消失
+    app.run()
+
+
+_MAC_KEEP = []
+
+
 def _mac_untranslocate(exe=None):
     """macOS：从「下载」里直接打开的未公证应用会被系统放进 AppTranslocation 沙盒运行。
     本程序没有 Dock 图标，用户看不到它已在运行，再次双击就会弹「应用程序无法打开。-47」。
@@ -4136,7 +4200,17 @@ def main():
         threading.Timer(0.5, _open_browser, args=(url,)).start()
     LOG.write("开始处理网页请求")
     try:
-        httpd.serve_forever()
+        if sys.platform == "darwin":
+            # 菜单栏图标需要 Cocoa 事件循环占住主线程，网页服务放到后台线程
+            srv = threading.Thread(target=httpd.serve_forever, daemon=True)
+            srv.start()
+            try:
+                _mac_menubar(url)
+            except Exception as e:  # 没有 PyObjC 等：不要图标，照常运行（退出可用网页里的按钮）
+                LOG.write("  [菜单栏] 没能创建菜单栏图标：%s" % e)
+            srv.join()
+        else:
+            httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     _shutdown()
