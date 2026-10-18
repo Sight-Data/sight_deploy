@@ -772,7 +772,7 @@ function refreshState() {
 function productName(id) { return S.state && S.state.products[id] ? S.state.products[id].name : id; }
 function productInfo(id) { return (S.state && S.state.products && S.state.products[id]) || {}; }
 function allProductNames() { return S.state && S.state.products ? Object.keys(S.state.products).map(productName).join(' / ') : 'SightReport / SightWall'; }
-/* 安装包文件名 → 产品：<zip_prefix>-<版本>.zip（如 sight-report-2.0.71.zip、dfdatalink-0.2.0.zip） */
+/* 安装包文件名 → 产品：<zip_prefix>-<版本>.zip（如 sight-report-2.0.71.zip、sight-datalink-0.2.0.zip） */
 function guessPkg(name) {
   var ids = S.state && S.state.products ? Object.keys(S.state.products) : [];
   ids.sort(function (a, b) { return (productInfo(b).zip_prefix || b).length - (productInfo(a).zip_prefix || a).length; });
@@ -1093,7 +1093,7 @@ function resultSummary(j) {
   }
   return wrap;
 }
-/* DFDataLink 安装向导：初始化令牌（一次性凭据，只在本次操作的结果里显示） */
+/* Sight DataLink 安装向导：初始化令牌（一次性凭据，只在本次操作的结果里显示） */
 function tokenBox(x, multi) {
   if (x.status !== '完成') return null;
   if (x.mode === 'waiting') {
@@ -1551,7 +1551,7 @@ function openRollback(host, pid) {
     body.appendChild(l2);
     if (dbk === 'external') body.appendChild(h('div', { class: 'note warn', style: 'margin:12px 0 0', html: ico('bang') + '<div>这台服务器使用外部数据库，数据库不在备份里，回滚不会改动它。如果新版本改过数据库结构，请先联系负责人确认。</div>' }));
     else if (dbk === 'none') body.appendChild(h('div', { class: 'note info', style: 'margin:12px 0 0', html: ico('help') + '<div>这个备份里没有数据库。</div>' }));
-    /* 数据库结构版本（DFDataLink / Flyway）：外部库的结构变了就不能只回滚程序，后端回滚前还会再核对一次 */
+    /* 数据库结构版本（Sight DataLink / Flyway）：外部库的结构变了就不能只回滚程序，后端回滚前还会再核对一次 */
     var sNote = h('div', { class: 'note', style: 'margin:12px 0 0;display:none' });
     body.appendChild(sNote);
     function schemaCheck() {

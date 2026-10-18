@@ -28,13 +28,13 @@ STATE = {
          "last_used": "2026-09-30 09:02", "products": {}},
         {"name": "数据-3", "host": "10.0.0.7", "port": 22, "user": "root", "auth": "password",
          "last_used": "2026-10-12 15:20",
-         "products": {"dfdatalink": {"install_dir": "/opt/dfdatalink", "port": 18680, "version": "0.2.0"}}},
+         "products": {"sight-datalink": {"install_dir": "/opt/sight-datalink", "port": 18680, "version": "0.2.0"}}},
     ],
     "products": {"sight-report": {"name": "SightReport", "port": 9091, "dir": "/opt/sight-report", "zip_prefix": "sight-report",
                                   "setup_path": "/setup", "setup_token": False, "rolling_upgrade": True, "schema_versioned": False},
                  "sight-wall": {"name": "SightWall", "port": 9090, "dir": "/opt/sight-wall", "zip_prefix": "sight-wall",
                                 "setup_path": "/setup", "setup_token": False, "rolling_upgrade": True, "schema_versioned": False},
-                 "dfdatalink": {"name": "DFDataLink", "port": 18680, "dir": "/opt/dfdatalink", "zip_prefix": "dfdatalink",
+                 "sight-datalink": {"name": "Sight DataLink", "port": 18680, "dir": "/opt/sight-datalink", "zip_prefix": "sight-datalink",
                                 "setup_path": "/", "setup_token": True, "rolling_upgrade": False, "schema_versioned": True}},
     "log_path": "/Users/demo/.sight-deploy/logs/sight-deploy-20261010.log",
 }
@@ -175,12 +175,12 @@ def s_status(job):
                       "db": "内置 H2 数据库（/opt/sight-report/data/h2）", "db_kind": "h2",
                       "disk_free": 31876000000, "backups": 2, "last_backup": "2026-10-10 01:16（2.0.69）"})
         prods.append({"product": "sight-wall", "name": "SightWall", "installed": False})
-        prods.append({"product": "dfdatalink", "name": "DFDataLink", "installed": False})
+        prods.append({"product": "sight-datalink", "name": "Sight DataLink", "installed": False})
     elif h["host"] == "10.0.0.7":
         prods = [{"product": "sight-report", "name": "SightReport", "installed": False},
                  {"product": "sight-wall", "name": "SightWall", "installed": False},
-                 {"product": "dfdatalink", "name": "DFDataLink", "installed": True, "version": "0.2.0",
-                  "dir": "/opt/dfdatalink", "owner": "root", "service": "systemd", "active": "active",
+                 {"product": "sight-datalink", "name": "Sight DataLink", "installed": True, "version": "0.2.0",
+                  "dir": "/opt/sight-datalink", "owner": "root", "service": "systemd", "active": "active",
                   "running": True, "healthy": True, "bootstrapped": False, "db_reachable": None, "mode": "setup",
                   "port": 18680, "url": "http://10.0.0.7:18680/", "setup_url": "http://10.0.0.7:18680/", "reachable": True,
                   "java": "21.0.4（/usr/lib/jvm/java-21-openjdk/bin/java）", "db": "尚未配置（还没走安装向导）", "db_kind": "none",
@@ -200,8 +200,8 @@ def s_status(job):
                       "port": 9090, "url": "http://10.0.0.6:9090/", "reachable": False,
                       "java": "17.0.9（/usr/bin/java）", "db": "内置 H2 数据库", "db_kind": "h2",
                       "disk_free": 4200000000, "backups": 1, "last_backup": "2026-09-01 10:00（1.8.1）"})
-        prods.append({"product": "dfdatalink", "name": "DFDataLink", "installed": True, "version": "0.1.9",
-                      "dir": "/data/dfdatalink", "owner": "sight", "service": "systemd", "active": "active",
+        prods.append({"product": "sight-datalink", "name": "Sight DataLink", "installed": True, "version": "0.1.9",
+                      "dir": "/data/sight-datalink", "owner": "sight", "service": "systemd", "active": "active",
                       "running": True, "healthy": True, "bootstrapped": False, "db_reachable": False, "mode": "waiting",
                       "port": 18680, "url": "http://10.0.0.6:18680/", "setup_url": "http://10.0.0.6:18680/", "reachable": True,
                       "java": "21.0.4（/opt/sight-jdk/jdk-21.0.4+7/bin/java）", "db": "外部数据库 postgresql @ 192.168.1.30",
@@ -209,7 +209,7 @@ def s_status(job):
     else:
         prods = [{"product": "sight-report", "name": "SightReport", "installed": False},
                  {"product": "sight-wall", "name": "SightWall", "installed": False},
-                 {"product": "dfdatalink", "name": "DFDataLink", "installed": False}]
+                 {"product": "sight-datalink", "name": "Sight DataLink", "installed": False}]
     job.ok_("状态已更新")
     return {"host": name, "address": "%s@%s" % (h["user"], h["host"]),
             "os": "Linux x86_64 / CentOS 7.9 / up 3 days", "products": prods}
@@ -219,16 +219,16 @@ MOCK_TOKEN = "q8Zt3VfK1mWcR7xYpL2nB0sDuE9gHaJ4"
 
 
 def s_deploy_datalink(job, hosts, pkg):
-    """DFDataLink 首次安装：安装向导 + 初始化令牌（看安装完成页）。"""
+    """Sight DataLink 首次安装：安装向导 + 初始化令牌（看安装完成页）。"""
     results = []
     for hn in hosts:
         h = find_host(hn) or {"host": "?", "user": "root"}
         job.step("读取安装包 %s" % os.path.basename(pkg))
-        job.ok_("DFDataLink 0.2.0（212.4 MB，9 个文件）")
-        job.info("检查 DFDataLink 是否已安装 …")
-        job.step("首次安装 DFDataLink 0.2.0 → root@%s" % h["host"])
-        vals = job.ask({"kind": "form", "title": "安装 DFDataLink 0.2.0 到 root@%s" % h["host"], "error": None, "fields": [
-            {"key": "dir", "label": "安装目录", "default": "/opt/dfdatalink"},
+        job.ok_("Sight DataLink 0.2.0（212.4 MB，9 个文件）")
+        job.info("检查 Sight DataLink 是否已安装 …")
+        job.step("首次安装 Sight DataLink 0.2.0 → root@%s" % h["host"])
+        vals = job.ask({"kind": "form", "title": "安装 Sight DataLink 0.2.0 到 root@%s" % h["host"], "error": None, "fields": [
+            {"key": "dir", "label": "安装目录", "default": "/opt/sight-datalink"},
             {"key": "port", "label": "服务端口", "default": "18680", "type": "number"},
             {"key": "xmx", "label": "最大堆内存", "default": "", "placeholder": "留空 = 按服务器内存自适应",
              "help": "如 4g、8g。留空时程序按服务器可用内存的 75% 自动设置"}]})
@@ -238,9 +238,9 @@ def s_deploy_datalink(job, hosts, pkg):
                   "内存      15.4 GB，CPU 8 核", "磁盘      / 剩余 52.0 GB", "端口      %d 空闲" % port):
             job.ok_(t)
         job.step("确认安装计划")
-        plan = [["产品", "DFDataLink 0.2.0"], ["服务器", "root@%s" % h["host"]], ["安装目录", vals.get("dir") or "/opt/dfdatalink"],
+        plan = [["产品", "Sight DataLink 0.2.0"], ["服务器", "root@%s" % h["host"]], ["安装目录", vals.get("dir") or "/opt/sight-datalink"],
                 ["端口", str(port)], ["Java", "/usr/lib/jvm/java-21-openjdk/bin/java"], ["内存", "自适应（可用内存的 75%）"],
-                ["运行方式", "系统服务 dfdatalink（开机自启、崩溃自动拉起），运行账号 root"]]
+                ["运行方式", "系统服务 sight-datalink（开机自启、崩溃自动拉起），运行账号 root"]]
         job.emit(t="kv", title="安装计划", items=plan)
         if not job.ask({"kind": "confirm", "title": "开始安装？", "default": True, "detail": ["%s：%s" % tuple(x) for x in plan]}):
             raise Cancelled()
@@ -248,11 +248,11 @@ def s_deploy_datalink(job, hosts, pkg):
         total = 212_400_000
         for i in range(1, 9):
             job.sleep(0.15)
-            job.emit(t="progress", id="up", label="上传 dfdatalink.jar", done=total * i // 8, total=total, speed=48_000_000, eta=(8 - i) * 0.5)
+            job.emit(t="progress", id="up", label="上传 sight-datalink.jar", done=total * i // 8, total=total, speed=48_000_000, eta=(8 - i) * 0.5)
         job.ok_("上传完成，sha256 校验一致")
         job.step("安装")
-        job.log("写入 systemd unit：/etc/systemd/system/dfdatalink.service")
-        job.log("服务已安装并启动：dfdatalink（profile=prod，已设开机自启）")
+        job.log("写入 systemd unit：/etc/systemd/system/sight-datalink.service")
+        job.log("服务已安装并启动：sight-datalink（profile=prod，已设开机自启）")
         job.step("等待服务启动（首次启动约 30~90 秒）")
         for i in range(3):
             job.emit(t="live", id="wait", text="等待服务启动 … 0:%02d" % (i * 3 + 2))
@@ -260,7 +260,7 @@ def s_deploy_datalink(job, hosts, pkg):
         job.emit(t="live", id="wait", text="")
         job.ok_("服务已就绪（用时 0:11）")
         job.step("安装完成")
-        job.ok_("DFDataLink 0.2.0 已安装并启动")
+        job.ok_("Sight DataLink 0.2.0 已安装并启动")
         url = "http://%s:%d/" % (h["host"], port)
         job.info("访问地址：%s" % url)
         job.info("首次访问请按安装向导配置元数据库，之后「初始化管理员」时仍需要同一个初始化令牌")
@@ -268,14 +268,14 @@ def s_deploy_datalink(job, hosts, pkg):
                  items=[["初始化令牌", MOCK_TOKEN], ["说明", "安装向导和之后的「初始化管理员」都需要这个令牌，请妥善转交给实施人员"]])
         results.append({"host": hn, "status": "完成", "url": url, "mode": "setup", "setup_token": MOCK_TOKEN})
         with LOCK:
-            h.setdefault("products", {})["dfdatalink"] = {"install_dir": vals.get("dir") or "/opt/dfdatalink", "port": port, "version": "0.2.0"}
+            h.setdefault("products", {})["sight-datalink"] = {"install_dir": vals.get("dir") or "/opt/sight-datalink", "port": port, "version": "0.2.0"}
     return {"results": results}
 
 
 def s_deploy(job):
     hosts = job.params.get("hosts") or []
     pkg = job.params.get("package", "")
-    if "dfdatalink" in os.path.basename(pkg):
+    if "sight-datalink" in os.path.basename(pkg):
         return s_deploy_datalink(job, hosts, pkg)
     broken = "broken" in pkg
     results = []
@@ -408,13 +408,13 @@ def s_follow_logs(job):
 
 def s_list_backups(job):
     job.sleep(0.6)
-    if job.params.get("product") == "dfdatalink":
+    if job.params.get("product") == "sight-datalink":
         ext = (find_host(job.params.get("host")) or {}).get("host") == "10.0.0.6"
-        return {"backup_dir": "/data/sight-backups/dfdatalink", "current_version": "0.1.9", "db_kind": "external" if ext else "h2",
+        return {"backup_dir": "/data/sight-backups/sight-datalink", "current_version": "0.1.9", "db_kind": "external" if ext else "h2",
                 "current_schema_version": "1.24",
-                "backups": [{"file": "/data/sight-backups/dfdatalink/dfdatalink-0.1.8-20261001-091000.tar.gz", "version": "0.1.8",
+                "backups": [{"file": "/data/sight-backups/sight-datalink/sight-datalink-0.1.8-20261001-091000.tar.gz", "version": "0.1.8",
                              "time": "2026-10-01 09:10", "size": 61_200_000, "schema_version": "1.21"},
-                            {"file": "/data/sight-backups/dfdatalink/dfdatalink-0.1.9-20261012-150200.tar.gz", "version": "0.1.9",
+                            {"file": "/data/sight-backups/sight-datalink/sight-datalink-0.1.9-20261012-150200.tar.gz", "version": "0.1.9",
                              "time": "2026-10-12 15:02", "size": 63_900_000, "schema_version": "1.24"}]}
     h = find_host(job.params.get("host")) or {}
     ext = h.get("host") == "10.0.0.6"
@@ -491,7 +491,7 @@ ONLINE = {
              "page": "https://www.sightdata.top/downloads"},
     "products": {"sight-report": {"latest": "2.0.73", "file_name": "sight-report-2.0.73.zip", "size_text": "258M", "url": "x"},
                  "sight-wall": {"latest": "2.0.70", "file_name": "sight-wall-2.0.70.zip", "size_text": "293M", "url": "x"},
-                 "dfdatalink": {"latest": "0.2.0", "file_name": "dfdatalink-0.2.0.zip", "size_text": "203M", "url": "x"}},
+                 "sight-datalink": {"latest": "0.2.0", "file_name": "sight-datalink-0.2.0.zip", "size_text": "203M", "url": "x"}},
 }
 
 
@@ -534,7 +534,7 @@ FAKE_PACKAGES = [
     ("/Users/demo/Downloads", "sight-report-2.0.72.zip", 28_600_000, "sight-report", "2.0.72", 0),
     ("/Users/demo/Downloads", "sight-report-2.0.72-broken.zip", 12_400_000, "sight-report", "2.0.72", 3600),
     ("/Users/demo/Downloads", "sight-wall-1.9.0.zip", 142_000_000, "sight-wall", "1.9.0", 86400),
-    ("/Users/demo/Downloads", "dfdatalink-0.2.0.zip", 212_400_000, "dfdatalink", "0.2.0", 1800),
+    ("/Users/demo/Downloads", "sight-datalink-0.2.0.zip", 212_400_000, "sight-datalink", "0.2.0", 1800),
     ("/Users/demo/Desktop", "sight-report-2.0.71.zip", 258_824_866, "sight-report", "2.0.71", 5 * 86400),
     ("/Users/demo/Desktop", "sight-deploy-2.0.0-extra.zip", 1_900_000_000, None, None, 12 * 86400),
 ]

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-Sight 部署助手 —— SightReport / SightWall / DFDataLink 远程安装与升级（网页界面）
+Sight 部署助手 —— SightReport / SightWall / Sight DataLink 远程安装与升级（网页界面）
 
 开源地址：https://github.com/Sight-Data/sight_deploy    产品官网：https://www.sightdata.top
 
@@ -19,8 +19,8 @@ Sight 部署助手 —— SightReport / SightWall / DFDataLink 远程安装与�
   设环境变量 SIGHT_DEPLOY_PASSPHRASE 可额外加一层口令（之后每次运行都要设同样的值）。
 
 服务器端约定（与产品包里的 install.sh / start.sh 一致）：
-  安装目录     默认 /opt/sight-report、/opt/sight-wall、/opt/dfdatalink
-  系统服务     systemd 服务 sight-report / sight-wall / dfdatalink（由包内 install.sh 注册）
+  安装目录     默认 /opt/sight-report、/opt/sight-wall、/opt/sight-datalink
+  系统服务     systemd 服务 sight-report / sight-wall / sight-datalink（由包内 install.sh 注册）
   升级备份     默认 <安装目录的上级>/sight-backups/<产品>/，含程序文件 + data/
                （不含 logs；SightReport / SightWall 另不含 data/cache*、data/temp、data/backups）
   非默认端口   写在 /etc/systemd/system/<服务>.service.d/10-sight-deploy.conf
@@ -50,7 +50,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-TOOL_VERSION = "2.2.0"
+TOOL_VERSION = "2.2.1"
 CONF_DIR = Path(os.environ.get("SIGHT_DEPLOY_HOME") or (Path.home() / ".sight-deploy"))
 FROZEN = getattr(sys, "frozen", False)
 # 程序所在目录：打包后是 exe/.app 所在目录（用来找同目录下的安装包），源码运行是本文件目录
@@ -110,23 +110,23 @@ def _sight_product(key, name, port, start_class, site_id):
 PRODUCTS = {
     "sight-report": _sight_product("sight-report", "SightReport", 9091, "SightDataApplication", "dl-report"),
     "sight-wall": _sight_product("sight-wall", "SightWall", 9090, "SightWallApplication", "dl-wall"),
-    # DFDataLink：约定见 DataLink 仓库 docs/plans/2026-10-17-sight-deploy-integration.md 与安装包里的 README.txt
-    "dfdatalink": {
-        "name": "DFDataLink", "jar": "dfdatalink.jar", "zip_prefix": "dfdatalink",
-        "start_class": "DFDataLinkBackendApplication", "port": 18680, "dir": "/opt/dfdatalink",
-        "service": "dfdatalink", "health": "/api/health",
+    # Sight DataLink：约定见 DataLink 仓库 docs/plans/2026-10-17-sight-deploy-integration.md 与安装包里的 README.txt
+    "sight-datalink": {
+        "name": "Sight DataLink", "jar": "sight-datalink.jar", "zip_prefix": "sight-datalink",
+        "start_class": "DFDataLinkBackendApplication", "port": 18680, "dir": "/opt/sight-datalink",
+        "service": "sight-datalink", "health": "/api/health",
         "setup_path": "/",                  # 安装向导就在根路径
         "setup_token": True,                # 向导令牌打印在服务日志里：「初始化令牌：<token>」
         "setup_hint": "首次访问请按安装向导配置元数据库，之后「初始化管理员」时仍需要同一个初始化令牌",
         "db_none_desc": "尚未配置（还没走安装向导）",
-        "db_reader": "datalink",            # data/datalink.properties 的 DB_URL + 环境变量 / dfdatalink.env 的 DB_URL
+        "db_reader": "datalink",            # data/datalink.properties 的 DB_URL + 环境变量 / sight-datalink.env 的 DB_URL
         "db_env_re": r"(?<![A-Za-z0-9_])DB_URL=([^\s\"']+)",
         "proc_env_re": "FDL_DATA_DIR",
         "version_api": None,
         # data/ 下全是要紧的东西（向导配置与连接密钥、内置 H2、自备驱动、受管文件），整个备份
         "backup_excludes": ["./logs", "./.sight-staging", "./*.pid", "./*.bak.*", "./*.jar.new"],
         "data_excludes": "",
-        "log_files": ("logs/console.out", "logs/dfdatalink.log"),
+        "log_files": ("logs/console.out", "logs/sight-datalink.log"),
         "follow_log": "logs/console.out",
         "follow_journal": True,             # 应用只写标准输出：系统服务方式看 journalctl
         "needs_fonts": False,
@@ -137,8 +137,8 @@ PRODUCTS = {
         "rolling_upgrade": False,           # 多台共用一个外部库（集群）时不能自动滚动升级
         "schema_versioned": True,           # Flyway：外部库的表结构升级不可逆
         "waiting_mode": True,               # 连不上元数据库时 mode=waiting：安装时照常提示，升级时持续一段时间算失败
-        "db_backup_hint": "DFDataLink 用 Flyway 升级元数据库结构，外部库升级后不能只靠回滚程序恢复。",
-        "license": "DFDataLink 按其自带的 Sustainable Use License 分发（见安装包里的 LICENSING.md）",
+        "db_backup_hint": "Sight DataLink 用 Flyway 升级元数据库结构，外部库升级后不能只靠回滚程序恢复。",
+        "license": "Sight DataLink 按其自带的 Sustainable Use License 分发（见安装包里的 LICENSING.md）",
     },
 }
 
@@ -666,8 +666,8 @@ def sha256_file(path, label=None):
 
 
 class Package:
-    """产品安装包：<产品>-<版本>.zip（完整包，如 sight-report-2.0.71.zip、dfdatalink-0.2.0.zip），
-    或单独的产品 jar（sight-report.jar / dfdatalink.jar，只能用于升级）。"""
+    """产品安装包：<产品>-<版本>.zip（完整包，如 sight-report-2.0.71.zip、sight-datalink-0.2.0.zip），
+    或单独的产品 jar（sight-report.jar / sight-datalink.jar，只能用于升级）。"""
 
     def __init__(self, path):
         self.path = Path(path)
@@ -1568,7 +1568,7 @@ done
 if [ "$DBR" = datalink ]; then
   # 只输出 DB_URL 这一行（文件里还有数据库密码和连接密钥，不能整个读出来）
   [ -f "$D/data/datalink.properties" ] && grep -E '^[[:space:]]*DB_URL[[:space:]]*[=:[:space:]]' "$D/data/datalink.properties" | sed 's/^/dbprop=/'
-  [ -f "$D/dfdatalink.env" ] && grep -E '^[[:space:]]*(export[[:space:]]+)?DB_URL=' "$D/dfdatalink.env" | sed 's/^/dbenvfile=/'
+  [ -f "$D/sight-datalink.env" ] && grep -E '^[[:space:]]*(export[[:space:]]+)?DB_URL=' "$D/sight-datalink.env" | sed 's/^/dbenvfile=/'
 elif [ -f "$D/data/work/database.config" ]; then echo "dbconf=$(tr -d '\n' < "$D/data/work/database.config")"; fi
 # 外部配置文件里的 server.port（按 Spring Boot 的优先级顺序输出，取第一个）
 for f in "$D/config/application.properties" "$D/config/application.yml" "$D/config/application.yaml" \
@@ -1784,10 +1784,10 @@ def _prop_unescape(s):
 
 
 def classify_db_datalink(prop_lines, envfile_lines, unit_texts, install_dir):
-    """DFDataLink：部署方给的 DB_URL（systemd 环境 / 进程环境 / dfdatalink.env）优先，其次是向导写的 data/datalink.properties。"""
+    """Sight DataLink：部署方给的 DB_URL（systemd 环境 / 进程环境 / sight-datalink.env）优先，其次是向导写的 data/datalink.properties。"""
     url = None
     for t in unit_texts:
-        m = re.search(PRODUCTS["dfdatalink"]["db_env_re"], t)
+        m = re.search(PRODUCTS["sight-datalink"]["db_env_re"], t)
         if m:
             url = m.group(1)
     for line in envfile_lines:
@@ -1797,7 +1797,7 @@ def classify_db_datalink(prop_lines, envfile_lines, unit_texts, install_dir):
             url = v
     if not url and prop_lines:
         url = parse_java_properties("\n".join(prop_lines)).get("DB_URL") or None
-    return describe_db_url(url, install_dir, "dfdatalink")
+    return describe_db_url(url, install_dir, "sight-datalink")
 
 
 def describe_db_url(url, install_dir, product="sight-report"):
@@ -2943,7 +2943,7 @@ def read_dropin(r, product):
     return dict(re.findall(r"^Environment=([A-Z_]+)=(.*)$", t, re.M))
 
 
-# ---------------------------------------------------------------- 外部元数据库（DFDataLink）
+# ---------------------------------------------------------------- 外部元数据库（Sight DataLink）
 
 def _checked(v):
     """表单里复选框的值（网页传 true/false，ask_form 转成了字符串）。"""
@@ -2960,7 +2960,7 @@ def parse_pg_jdbc(url):
 
 
 def pg_dump_target(r, product, inst, bdir, stamp):
-    """能否在服务器上用 pg_dump 备份 DFDataLink 的元数据库：PostgreSQL、连接信息来自向导写的 data/datalink.properties、
+    """能否在服务器上用 pg_dump 备份 Sight DataLink 的元数据库：PostgreSQL、连接信息来自向导写的 data/datalink.properties、
     服务器上有 pg_dump。凭据只留在内存里，执行时经 0600 临时文件传给 PGPASSWORD（不出现在命令行和日志里）。"""
     pg = parse_pg_jdbc(inst["db"].get("url"))
     if not pg:
@@ -3526,7 +3526,7 @@ def _local_same_file(name, size):
 
 
 def _check_zip_product(path, product):
-    """zip 里必须有该产品的 jar（sight-wall.jar / sight-report.jar / dfdatalink.jar），防止官网条目或本机同名文件拿错包。"""
+    """zip 里必须有该产品的 jar（sight-wall.jar / sight-report.jar / sight-datalink.jar），防止官网条目或本机同名文件拿错包。"""
     jar = PRODUCTS[product]["jar"]
     try:
         with zipfile.ZipFile(path) as zf:
@@ -3672,7 +3672,7 @@ def job_status(ctx, p):
             if h and h.get("mode") == "CLUSTER":
                 item["cluster_nodes"] = h.get("activeNodes")
             if h and h.get("mode") in ("setup", "waiting", "normal"):
-                item["mode"] = h["mode"]  # DFDataLink：setup = 安装向导，waiting = 等元数据库
+                item["mode"] = h["mode"]  # Sight DataLink：setup = 安装向导，waiting = 等元数据库
             if h and "adminInitialized" in h:
                 item["admin_initialized"] = bool(h["adminInitialized"])
             if P["setup_path"] != "/setup":
@@ -3723,7 +3723,7 @@ def job_deploy(ctx, p):
                 if not res and len(hosts) == 1:
                     raise UserAbort()  # 用户在确认框里选了「取消」：整个任务算取消，而不是「完成」
                 item = {"host": name, "status": "完成" if res else "跳过", "url": (res or {}).get("url")}
-                for k in ("mode", "setup_token", "token_hint"):  # DFDataLink 安装向导：模式与初始化令牌
+                for k in ("mode", "setup_token", "token_hint"):  # Sight DataLink 安装向导：模式与初始化令牌
                     if (res or {}).get(k):
                         item[k] = res[k]
                 results.append(item)

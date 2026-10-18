@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""产品描述与 DFDataLink 接入的单元测试（只用标准库，不连服务器）。
+"""产品描述与 Sight DataLink 接入的单元测试（只用标准库，不连服务器）。
 
 运行：python3 -m unittest discover -s tests -v
 """
@@ -51,7 +51,7 @@ class PackageRecognition(unittest.TestCase):
     def test_three_products_zip(self):
         cases = [("sight-report", "sight-report-2.0.71.zip", "sight-report.jar", "com.sight.SightDataApplication", "2.0.71"),
                  ("sight-wall", "sight-wall-1.9.0.zip", "sight-wall.jar", "com.sight.SightWallApplication", "1.9.0"),
-                 ("dfdatalink", "dfdatalink-0.2.0.zip", "dfdatalink.jar",
+                 ("sight-datalink", "sight-datalink-0.2.0.zip", "sight-datalink.jar",
                   "com.dfdatalink.backend.DFDataLinkBackendApplication", "0.2.0")]
         for prod, zname, jar, sc, ver in cases:
             p = os.path.join(self.d, zname)
@@ -65,15 +65,15 @@ class PackageRecognition(unittest.TestCase):
             self.assertEqual(pkg.files[-1][0], jar)  # jar 最后传
 
     def test_single_jar_upgrade(self):
-        p = os.path.join(self.d, "dfdatalink.jar")
+        p = os.path.join(self.d, "sight-datalink.jar")
         make_jar(p, {"Product-Version": "0.3.0", "Java-Version": "21",
                      "Start-Class": "com.dfdatalink.backend.DFDataLinkBackendApplication"})
         pkg = self.load(p)
-        self.assertEqual((pkg.product, pkg.version, pkg.full), ("dfdatalink", "0.3.0", False))
+        self.assertEqual((pkg.product, pkg.version, pkg.full), ("sight-datalink", "0.3.0", False))
 
     def test_version_from_file_name_when_manifest_lacks_it(self):
-        p = os.path.join(self.d, "dfdatalink-0.4.1.zip")
-        make_zip(p, "dfdatalink-0.4.1", "dfdatalink.jar", {"Start-Class": "x.DFDataLinkBackendApplication"})
+        p = os.path.join(self.d, "sight-datalink-0.4.1.zip")
+        make_zip(p, "sight-datalink-0.4.1", "sight-datalink.jar", {"Start-Class": "x.DFDataLinkBackendApplication"})
         self.assertEqual(self.load(p).version, "0.4.1")
 
     def test_unknown_zip_rejected(self):
@@ -81,23 +81,23 @@ class PackageRecognition(unittest.TestCase):
         make_zip(p, "other", "other-backend.jar", {"Product-Version": "1.0"})
         with self.assertRaises(sd.DeployError) as cm:
             sd.Package(p)
-        self.assertIn("dfdatalink.jar", str(cm.exception))
+        self.assertIn("sight-datalink.jar", str(cm.exception))
 
     def test_other_jars_in_zip_ignored(self):
         # 包里另有驱动等 jar：只认产品 jar
-        p = os.path.join(self.d, "dfdatalink-0.2.0.zip")
-        make_zip(p, "dfdatalink-0.2.0", "dfdatalink.jar", {"Product-Version": "0.2.0"},
+        p = os.path.join(self.d, "sight-datalink-0.2.0.zip")
+        make_zip(p, "sight-datalink-0.2.0", "sight-datalink.jar", {"Product-Version": "0.2.0"},
                  extra=("install.sh", "drivers/sight-x.jar"))
-        self.assertEqual(self.load(p).product, "dfdatalink")
+        self.assertEqual(self.load(p).product, "sight-datalink")
 
     def test_guess_pkg_and_zip_check(self):
-        self.assertEqual(sd._guess_pkg("dfdatalink-0.2.0.zip"), ("dfdatalink", "0.2.0"))
+        self.assertEqual(sd._guess_pkg("sight-datalink-0.2.0.zip"), ("sight-datalink", "0.2.0"))
         self.assertEqual(sd._guess_pkg("sight-report-2.0.71.zip"), ("sight-report", "2.0.71"))
         self.assertEqual(sd._guess_pkg("sight-wall.jar"), ("sight-wall", None))
-        self.assertEqual(sd._guess_pkg("dfdatalink-backend-0.1.0.jar"), (None, None))
-        p = os.path.join(self.d, "dfdatalink-0.2.0.zip")
-        make_zip(p, "dfdatalink-0.2.0", "dfdatalink.jar", {"Product-Version": "0.2.0"})
-        sd._check_zip_product(p, "dfdatalink")
+        self.assertEqual(sd._guess_pkg("sight-datalink-backend-0.1.0.jar"), (None, None))
+        p = os.path.join(self.d, "sight-datalink-0.2.0.zip")
+        make_zip(p, "sight-datalink-0.2.0", "sight-datalink.jar", {"Product-Version": "0.2.0"})
+        sd._check_zip_product(p, "sight-datalink")
         with self.assertRaises(sd.DeployError):
             sd._check_zip_product(p, "sight-report")
 
@@ -109,16 +109,16 @@ class Descriptors(unittest.TestCase):
             self.assertTrue(keys <= set(v), "%s 缺少 %s" % (k, keys - set(v)))
 
     def test_datalink(self):
-        P = sd.PRODUCTS["dfdatalink"]
+        P = sd.PRODUCTS["sight-datalink"]
         self.assertEqual((P["name"], P["jar"], P["port"], P["dir"], P["service"]),
-                         ("DFDataLink", "dfdatalink.jar", 18680, "/opt/dfdatalink", "dfdatalink"))
+                         ("Sight DataLink", "sight-datalink.jar", 18680, "/opt/sight-datalink", "sight-datalink"))
         self.assertEqual(P["health"], "/api/health")
         self.assertEqual(P["setup_path"], "/")
         self.assertTrue(P["setup_token"] and P["schema_versioned"])
         self.assertFalse(P["rolling_upgrade"])
-        self.assertEqual(sd.SITE_PRODUCT_IDS["dfdatalink"], "dl-datalink")
-        self.assertEqual(sd.product_by_jar("dfdatalink.jar"), "dfdatalink")
-        self.assertEqual(sd.svc_of("dfdatalink"), "dfdatalink")
+        self.assertEqual(sd.SITE_PRODUCT_IDS["sight-datalink"], "dl-datalink")
+        self.assertEqual(sd.product_by_jar("sight-datalink.jar"), "sight-datalink")
+        self.assertEqual(sd.svc_of("sight-datalink"), "sight-datalink")
 
     def test_sight_unchanged(self):
         for k, port, site in (("sight-report", 9091, "dl-report"), ("sight-wall", 9090, "dl-wall")):
@@ -132,29 +132,29 @@ class Descriptors(unittest.TestCase):
 
     def test_datalink_ownership(self):
         class Pkg:
-            product, jar = "dfdatalink", "dfdatalink.jar"
-            files = [("start.sh", "", 1, ""), ("dfdatalink.jar", "", 1, "")]
-        s = sd.copy_files_script(Pkg(), "/stg", "/opt/dfdatalink", "dl")
+            product, jar = "sight-datalink", "sight-datalink.jar"
+            files = [("start.sh", "", 1, ""), ("sight-datalink.jar", "", 1, "")]
+        s = sd.copy_files_script(Pkg(), "/stg", "/opt/sight-datalink", "dl")
         self.assertNotIn("chown", s)  # 程序文件归 root
         Pkg.product, Pkg.jar = "sight-report", "sight-report.jar"
         Pkg.files = [("start.sh", "", 1, ""), ("sight-report.jar", "", 1, "")]
-        self.assertIn("chown dl: /opt/dfdatalink/start.sh", sd.copy_files_script(Pkg(), "/stg", "/opt/dfdatalink", "dl"))
+        self.assertIn("chown dl: /opt/sight-datalink/start.sh", sd.copy_files_script(Pkg(), "/stg", "/opt/sight-datalink", "dl"))
 
     def test_backup_excludes(self):
         self.assertIn("./data/cache*", sd.tar_excludes("sight-report"))
-        dl = sd.tar_excludes("dfdatalink")
+        dl = sd.tar_excludes("sight-datalink")
         self.assertNotIn("data/", dl)  # data/ 整个备份（向导配置、H2、驱动、受管文件）
         self.assertIn("./logs", dl)
-        s = sd.svc_functions("dfdatalink", "/opt/dfdatalink", "root", True, "prod", {})
+        s = sd.svc_functions("sight-datalink", "/opt/sight-datalink", "root", True, "prod", {})
         self.assertNotIn("cache*", s)
-        self.assertIn("SVC=dfdatalink", s)
+        self.assertIn("SVC=sight-datalink", s)
         s = sd.svc_functions("sight-wall", "/opt/sight-wall", "root", True, "prod", {})
         self.assertIn('case "${f#data/}" in backups|cache*|temp) continue;; esac', s)
 
 
 class DbDescription(unittest.TestCase):
     def test_properties_parsing(self):
-        text = ("#DFDataLink setup wizard\n"
+        text = ("#Sight DataLink setup wizard\n"
                 "! comment\n"
                 "DB_URL=jdbc\\:postgresql\\://10.0.0.8\\:5432/datalink?sslmode\\=require\n"
                 "DB_USERNAME = dl\n"
@@ -170,18 +170,18 @@ class DbDescription(unittest.TestCase):
         self.assertEqual(p["KEY WITH SPACE"], "v")
 
     def test_datalink_sources(self):
-        prop = ["DB_URL=jdbc\\:h2\\:file\\:/opt/dfdatalink/data/db/dfdatalink;AUTO_SERVER=FALSE"]
-        d = sd.classify_db_datalink(prop, [], [], "/opt/dfdatalink")
+        prop = ["DB_URL=jdbc\\:h2\\:file\\:/opt/sight-datalink/data/db/dfdatalink;AUTO_SERVER=FALSE"]
+        d = sd.classify_db_datalink(prop, [], [], "/opt/sight-datalink")
         self.assertEqual(d["kind"], "h2")
         self.assertTrue(d["inside"])
         # 部署方的环境变量优先于向导文件
-        d = sd.classify_db_datalink(prop, [], ["Environment=DB_URL=jdbc:postgresql://pg1:5432/dl"], "/opt/dfdatalink")
+        d = sd.classify_db_datalink(prop, [], ["Environment=DB_URL=jdbc:postgresql://pg1:5432/dl"], "/opt/sight-datalink")
         self.assertEqual((d["kind"], d["url"]), ("external", "jdbc:postgresql://pg1:5432/dl"))
         self.assertIn("pg1", d["desc"])
-        d = sd.classify_db_datalink(prop, ['DB_URL="jdbc:mysql://my1:3306/dl"'], [], "/opt/dfdatalink")
+        d = sd.classify_db_datalink(prop, ['DB_URL="jdbc:mysql://my1:3306/dl"'], [], "/opt/sight-datalink")
         self.assertEqual(d["url"], "jdbc:mysql://my1:3306/dl")
-        # SPRING_DATASOURCE_URL / MR_DB_URL 不是 DFDataLink 的 DB_URL
-        d = sd.classify_db_datalink([], [], ["Environment=MR_DB_URL=jdbc:mysql://x/y"], "/opt/dfdatalink")
+        # SPRING_DATASOURCE_URL / MR_DB_URL 不是 Sight DataLink 的 DB_URL
+        d = sd.classify_db_datalink([], [], ["Environment=MR_DB_URL=jdbc:mysql://x/y"], "/opt/sight-datalink")
         self.assertEqual(d["kind"], "none")
         self.assertIn("安装向导", d["desc"])
 
@@ -206,7 +206,7 @@ Oct 18 10:00:01 srv bash[901]:  DataLink 尚未配置元数据库，已进入安
 Oct 18 10:00:01 srv bash[901]:  浏览器打开 http://<本机地址>:18680/ 完成配置。
 Oct 18 10:00:01 srv bash[901]:  初始化令牌：OLDtoken-aaaaaaaaaaaaaaaaaaaaaaaaaaa
 Oct 18 10:05:12 srv bash[977]:  初始化令牌：\x1b[33mq8Zt3VfK1mWcR7xYpL2nB0sDuE9gHaJ4\x1b[0m
-Oct 18 10:05:12 srv bash[977]:  配置将写入：/opt/dfdatalink/data/datalink.properties
+Oct 18 10:05:12 srv bash[977]:  配置将写入：/opt/sight-datalink/data/datalink.properties
 """
 
 
@@ -233,14 +233,14 @@ class SetupToken(unittest.TestCase):
         class FakeR:
             def run(self, cmd, sudo=False, **kw):
                 calls.append(cmd)
-                if cmd.startswith("journalctl -u dfdatalink"):
+                if cmd.startswith("journalctl -u sight-datalink"):
                     return 0, "nothing here\n", ""
                 if "logs/console.out" in cmd:
                     return 0, JOURNAL, ""
                 return 1, "", ""
-        tok, hint = sd.find_setup_token(FakeR(), "dfdatalink", "/opt/dfdatalink", True, tries=1)
+        tok, hint = sd.find_setup_token(FakeR(), "sight-datalink", "/opt/sight-datalink", True, tries=1)
         self.assertEqual(tok, "q8Zt3VfK1mWcR7xYpL2nB0sDuE9gHaJ4")
-        self.assertTrue(any("journalctl -u dfdatalink -n 400 --no-pager" in c for c in calls))
+        self.assertTrue(any("journalctl -u sight-datalink -n 400 --no-pager" in c for c in calls))
 
     def test_token_not_in_local_log(self):
         buf = io.StringIO()
@@ -266,7 +266,7 @@ class SchemaRollback(unittest.TestCase):
         self.assertEqual(D("h2", "1.21", "1.24", False)[0], "warn")
         self.assertEqual(D("none", None, None, False)[0], "ok")
 
-    def _guard(self, meta, health, db_kind, full=False, product="dfdatalink"):
+    def _guard(self, meta, health, db_kind, full=False, product="sight-datalink"):
         class FakeR:
             def read_file(self, path, sudo=False):
                 return json.dumps(meta) if path.endswith(".json") else None
@@ -274,7 +274,7 @@ class SchemaRollback(unittest.TestCase):
             def health(self, port):
                 return health
         inst = {"port": 18680, "db": {"kind": db_kind}}
-        return sd.guard_schema_rollback(FakeR(), product, inst, "/opt/sight-backups/dfdatalink/x.tar.gz", full)
+        return sd.guard_schema_rollback(FakeR(), product, inst, "/opt/sight-backups/sight-datalink/x.tar.gz", full)
 
     def test_guard_refuses_external_mismatch(self):
         with self.assertRaises(sd.DeployError) as cm:
@@ -315,7 +315,7 @@ class WaitingMode(unittest.TestCase):
     UP_WAIT = {"status": "UP", "mode": "waiting", "bootstrapped": True, "dbConfigured": True, "dbReachable": False}
 
     def test_descriptor_flag(self):
-        self.assertTrue(sd.PRODUCTS["dfdatalink"]["waiting_mode"])
+        self.assertTrue(sd.PRODUCTS["sight-datalink"]["waiting_mode"])
         self.assertFalse(sd.PRODUCTS["sight-report"]["waiting_mode"] or sd.PRODUCTS["sight-wall"]["waiting_mode"])
         self.assertEqual(sd.WAITING_FAIL_SECS, 60)
 
@@ -365,7 +365,7 @@ class WaitingMode(unittest.TestCase):
         sd.fail, sd.info = (lambda m: msgs.append(("fail", m))), (lambda m: msgs.append(("info", m)))
         sd.ok = sd.warn = lambda m: None
         try:
-            good, h = sd.wait_healthy(FakeR(), "dfdatalink", "/opt/dfdatalink", 18680, need_boot, 300, False,
+            good, h = sd.wait_healthy(FakeR(), "sight-datalink", "/opt/sight-datalink", 18680, need_boot, 300, False,
                                       waiting_limit=limit)
         finally:
             sd.time, sd.fail, sd.info, sd.ok, sd.warn = saved
@@ -403,31 +403,31 @@ class WaitingMode(unittest.TestCase):
 
 class DbDumpPrune(unittest.TestCase):
     def test_name(self):
-        self.assertEqual(sd.db_dump_name("dfdatalink", "0.2.0-rc 1", "20261018-101500"),
-                         "dfdatalink-db-0.2.0_rc_1-20261018-101500.dump")
+        self.assertEqual(sd.db_dump_name("sight-datalink", "0.2.0-rc 1", "20261018-101500"),
+                         "sight-datalink-db-0.2.0_rc_1-20261018-101500.dump")
         # 本工具自己起的名字一定能被清理逻辑认出来
-        n = sd.db_dump_name("dfdatalink", "0.2.0-rc 1", "20261018-101500")
-        self.assertEqual(sd.db_dumps_to_prune([n], "dfdatalink", 0), [n])
+        n = sd.db_dump_name("sight-datalink", "0.2.0-rc 1", "20261018-101500")
+        self.assertEqual(sd.db_dumps_to_prune([n], "sight-datalink", 0), [n])
 
     def test_select(self):
         P = sd.db_dumps_to_prune
-        names = ["dfdatalink-db-0.1.8-20261001-091000.dump", "dfdatalink-db-0.1.9-20261012-150200.dump",
-                 "dfdatalink-db-0.2.0-20261018-101500.dump", "dfdatalink-db-0.1.7-20260901-080000.dump",
+        names = ["sight-datalink-db-0.1.8-20261001-091000.dump", "sight-datalink-db-0.1.9-20261012-150200.dump",
+                 "sight-datalink-db-0.2.0-20261018-101500.dump", "sight-datalink-db-0.1.7-20260901-080000.dump",
                  # 不是本工具的命名，一律不动
-                 "dfdatalink-db-0.2.1-20261019-101500.dump.tmp", "dfdatalink-0.1.9-20261012-150200.tar.gz",
-                 "dfdatalink-db-0.2.0-20261018-101500.dump.json", "my-dfdatalink-db-0.1-20200101-000000.dump",
-                 "dfdatalink-db-手工-20200101-000000.dump", "dfdatalink-db-x-2020.dump", "sight-report-db-1-20200101-000000.dump",
-                 "dfdatalink-db-../x-20200101-000000.dump"]
-        self.assertEqual(P(names, "dfdatalink", 3),
-                         ["dfdatalink-db-0.1.7-20260901-080000.dump"])
-        self.assertEqual(P(names, "dfdatalink", 1),
-                         ["dfdatalink-db-0.1.9-20261012-150200.dump", "dfdatalink-db-0.1.8-20261001-091000.dump",
-                          "dfdatalink-db-0.1.7-20260901-080000.dump"])
+                 "sight-datalink-db-0.2.1-20261019-101500.dump.tmp", "sight-datalink-0.1.9-20261012-150200.tar.gz",
+                 "sight-datalink-db-0.2.0-20261018-101500.dump.json", "my-sight-datalink-db-0.1-20200101-000000.dump",
+                 "sight-datalink-db-手工-20200101-000000.dump", "sight-datalink-db-x-2020.dump", "sight-report-db-1-20200101-000000.dump",
+                 "sight-datalink-db-../x-20200101-000000.dump"]
+        self.assertEqual(P(names, "sight-datalink", 3),
+                         ["sight-datalink-db-0.1.7-20260901-080000.dump"])
+        self.assertEqual(P(names, "sight-datalink", 1),
+                         ["sight-datalink-db-0.1.9-20261012-150200.dump", "sight-datalink-db-0.1.8-20261001-091000.dump",
+                          "sight-datalink-db-0.1.7-20260901-080000.dump"])
         # 刚做的那份总是保留（带路径也行）
-        self.assertNotIn("dfdatalink-db-0.1.7-20260901-080000.dump",
-                         P(names, "dfdatalink", 1, keep="/opt/sight-backups/dfdatalink/dfdatalink-db-0.1.7-20260901-080000.dump"))
-        self.assertEqual(P(names, "dfdatalink", 10), [])
-        self.assertEqual(P([], "dfdatalink", 3), [])
+        self.assertNotIn("sight-datalink-db-0.1.7-20260901-080000.dump",
+                         P(names, "sight-datalink", 1, keep="/opt/sight-backups/sight-datalink/sight-datalink-db-0.1.7-20260901-080000.dump"))
+        self.assertEqual(P(names, "sight-datalink", 10), [])
+        self.assertEqual(P([], "sight-datalink", 3), [])
 
     def test_prune_remote(self):
         class FakeR:
@@ -437,19 +437,19 @@ class DbDumpPrune(unittest.TestCase):
             def run(self, cmd, sudo=False, **k):
                 self.cmds.append(cmd)
                 if cmd.startswith("for f in"):
-                    return 0, "dfdatalink-db-0.1.8-20261001-091000.dump\ndfdatalink-db-0.1.9-20261012-150200.dump\n" \
-                              "dfdatalink-db-0.2.0-20261018-101500.dump\nnotes.txt\n", ""
+                    return 0, "sight-datalink-db-0.1.8-20261001-091000.dump\nsight-datalink-db-0.1.9-20261012-150200.dump\n" \
+                              "sight-datalink-db-0.2.0-20261018-101500.dump\nnotes.txt\n", ""
                 return 0, "", ""
         r = FakeR()
         saved = sd.info
         sd.info = lambda m: None
         try:
-            sd.prune_db_dumps(r, "/data/sight backups/dfdatalink", "dfdatalink", 2,
-                              keep="/data/sight backups/dfdatalink/dfdatalink-db-0.2.0-20261018-101500.dump")
+            sd.prune_db_dumps(r, "/data/sight backups/sight-datalink", "sight-datalink", 2,
+                              keep="/data/sight backups/sight-datalink/sight-datalink-db-0.2.0-20261018-101500.dump")
         finally:
             sd.info = saved
-        self.assertIn("'/data/sight backups/dfdatalink'/dfdatalink-db-*.dump", r.cmds[0])
-        self.assertEqual(r.cmds[1], "rm -f -- '/data/sight backups/dfdatalink/dfdatalink-db-0.1.8-20261001-091000.dump'")
+        self.assertIn("'/data/sight backups/sight-datalink'/sight-datalink-db-*.dump", r.cmds[0])
+        self.assertEqual(r.cmds[1], "rm -f -- '/data/sight backups/sight-datalink/sight-datalink-db-0.1.8-20261001-091000.dump'")
 
 
 if __name__ == "__main__":
