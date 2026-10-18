@@ -247,6 +247,14 @@ svg{width:1em;height:1em;flex:none;vertical-align:-.125em}
 .banner .hintl{margin-top:6px;padding:7px 10px;background:rgba(255,255,255,.75);border-radius:6px;color:#244e96}
 .banner .small{color:var(--muted);font-size:12px;margin-top:6px;word-break:break-all}
 .res{margin-top:8px;display:flex;flex-direction:column;gap:4px}
+.tok{margin-top:10px;padding:12px 14px;background:#fff;border:1px solid #f0d28a;border-radius:10px;box-shadow:0 1px 2px rgba(30,50,90,.05)}
+.tok .tt{font-weight:600;color:#80510a;display:flex;align-items:center;gap:6px}
+.tok .tv{display:flex;align-items:center;gap:8px;margin:8px 0 6px}
+.tok code{flex:1;min-width:0;font-family:var(--mono);font-size:15px;letter-spacing:.02em;padding:7px 10px;background:#fbf7ec;border:1px dashed #e2c06b;border-radius:7px;word-break:break-all;user-select:all;color:var(--ink)}
+.tok .tn{font-size:12.5px;color:var(--ink2);line-height:1.55}
+.chk{display:flex;align-items:flex-start;gap:8px;cursor:pointer;padding:8px 10px;border:1px solid var(--line2);border-radius:8px;background:#fff}
+.chk input{margin-top:4px}
+.chk.on{border-color:var(--accent);background:var(--accent-bg)}
 .res div{display:flex;gap:8px;align-items:center}
 
 /* timeline */
@@ -670,8 +678,8 @@ function buildPicker(opts) {
       var j = null; try { j = JSON.parse(xhr.responseText); } catch (e) { }
       if (xhr.status === 403) { fatal('warn', '会话已失效', '请重新打开 Sight 部署助手。', true); return; }
       if (xhr.status >= 300 || !j || !j.path) { toast((j && j.error) || '复制失败，请改用「浏览…」选择文件'); return; }
-      var m = /^(sight-report|sight-wall)[-_]v?(\d+(?:\.\d+)+)/i.exec(file.name);
-      var p = { path: j.path, name: file.name, size: file.size, mtime: Math.floor(Date.now() / 1000), dir: j.path.replace(/[\\\/][^\\\/]*$/, ''), product: m ? m[1].toLowerCase() : null, version: m ? m[2] : null };
+      var g = guessPkg(file.name);
+      var p = { path: j.path, name: file.name, size: file.size, mtime: Math.floor(Date.now() / 1000), dir: j.path.replace(/[\\\/][^\\\/]*$/, ''), product: g.product, version: g.version };
       items.unshift(p); if (kind !== 'key') renderList(); setSel(p);
     };
     xhr.onerror = function () { uploading = false; resetDrop(); toast('复制失败：与本地程序的连接中断'); };
@@ -762,6 +770,20 @@ function refreshState() {
   return api('GET', '/api/state').then(function (st) { S.state = st; return st; });
 }
 function productName(id) { return S.state && S.state.products[id] ? S.state.products[id].name : id; }
+function productInfo(id) { return (S.state && S.state.products && S.state.products[id]) || {}; }
+function allProductNames() { return S.state && S.state.products ? Object.keys(S.state.products).map(productName).join(' / ') : 'SightReport / SightWall'; }
+/* 安装包文件名 → 产品：<zip_prefix>-<版本>.zip（如 sight-report-2.0.71.zip、dfdatalink-0.2.0.zip） */
+function guessPkg(name) {
+  var ids = S.state && S.state.products ? Object.keys(S.state.products) : [];
+  ids.sort(function (a, b) { return (productInfo(b).zip_prefix || b).length - (productInfo(a).zip_prefix || a).length; });
+  for (var i = 0; i < ids.length; i++) {
+    var pre = (productInfo(ids[i]).zip_prefix || ids[i]).toLowerCase(), low = String(name || '').toLowerCase();
+    if (low.indexOf(pre) !== 0) continue;
+    var m = /^[-_]v?(\d+(?:\.\d+)+)/.exec(low.slice(pre.length));
+    if (m) return { product: ids[i], version: m[1] };
+  }
+  return { product: null, version: null };
+}
 
 /* ---------- job runner ---------- */
 /* o: {title, panel(default true), onEvent(ev,j), onDone(j), onClose(j), onFail(e), productId, noRefresh} */
@@ -900,13 +922,22 @@ function showQuestion(j, q) {
     var ins = {};
     (q.fields || []).forEach(function (fd) {
       var f2 = h('div', { class: 'fld' }), i2;
+      if (fd.type === 'checkbox') {
+        i2 = h('input', { type: 'checkbox' }); i2.checked = /^(1|true|yes|on)$/i.test(String(fd.default == null ? '' : fd.default));
+        var lb = h('label', { class: 'chk' + (i2.checked ? ' on' : '') }, [i2, h('span', null, [fd.label || fd.key])]);
+        i2.addEventListener('change', (function (x, l) { return function () { l.classList.toggle('on', x.checked); }; })(i2, lb));
+        f2.appendChild(lb);
+        if (fd.help) f2.appendChild(h('div', { class: 'help' }, [fd.help]));
+        ins[fd.key] = i2; body.appendChild(f2);
+        return;
+      }
       f2.appendChild(h('label', { class: 'l' }, [fd.label || fd.key]));
       if (fd.type === 'password') { var p2 = pwField(null, fd.default || '', fd.placeholder); i2 = p2.input; f2.appendChild(p2.wrap); }
       else { i2 = h('input', { class: 'inp', type: fd.type === 'number' ? 'number' : 'text', placeholder: fd.placeholder || '' }); i2.value = fd.default == null ? '' : fd.default; f2.appendChild(i2); }
       if (fd.help) f2.appendChild(h('div', { class: 'help' }, [fd.help]));
       ins[fd.key] = i2; body.appendChild(f2);
     });
-    acts = [cancelBtn, okBtn(function () { var v = {}; Object.keys(ins).forEach(function (k) { v[k] = ins[k].value; }); answerQ(j, q, { value: v }); })];
+    acts = [cancelBtn, okBtn(function () { var v = {}; Object.keys(ins).forEach(function (k) { v[k] = ins[k].type === 'checkbox' ? ins[k].checked : ins[k].value; }); answerQ(j, q, { value: v }); })];
   } else if (kind === 'file') {
     var pk = buildPicker({ kind: q.file_kind || 'package', onChange: function (s) { if (M && M.btn.ok) M.btn.ok.disabled = !s; } });
     if (q.label) body.appendChild(h('div', { style: 'font-weight:600;margin-bottom:8px' }, [q.label]));
@@ -1049,9 +1080,12 @@ function resultSummary(j) {
       var cls = x.status === '完成' ? 'ok' : x.status === '失败' ? 'bad' : x.status === '取消' ? 'warn' : 'gray';
       var row = h('div', null, [h('span', { class: 'badge ' + cls }, [x.status || '']), h('b', null, [x.host])]);
       if (x.url && x.status === '完成') row.appendChild(h('a', { href: x.url, target: '_blank', rel: 'noopener' }, [x.url]));
+      if (x.mode === 'setup') row.appendChild(h('span', { class: 'badge warn' }, ['待完成安装向导']));
+      if (x.mode === 'waiting') row.appendChild(h('span', { class: 'badge warn' }, ['等待元数据库']));
       box.appendChild(row);
     });
     wrap.appendChild(box);
+    r.results.forEach(function (x) { var t = tokenBox(x, r.results.length > 1); if (t) wrap.appendChild(t); });
   }
   if (j.kind === 'download_tool' && r.path) {
     wrap.appendChild(h('div', { class: 'small', style: 'color:var(--ink2);font-size:13px;margin-top:4px;word-break:break-all' }, ['已保存到：' + r.path]));
@@ -1059,10 +1093,30 @@ function resultSummary(j) {
   }
   return wrap;
 }
+/* DFDataLink 安装向导：初始化令牌（一次性凭据，只在本次操作的结果里显示） */
+function tokenBox(x, multi) {
+  if (x.status !== '完成') return null;
+  if (x.mode === 'waiting') {
+    return h('div', { class: 'tok' }, [h('div', { class: 'tt', html: ico('bang') + '<span>' + esc((multi ? x.host + '：' : '') + '元数据库连不上，服务在等待并自动重试') + '</span>' }),
+      h('div', { class: 'tn' }, ['数据库恢复后服务会自动启动，无需重启。打开 ' + (x.url || '') + ' 可以查看等待状态；改正连接配置需要初始化令牌（在配置文件 data/datalink.properties 的 FDL_SETUP_TOKEN 里）。'])]);
+  }
+  if (x.mode !== 'setup') return null;
+  if (!x.setup_token) {
+    return h('div', { class: 'tok' }, [h('div', { class: 'tt', html: ico('bang') + '<span>' + esc((multi ? x.host + '：' : '') + (/^令牌为/.test(x.token_hint || '') ? '初始化令牌' : '没有取到初始化令牌')) + '</span>' }),
+      h('div', { class: 'tn' }, [x.token_hint || '请在服务器上查看服务日志里「初始化令牌：」那一行。'])]);
+  }
+  var cp = h('button', { class: 'btn sm', type: 'button', html: ico('copy') + '复制令牌' });
+  cp.addEventListener('click', function () { copyText(x.setup_token); });
+  return h('div', { class: 'tok' }, [
+    h('div', { class: 'tt', html: ico('bang') + '<span>' + esc((multi ? x.host + ' 的' : '') + '初始化令牌') + '</span>' }),
+    h('div', { class: 'tv' }, [h('code', null, [x.setup_token]), cp]),
+    h('div', { class: 'tn', html: '打开 <a href="' + esc(x.url || '') + '" target="_blank" rel="noopener">' + esc(x.url || '') + '</a> 按安装向导配置元数据库时要填这个令牌；' +
+      '向导完成后的<b>「初始化管理员」也需要同一个令牌</b>。令牌是一次性的初始化凭据，只显示在这里；关闭后可以在服务器的服务日志里搜「初始化令牌」找到。' })]);
+}
 function bannerText(j) {
   var r = j.result || {};
   switch (j.kind) {
-    case 'deploy': return '安装 / 升级已完成';
+    case 'deploy': return (r.results || []).some(function (x) { return x.mode === 'setup'; }) ? '安装已完成，请继续完成安装向导' : '安装 / 升级已完成';
     case 'rollback': return '回滚已完成';
     case 'service': return '操作已完成';
     case 'download_package': return (r.reused ? '本机已有这个版本的安装包' : '安装包已下载并校验') + (r.version ? '：' + r.version : '');
@@ -1103,7 +1157,7 @@ function panelDone(j) {
   if (j.ok && j.kind === 'deploy' && j.result && j.result.results) {
     var ok = j.result.results.filter(function (x) { return x.url && x.status === '完成'; });
     ok.forEach(function (x) {
-      var lbl = ok.length === 1 ? '打开 ' + (j.o.productName || '系统') : '打开 ' + x.host;
+      var lbl = ok.length === 1 ? (x.mode === 'setup' ? '打开安装向导' : '打开 ' + (j.o.productName || '系统')) : '打开 ' + x.host;
       acts.push({ label: lbl, kind: '', onClick: function () { window.open(x.url, '_blank', 'noopener'); } });
     });
   }
@@ -1159,7 +1213,7 @@ function renderSide() {
 
 function renderEmpty() {
   return '<div class="empty">' + updateBannerHtml() + '<h1>欢迎使用 Sight 部署助手</h1>' +
-    '<p class="lead">在你的电脑上，通过 SSH 把 SightReport / SightWall 安装到客户的 Linux 服务器，或升级到新版本。<br>不需要手工敲命令，三步就能完成。</p>' +
+    '<p class="lead">在你的电脑上，通过 SSH 把 ' + esc(allProductNames()) + ' 安装到客户的 Linux 服务器，或升级到新版本。<br>不需要手工敲命令，三步就能完成。</p>' +
     '<div class="steps3">' +
     '<div class="step3"><div class="n">1</div><b>添加服务器</b><span>填写服务器地址、账号和密码（或私钥）。程序会先测试连接，并安全保存在本机。</span></div>' +
     '<div class="step3"><div class="n">2</div><b>选择安装包</b><span>从「下载」「桌面」里自动找到安装包，也可以直接把 zip 文件拖进页面。</span></div>' +
@@ -1170,7 +1224,9 @@ function renderEmpty() {
 function skeletonCards() {
   var one = '<div class="card skeleton"><div class="ch"><div class="pico"></div><h2 style="color:var(--muted)">正在读取…</h2></div>' +
     '<div class="ln" style="width:70%"></div><div class="ln" style="width:55%"></div><div class="ln" style="width:62%"></div><div class="ln" style="width:40%;margin-bottom:22px"></div></div>';
-  return '<div class="cards">' + one + one + '</div>';
+  var n = S.state && S.state.products ? Object.keys(S.state.products).length : 2, all = '';
+  for (var i = 0; i < n; i++) all += one;
+  return '<div class="cards">' + all + '</div>';
 }
 
 function dbLine(p) {
@@ -1187,14 +1243,21 @@ function productCard(p, hostRec) {
       '<div><button class="btn primary" type="button" data-job="1" data-act="deploy" data-p="' + esc(id) + '">安装 ' + esc(pn) + '</button></div></div></div>';
   }
   var badge = p.running && p.healthy ? '<span class="badge ok"><i class="dot"></i>运行中</span>' : p.running ? '<span class="badge warn"><i class="dot"></i>启动中 / 无响应</span>' : '<span class="badge bad"><i class="dot"></i>未运行</span>';
+  if (p.running && p.healthy && p.mode === 'setup') badge = '<span class="badge warn" title="还没有配置元数据库">安装向导</span> ' + badge;
+  else if (p.running && p.healthy && p.mode === 'waiting') badge = '<span class="badge warn" title="元数据库连不上，服务在等待并自动重试">等待数据库</span> ' + badge;
   var svc = p.service === 'systemd' ? 'systemd 系统服务' + (p.active ? '（' + esc(p.active) + '）' : '') : p.service === 'process' ? '后台进程（未注册为系统服务）' : esc(p.service || '-');
   var notes = '';
   function note(cls, ic, html) { notes += '<div class="note ' + cls + '">' + ico(ic) + '<div>' + html + '</div></div>'; }
   if (!p.running) note('info', 'help', '服务当前没有运行，点「启动」即可。');
   else {
     if (!p.healthy) note('warn', 'bang', '服务进程在运行，但健康检查还没通过。可能仍在启动，请稍后点「刷新」；一直如此请打开「日志」查看原因。');
-    else if (p.bootstrapped === false) note('warn', 'bang', '系统还没有完成初始化，请先打开 <a href="' + esc((p.url || '').replace(/\/?$/, '/') + 'setup') + '" target="_blank" rel="noopener">' + esc((p.url || '').replace(/\/?$/, '/') + 'setup') + '</a> 完成首次设置。');
-    if (p.db_reachable === false) note('bad', 'x', '数据库无法连接，请检查数据库服务和连接配置。');
+    else if (p.mode === 'waiting') note('warn', 'bang', '元数据库连不上，服务在等待并自动重试：数据库恢复后会自动启动，无需重启服务。打开 <a href="' + esc(p.url || '') + '" target="_blank" rel="noopener">' + esc(p.url || '') + '</a> 可以查看等待状态。');
+    else if (p.bootstrapped === false) {
+      var su = p.setup_url || (p.url || '').replace(/\/?$/, '/') + 'setup', sl = '<a href="' + esc(su) + '" target="_blank" rel="noopener">' + esc(su) + '</a>';
+      if (p.mode === 'setup') note('warn', 'bang', '安装向导还没有完成：请打开 ' + sl + ' 配置元数据库。向导需要<b>初始化令牌</b>（安装完成时显示过；也可以在服务日志里找「初始化令牌：」那一行）。');
+      else note('warn', 'bang', '系统还没有完成初始化，请先打开 ' + sl + ' 完成首次设置。');
+    } else if (p.admin_initialized === false) note('info', 'help', '还没有创建管理员：打开 <a href="' + esc(p.url || '') + '" target="_blank" rel="noopener">' + esc(p.url || '') + '</a> 完成「初始化管理员」（需要安装时的同一个初始化令牌）。');
+    if (p.db_reachable === false && p.mode !== 'waiting') note('bad', 'x', '数据库无法连接，请检查数据库服务和连接配置。');
     if (p.healthy && p.reachable === false) note('warn', 'bang', '本机暂时无法访问这个地址，可能是服务器防火墙或网络策略限制了端口 ' + esc(p.port) + '。');
   }
   var nw = onlineNewer(id, p.version);
@@ -1321,10 +1384,13 @@ function deployFlow(hostName, productId) {
       list.appendChild(row);
     });
     var prod = pkg.product ? productName(pkg.product) : '';
+    var noRolling = pkg.product && productInfo(pkg.product).rolling_upgrade === false;
+    var clusterNote = noRolling ? h('div', { class: 'note warn', style: 'margin:12px 0 0;display:none', html: ico('bang') + '<div><b>' + esc(prod) + ' 不做自动滚动升级。</b>如果这几台是集群（共用一个外部元数据库）：请先把所有服务器上的 ' + esc(prod) + ' 全部停止，再升级第一台、等它启动完成（数据库结构迁移完成）后再升级其余。开始后还会再确认一次。</div>' }) : null;
     var body = h('div', null, [
       h('div', { class: 'note info', style: 'margin:0 0 14px', html: ico('box') + '<div>安装包：<b>' + esc(pkg.name) + '</b>' + (prod ? '（' + esc(prod) + (pkg.version ? ' ' + esc(pkg.version) : '') + '）' : '') + '，' + fmtSize(pkg.size) + '</div>' }),
       h('div', { style: 'font-weight:600;margin-bottom:8px' }, ['部署到哪些服务器？']), list,
-      n > 1 ? h('div', { class: 'help', style: 'color:var(--muted);font-size:12.5px;margin-top:10px' }, ['选择多台时会依次处理（滚动升级）；某台失败时，程序会询问是否继续处理后面的服务器。']) : null
+      n > 1 ? h('div', { class: 'help', style: 'color:var(--muted);font-size:12.5px;margin-top:10px' }, [noRolling ? '选择多台时会按列表顺序依次处理；某台失败时，程序会询问是否继续处理后面的服务器。' : '选择多台时会依次处理（滚动升级）；某台失败时，程序会询问是否继续处理后面的服务器。']) : null,
+      clusterNote
     ]);
     var M2 = openModal({
       title: '选择要部署的服务器', sub: '第 2 步，共 2 步', cls: 'w600', body: body, dismiss: true, enter: 'go',
@@ -1335,6 +1401,7 @@ function deployFlow(hostName, productId) {
       var c = Object.keys(picked).filter(function (k) { return picked[k]; }).length;
       M2.btn.go.disabled = !c || isBusy();
       M2.btn.go.textContent = c > 1 ? '开始安装 / 升级（' + c + ' 台）' : '开始安装 / 升级';
+      if (clusterNote) clusterNote.style.display = c > 1 ? '' : 'none';
     }
     function go(M) {
       var names = S.state.hosts.map(function (x) { return x.name; }).filter(function (k) { return picked[k]; });
@@ -1458,16 +1525,16 @@ function openRollback(host, pid) {
       body.appendChild(h('div', { class: 'side-empty', style: 'padding:24px 0;text-align:center' }, ['这台服务器上还没有可用的备份。每次升级前程序会自动备份，之后就能在这里回滚。']));
       M.setActions([{ label: '关闭', kind: 'primary', onClick: function () { M.close(); } }]); return;
     }
-    var selI = 0, full = true;
-    body.appendChild(h('div', { style: 'color:var(--ink2);margin-bottom:12px', html: '当前版本 <b>' + esc(r.current_version || '未知') + '</b>，备份目录 <span style="font-family:var(--mono);font-size:12.5px">' + esc(r.backup_dir || '') + '</span>' }));
+    var selI = 0, full = true, schemaOn = !!productInfo(pid).schema_versioned, rbBlocked = false;
+    body.appendChild(h('div', { style: 'color:var(--ink2);margin-bottom:12px', html: '当前版本 <b>' + esc(r.current_version || '未知') + '</b>' + (schemaOn ? '，数据库结构版本 <b>' + esc(r.current_schema_version || '读不到') + '</b>' : '') + '，备份目录 <span style="font-family:var(--mono);font-size:12.5px">' + esc(r.backup_dir || '') + '</span>' }));
     body.appendChild(h('div', { style: 'font-weight:600;margin-bottom:6px' }, ['1. 选择要恢复到的备份']));
     var l1 = h('div', { class: 'opts' });
     bs.forEach(function (b, i) {
       var rd = h('input', { type: 'radio', name: 'bk' }); if (i === 0) rd.checked = true;
       var row = h('label', { class: 'opt tight' + (i === 0 ? ' on' : '') }, [rd, h('div', { style: 'flex:1;min-width:0' }, [
-        h('div', { class: 'o1', html: esc(b.time) + '　<span class="tag">版本 ' + esc(b.version || '未知') + '</span>' + (b.version && b.version === r.current_version ? ' <span class="tag gray">与当前版本相同</span>' : '') + '　<span style="font-weight:400;color:var(--ink2)">' + fmtSize(b.size) + '</span>' }),
+        h('div', { class: 'o1', html: esc(b.time) + '　<span class="tag">版本 ' + esc(b.version || '未知') + '</span>' + (b.version && b.version === r.current_version ? ' <span class="tag gray">与当前版本相同</span>' : '') + (schemaOn ? ' <span class="tag gray" title="备份时记录的数据库结构版本">结构 ' + esc(b.schema_version || '未记录') + '</span>' : '') + '　<span style="font-weight:400;color:var(--ink2)">' + fmtSize(b.size) + '</span>' }),
         h('div', { class: 'o2', style: 'font-family:var(--mono);font-size:12px;overflow:hidden;text-overflow:ellipsis' }, [b.file])])]);
-      rd.addEventListener('change', function () { selI = i; Array.prototype.forEach.call(l1.children, function (c, k) { c.classList.toggle('on', k === i); }); });
+      rd.addEventListener('change', function () { selI = i; Array.prototype.forEach.call(l1.children, function (c, k) { c.classList.toggle('on', k === i); }); schemaCheck(); });
       l1.appendChild(row);
     });
     body.appendChild(l1);
@@ -1478,13 +1545,26 @@ function openRollback(host, pid) {
      [false, '仅程序', '只换回程序文件，保留现在的数据和配置。适合新版本有问题、但数据不想回退的情况。']].forEach(function (o, i) {
       var rd = h('input', { type: 'radio', name: 'sc' }); if (i === 0) rd.checked = true;
       var row = h('label', { class: 'opt tight' + (i === 0 ? ' on' : '') }, [rd, h('div', null, [h('div', { class: 'o1' }, [o[1]]), h('div', { class: 'o2' }, [o[2]])])]);
-      rd.addEventListener('change', function () { full = o[0]; Array.prototype.forEach.call(l2.children, function (c, k) { c.classList.toggle('on', k === i); }); });
+      rd.addEventListener('change', function () { full = o[0]; Array.prototype.forEach.call(l2.children, function (c, k) { c.classList.toggle('on', k === i); }); schemaCheck(); });
       l2.appendChild(row);
     });
     body.appendChild(l2);
     if (dbk === 'external') body.appendChild(h('div', { class: 'note warn', style: 'margin:12px 0 0', html: ico('bang') + '<div>这台服务器使用外部数据库，数据库不在备份里，回滚不会改动它。如果新版本改过数据库结构，请先联系负责人确认。</div>' }));
     else if (dbk === 'none') body.appendChild(h('div', { class: 'note info', style: 'margin:12px 0 0', html: ico('help') + '<div>这个备份里没有数据库。</div>' }));
+    /* 数据库结构版本（DFDataLink / Flyway）：外部库的结构变了就不能只回滚程序，后端回滚前还会再核对一次 */
+    var sNote = h('div', { class: 'note', style: 'margin:12px 0 0;display:none' });
+    body.appendChild(sNote);
+    function schemaCheck() {
+      if (!schemaOn || !M.btn.go) return;
+      var b = bs[selI], cur = r.current_schema_version, rec = b && b.schema_version, block = false, html = '';
+      if (dbk === 'external' && rec && cur && rec !== cur) { block = true; html = ico('x') + '<div>外部元数据库的结构已从 <b>' + esc(rec) + '</b> 升级到 <b>' + esc(cur) + '</b>，<b>不能只回滚程序</b>：旧版本程序用不了新结构的数据库。请先用升级前的数据库备份恢复元数据库（恢复后结构版本会回到 ' + esc(rec) + '），再回来回滚。</div>'; sNote.className = 'note bad'; }
+      else if (dbk === 'external' && (!rec || !cur)) { html = ico('bang') + '<div>无法核对数据库结构版本（备份时记录：' + esc(rec || '没有记录') + '，当前：' + esc(cur || '读不到') + '）。回滚前会再请你确认数据库结构没有变化。</div>'; sNote.className = 'note warn'; }
+      else if (dbk === 'h2' && !full && rec && cur && rec !== cur) { html = ico('bang') + '<div>内置 H2 的结构已从 ' + esc(rec) + ' 升级到 ' + esc(cur) + '，「仅程序」回滚后旧版本可能用不了现在的数据，建议选「程序 + 数据」。</div>'; sNote.className = 'note warn'; }
+      sNote.innerHTML = html; sNote.style.display = html ? '' : 'none';
+      rbBlocked = block; M.btn.go.disabled = block; M.btn.go.title = block ? '外部元数据库的结构已变化，不能只回滚程序' : '';
+    }
     M.setActions([{ label: '取消', onClick: function () { M.close(); } }, { label: '回滚…', key: 'go', kind: 'primary', job: true, onClick: function () {
+      if (rbBlocked) { toast('外部元数据库的结构已变化，不能只回滚程序：请先用数据库备份恢复'); return; }
       var b = bs[selI];
       uiConfirm({
         title: '确定回滚到 ' + (b.version || b.time) + '？', danger: true, yes: '确定回滚',
@@ -1495,6 +1575,7 @@ function openRollback(host, pid) {
         startJob('rollback', { host: host, product: pid, file: b.file, full: full }, { title: '回滚 ' + pn + ' · ' + host, failTitle: '回滚没有成功' });
       });
     } }]);
+    schemaCheck();
     M.btn.go.focus && M.btn.go.focus();
   }
 }
@@ -1585,7 +1666,7 @@ function openSettings() {
     h('div', { class: 'fld' }, [h('label', { class: 'l' }, ['升级时保留的备份份数']), kb, h('div', { class: 'help' }, ['每次升级前自动备份，超过这个份数时删除最旧的备份。每份备份约占几十 MB 磁盘。'])]),
     h('div', { class: 'fld' }, [h('label', { class: 'l' }, ['等待服务就绪的时间（秒）']), ht, h('div', { class: 'help' }, ['启动或升级后，等待服务通过健康检查的最长时间。服务器较慢或数据量大时可以调大，默认 300 秒。'])]),
     h('div', { class: 'fld' }, [h('label', { class: 'sw', style: 'padding:0' }, [ac, h('span', { class: 'tr' }), h('span', { style: 'font-weight:600' }, ['启动时自动检查更新'])]),
-      h('div', { class: 'help' }, ['打开程序时联网查询官网：部署助手有没有新版本、SightReport / SightWall 的最新版本。只读取版本信息，不上传任何数据。内网电脑可以关掉，需要时点左下角「检查更新」。'])])]);
+      h('div', { class: 'help' }, ['打开程序时联网查询官网：部署助手有没有新版本、' + allProductNames() + ' 的最新版本。只读取版本信息，不上传任何数据。内网电脑可以关掉，需要时点左下角「检查更新」。'])])]);
   var err = h('div', { class: 'qerr hidden' }); body.insertBefore(err, body.firstChild);
   openModal({
     title: '设置', body: body, dismiss: true, enter: 'ok',

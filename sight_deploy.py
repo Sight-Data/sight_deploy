@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-Sight 部署助手 —— SightReport / SightWall 远程安装与升级（网页界面）
+Sight 部署助手 —— SightReport / SightWall / DFDataLink 远程安装与升级（网页界面）
 
 开源地址：https://github.com/Sight-Data/sight_deploy    产品官网：https://www.sightdata.top
 
@@ -19,10 +19,10 @@ Sight 部署助手 —— SightReport / SightWall 远程安装与升级（网页
   设环境变量 SIGHT_DEPLOY_PASSPHRASE 可额外加一层口令（之后每次运行都要设同样的值）。
 
 服务器端约定（与产品包里的 install.sh / start.sh 一致）：
-  安装目录     默认 /opt/sight-report、/opt/sight-wall
-  系统服务     systemd 服务 sight-report / sight-wall（由包内 install.sh 注册）
+  安装目录     默认 /opt/sight-report、/opt/sight-wall、/opt/dfdatalink
+  系统服务     systemd 服务 sight-report / sight-wall / dfdatalink（由包内 install.sh 注册）
   升级备份     默认 <安装目录的上级>/sight-backups/<产品>/，含程序文件 + data/
-               （不含 logs、data/cache*、data/temp、data/backups）
+               （不含 logs；SightReport / SightWall 另不含 data/cache*、data/temp、data/backups）
   非默认端口   写在 /etc/systemd/system/<服务>.service.d/10-sight-deploy.conf
 
 开发调试：python3 sight_deploy.py --no-browser --port 17880（只起服务，不开浏览器）；说明见同目录 README.md
@@ -50,7 +50,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-TOOL_VERSION = "2.1.6"
+TOOL_VERSION = "2.2.0"
 CONF_DIR = Path(os.environ.get("SIGHT_DEPLOY_HOME") or (Path.home() / ".sight-deploy"))
 FROZEN = getattr(sys, "frozen", False)
 # 程序所在目录：打包后是 exe/.app 所在目录（用来找同目录下的安装包），源码运行是本文件目录
@@ -61,18 +61,95 @@ SCRIPT_DIR = APP_DIR
 # 内嵌资源（web/index.html）目录：PyInstaller 解压目录或源码目录
 RES_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 
-PRODUCTS = {
-    "sight-report": {"name": "SightReport", "port": 9091, "jar": "sight-report.jar",
-                     "start_class": "SightDataApplication"},
-    "sight-wall": {"name": "SightWall", "port": 9090, "jar": "sight-wall.jar",
-                   "start_class": "SightWallApplication"},
-}
 MIN_JAVA = 21
 DROPIN_NAME = "10-sight-deploy.conf"
 MARKER = ".sight-deploy.json"
-# 备份时排除的内容（相对安装目录，tar 成员名形如 ./logs）
+# 备份时排除的内容（相对安装目录，tar 成员名形如 ./logs）。SightReport / SightWall 用这一份；
+# 各产品可在描述里用 backup_excludes 换成自己的（见 PRODUCTS）
 BACKUP_EXCLUDES = ["./logs", "./data/backups", "./data/cache*", "./data/temp", "./.sight-staging",
                    "./*.pid", "./*.bak.*", "./*.jar.new"]
+
+
+def _sight_product(key, name, port, start_class, site_id):
+    """SightReport / SightWall 的产品描述（两者约定完全相同，只是名字、端口、主类不同）。"""
+    return {
+        "name": name,                       # 界面上的显示名
+        "jar": key + ".jar",                # 安装目录里的程序 jar（也用来识别安装包、定位进程）
+        "zip_prefix": key,                  # 安装包文件名：<zip_prefix>-<版本>.zip
+        "start_class": start_class,         # MANIFEST 的 Start-Class 里应包含它（防止拿错包）
+        "port": port,                       # 默认端口
+        "dir": "/opt/" + key,               # 默认安装目录
+        "service": key,                     # systemd 服务名（包内 install.sh 按 jar 名注册）
+        "health": "/api/health",            # 健康检查（status=="UP"；bootstrapped=false 表示还没初始化）
+        "setup_path": "/setup",             # 未初始化时让实施人员打开的地址
+        "setup_token": False,               # 初始化是否需要服务日志里的一次性令牌
+        "setup_hint": "首次访问请按向导配置「数据库连接 + 管理员账号」",
+        "db_none_desc": "尚未配置（还没走 /setup 向导）",
+        "db_reader": "sight",               # 数据库配置：data/work/database.config（JSON）+ 环境变量 MR_DB_URL
+        "db_env_re": r"MR_DB_URL=([^\s\"']+)",
+        "proc_env_re": "MR_[A-Z_]+",        # 非系统服务方式运行时，重启要沿用的进程环境变量（除 JVM / 端口外）
+        "version_api": "/api/app/version",  # 升级后核对版本号的接口；None = 读健康检查里的 version
+        "backup_excludes": BACKUP_EXCLUDES,
+        "data_excludes": "backups|cache*|temp",  # 目录复制备份时跳过的 data/ 子项（与上面一致）
+        "log_files": ("logs/sight-data-error.log", "logs/console.out", "logs/sight-data-info.log"),
+        "follow_log": "logs/sight-data-info.log",
+        "follow_journal": False,
+        "needs_fonts": True,                # 导出 PDF / 图片要字体库
+        "start_env": {},                    # 非系统服务方式启动时固定要带的环境变量（{dir} 替换为安装目录）
+        "owned_dirs": None,                 # 交给运行账号的内容：None = 整个安装目录；否则只给这几个子目录，程序文件归 root
+        "site_id": site_id,                 # 官网下载中心条目 id
+        "rolling_upgrade": True,            # 多台服务器可以依次滚动升级
+        "schema_versioned": False,          # 健康检查报告 schemaVersion，升级 / 回滚时核对
+        "db_backup_hint": "升级前请先备份数据库，或在 SightReport / SightWall 管理台「系统管理 › 备份」创建一次完整备份。",
+    }
+
+
+PRODUCTS = {
+    "sight-report": _sight_product("sight-report", "SightReport", 9091, "SightDataApplication", "dl-report"),
+    "sight-wall": _sight_product("sight-wall", "SightWall", 9090, "SightWallApplication", "dl-wall"),
+    # DFDataLink：约定见 DataLink 仓库 docs/plans/2026-10-17-sight-deploy-integration.md 与安装包里的 README.txt
+    "dfdatalink": {
+        "name": "DFDataLink", "jar": "dfdatalink.jar", "zip_prefix": "dfdatalink",
+        "start_class": "DFDataLinkBackendApplication", "port": 18680, "dir": "/opt/dfdatalink",
+        "service": "dfdatalink", "health": "/api/health",
+        "setup_path": "/",                  # 安装向导就在根路径
+        "setup_token": True,                # 向导令牌打印在服务日志里：「初始化令牌：<token>」
+        "setup_hint": "首次访问请按安装向导配置元数据库，之后「初始化管理员」时仍需要同一个初始化令牌",
+        "db_none_desc": "尚未配置（还没走安装向导）",
+        "db_reader": "datalink",            # data/datalink.properties 的 DB_URL + 环境变量 / dfdatalink.env 的 DB_URL
+        "db_env_re": r"(?<![A-Za-z0-9_])DB_URL=([^\s\"']+)",
+        "proc_env_re": "FDL_DATA_DIR",
+        "version_api": None,
+        # data/ 下全是要紧的东西（向导配置与连接密钥、内置 H2、自备驱动、受管文件），整个备份
+        "backup_excludes": ["./logs", "./.sight-staging", "./*.pid", "./*.bak.*", "./*.jar.new"],
+        "data_excludes": "",
+        "log_files": ("logs/console.out", "logs/dfdatalink.log"),
+        "follow_log": "logs/console.out",
+        "follow_journal": True,             # 应用只写标准输出：系统服务方式看 journalctl
+        "needs_fonts": False,
+        "start_env": {"FDL_DATA_DIR": "{dir}/data"},
+        # 与包内 install.sh 一致：程序文件归 root，只有 data/、logs/ 归运行账号（服务被攻破也改不了 root 之后要执行的脚本和 jar）
+        "owned_dirs": ("data", "logs"),
+        "site_id": "dl-datalink",
+        "rolling_upgrade": False,           # 多台共用一个外部库（集群）时不能自动滚动升级
+        "schema_versioned": True,           # Flyway：外部库的表结构升级不可逆
+        "db_backup_hint": "DFDataLink 用 Flyway 升级元数据库结构，外部库升级后不能只靠回滚程序恢复。",
+        "license": "DFDataLink 按其自带的 Sustainable Use License 分发（见安装包里的 LICENSING.md）",
+    },
+}
+
+
+def svc_of(product):
+    """systemd 服务名。"""
+    return PRODUCTS[product]["service"]
+
+
+def product_by_jar(jar_name):
+    return next((k for k, v in PRODUCTS.items() if v["jar"] == jar_name), None)
+
+
+def product_names():
+    return " / ".join(v["name"] for v in PRODUCTS.values())
 
 paramiko = None  # 由 ensure_deps() 延迟导入
 
@@ -116,7 +193,7 @@ def _emit(ev):
     j = current_job()
     if j:
         j.emit(ev)
-    LOG.write(_log_line(ev))
+    LOG.write(mask_token(_log_line(ev)))
 
 
 def _log_line(ev):
@@ -585,7 +662,8 @@ def sha256_file(path, label=None):
 
 
 class Package:
-    """产品安装包：sight-<产品>-<版本>.zip（完整包），或单独的 sight-<产品>.jar（只能用于升级）。"""
+    """产品安装包：<产品>-<版本>.zip（完整包，如 sight-report-2.0.71.zip、dfdatalink-0.2.0.zip），
+    或单独的产品 jar（sight-report.jar / dfdatalink.jar，只能用于升级）。"""
 
     def __init__(self, path):
         self.path = Path(path)
@@ -611,9 +689,10 @@ class Package:
             with zipfile.ZipFile(p) as zf:
                 names = [n for n in zf.namelist() if not n.endswith("/")
                          and "__MACOSX" not in n and not n.endswith(".DS_Store")]
-                jars = [n for n in names if re.search(r"(^|/)sight-[a-z]+\.jar$", n)]
+                jars = [n for n in names if product_by_jar(n.rsplit("/", 1)[-1])]
                 if not jars:
-                    raise DeployError("这个 zip 里没有 sight-*.jar，不是 SightReport / SightWall 安装包：%s" % p.name)
+                    raise DeployError("这个 zip 里没有 %s，不是 %s 安装包：%s" % (
+                        " / ".join(v["jar"] for v in PRODUCTS.values()), product_names(), p.name))
                 jar_name = sorted(jars, key=len)[0]
                 rel_root = jar_name[: -len(Path(jar_name).name)]
                 out(dim("    解压安装包 …"))
@@ -635,8 +714,7 @@ class Package:
             raise DeployError("不支持的安装包格式：%s（需要 .zip 或 .jar）" % p.name)
 
         self.jar = jar_local.name
-        m = re.match(r"(sight-[a-z]+)\.jar$", self.jar)
-        self.product = m.group(1) if m else None
+        self.product = product_by_jar(self.jar)
         if self.product not in PRODUCTS:
             raise DeployError("无法识别的产品：%s" % self.jar)
         try:
@@ -689,7 +767,7 @@ def search_dirs():
 def find_packages():
     found = {}
     for d in search_dirs():
-        for pat in ("sight-report*.zip", "sight-wall*.zip"):
+        for pat in [v["zip_prefix"] + "*.zip" for v in PRODUCTS.values()]:
             for f in d.glob(pat):
                 if f.is_file():
                     found[str(f.resolve())] = f
@@ -1193,8 +1271,8 @@ class Remote:
         # 必须是产品的健康检查结果：端口上是别的程序（如返回 {"code":401,...} 的统一响应体）时不算
         return j if isinstance(j, dict) and "status" in j else None
 
-    def app_version(self, port):
-        st, body = self.http_get(port, "/api/app/version")
+    def app_version(self, port, path="/api/app/version"):
+        st, body = self.http_get(port, path)
         if st != 200:
             return None
         try:
@@ -1206,6 +1284,7 @@ class Remote:
 def _mask(s):
     """日志脱敏：数据库密码、各类 PASSWORD 环境变量。"""
     s = re.sub(r'("password"\s*:\s*")[^"]*(")', r"\1***\2", s, flags=re.I)
+    s = mask_token(s)
     return re.sub(r"((?:PASSWORD|SECRET|TOKEN)[A-Z_]*=)\S+", r"\1***", s, flags=re.I)
 
 
@@ -1451,9 +1530,10 @@ true
 '''
 
 INSPECT_SH = r'''
-D=__DIR__; SVC=__SVC__; JAR=__JAR__
+D=__DIR__; SVC=__SVC__; JAR=__JAR__; ENVRE=__ENVRE__; DBR=__DBR__; OWNF=__OWNF__
 R=$(readlink -f "$D")
-echo "owner=$(stat -c %U "$D/$JAR" 2>/dev/null)"
+o=""; [ -n "$OWNF" ] && [ -e "$D/$OWNF" ] && o=$(stat -c %U "$D/$OWNF" 2>/dev/null)
+echo "owner=${o:-$(stat -c %U "$D/$JAR" 2>/dev/null)}"
 # 只有 unit 的 WorkingDirectory 就是这个目录时，才算「这套安装是系统服务」（同机另一套手工启动的不能误停生产服务）
 U="/etc/systemd/system/$SVC.service"; mine=0
 if [ -f "$U" ]; then
@@ -1475,12 +1555,17 @@ for p in $(pgrep -f -- "$JAR" 2>/dev/null); do
   case "$a" in *"$R/$JAR"*|*"$D/$JAR"*) ;; *) [ "$c" = "$R" ] || continue;; esac
   echo "pid=$p"; echo "pid_java=$e"; echo "pid_args=$a"
   tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null \
-    | grep -E '^(SERVER_PORT|CHECK_PORT|JVM_XMX|JVM_XMS|JVM_RAM_PCT|JVM_OPTS|SPRING_PROFILES_ACTIVE|MR_[A-Z_]+)=' \
+    | grep -E "^(SERVER_PORT|CHECK_PORT|JVM_XMX|JVM_XMS|JVM_RAM_PCT|JVM_OPTS|SPRING_PROFILES_ACTIVE|$ENVRE)=" \
     | sed 's/^/pid_env_/'
+  [ "$DBR" = datalink ] && tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -m1 '^DB_URL=' | sed 's/^DB_URL=/pid_dburl=/'
   if command -v ss >/dev/null 2>&1; then ss -ltnp 2>/dev/null | grep "pid=$p," | awk '{print $4}'
   else netstat -ltnp 2>/dev/null | grep " $p/" | awk '{print $4}'; fi | sed -E 's/.*[:.]([0-9]+)$/pid_port=\1/'
 done
-if [ -f "$D/data/work/database.config" ]; then echo "dbconf=$(tr -d '\n' < "$D/data/work/database.config")"; fi
+if [ "$DBR" = datalink ]; then
+  # 只输出 DB_URL 这一行（文件里还有数据库密码和连接密钥，不能整个读出来）
+  [ -f "$D/data/datalink.properties" ] && grep -E '^[[:space:]]*DB_URL[[:space:]]*[=:[:space:]]' "$D/data/datalink.properties" | sed 's/^/dbprop=/'
+  [ -f "$D/dfdatalink.env" ] && grep -E '^[[:space:]]*(export[[:space:]]+)?DB_URL=' "$D/dfdatalink.env" | sed 's/^/dbenvfile=/'
+elif [ -f "$D/data/work/database.config" ]; then echo "dbconf=$(tr -d '\n' < "$D/data/work/database.config")"; fi
 # 外部配置文件里的 server.port（按 Spring Boot 的优先级顺序输出，取第一个）
 for f in "$D/config/application.properties" "$D/config/application.yml" "$D/config/application.yaml" \
          "$D/application.properties" "$D/application.yml" "$D/application.yaml"; do
@@ -1506,9 +1591,10 @@ def render(sh, **kw):
 
 def probe_env(r, product, install_dir, port):
     p = PRODUCTS[product]
-    code, o, _ = r.run(render(PROBE_SH, dir=install_dir, port=port, svc=product, jar=p["jar"]),
+    code, o, _ = r.run(render(PROBE_SH, dir=install_dir, port=port, svc=p["service"], jar=p["jar"]),
                        sudo=True, timeout=120)
     kv = parse_kv(o)
+    kv["product"] = product
     javas = []
     for item in as_list(kv.get("java")):
         path, _, ver = item.partition("|")
@@ -1519,7 +1605,7 @@ def probe_env(r, product, install_dir, port):
 
 def find_installs(r, product):
     p = PRODUCTS[product]
-    code, o, _ = r.run(render(DETECT_SH, svc=product, jar=p["jar"]), sudo=True, timeout=60)
+    code, o, _ = r.run(render(DETECT_SH, svc=p["service"], jar=p["jar"]), sudo=True, timeout=60)
     cands = []
     for item in as_list(parse_kv(o).get("cand")):
         d, _, src = item.partition("|")
@@ -1531,7 +1617,9 @@ def find_installs(r, product):
 
 def inspect_install(r, product, install_dir):
     p = PRODUCTS[product]
-    code, o, _ = r.run(render(INSPECT_SH, dir=install_dir, svc=product, jar=p["jar"], marker=MARKER),
+    code, o, _ = r.run(render(INSPECT_SH, dir=install_dir, svc=p["service"], jar=p["jar"], marker=MARKER,
+                              envre=p["proc_env_re"], dbr=p["db_reader"],
+                              ownf=(p["owned_dirs"] or ("",))[0]),
                        sudo=True, timeout=60)
     kv = parse_kv(o)
     owner = kv.get("owner") or "root"
@@ -1580,7 +1668,11 @@ def inspect_install(r, product, install_dir):
             port = real
     inst["port"] = port
     # 数据库
-    inst["db"] = classify_db(kv.get("dbconf"), texts, install_dir)
+    if p["db_reader"] == "datalink":
+        inst["db"] = classify_db_datalink(as_list(kv.get("dbprop")), as_list(kv.get("dbenvfile")),
+                                          texts + ["DB_URL=" + x for x in as_list(kv.get("pid_dburl"))], install_dir)
+    else:
+        inst["db"] = classify_db(kv.get("dbconf"), texts, install_dir, product)
     # 版本（读 jar 的 MANIFEST，经 SFTP 随机读取，几 KB 流量）
     inst["version"], inst["java_req"] = remote_jar_version(r, posix_join(install_dir, p["jar"]))
     inst["java"] = None
@@ -1618,10 +1710,10 @@ def posix_join(*a):
     return "/".join([a[0].rstrip("/")] + [x.strip("/") for x in a[1:]])
 
 
-def classify_db(dbconf, unit_texts, install_dir):
+def classify_db(dbconf, unit_texts, install_dir, product="sight-report"):
     url = None
     for t in unit_texts:
-        m = re.search(r"MR_DB_URL=([^\s\"']+)", t)
+        m = re.search(PRODUCTS[product]["db_env_re"], t)
         if m:
             url = m.group(1)
     if not url and dbconf:
@@ -1630,8 +1722,83 @@ def classify_db(dbconf, unit_texts, install_dir):
         except Exception:
             m = re.search(r'"url"\s*:\s*"([^"]+)"', dbconf)
             url = m.group(1) if m else None
+    return describe_db_url(url, install_dir, product)
+
+
+def parse_java_properties(text):
+    r"""按 java.util.Properties.load 的规则解析：# ! 注释、续行（行尾 \）、= : 或空白分隔、\t \n \uXXXX 等转义。"""
+    res = {}
+    lines = (text or "").splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].lstrip(" \t\f")
+        i += 1
+        if not line or line[0] in "#!":
+            continue
+        # 续行：行尾有奇数个反斜杠
+        while (len(line) - len(line.rstrip("\\"))) % 2 == 1 and i <= len(lines):
+            line = line[:-1] + (lines[i].lstrip(" \t\f") if i < len(lines) else "")
+            i += 1
+        key, val, j, n = [], None, 0, len(line)
+        while j < n:  # 键：到第一个未转义的 = : 或空白为止
+            c = line[j]
+            if c == "\\" and j + 1 < n:
+                key.append(line[j:j + 2])
+                j += 2
+                continue
+            if c in "=: \t\f":
+                break
+            key.append(c)
+            j += 1
+        while j < n and line[j] in " \t\f":
+            j += 1
+        if j < n and line[j] in "=:":
+            j += 1
+        while j < n and line[j] in " \t\f":
+            j += 1
+        val = line[j:]
+        res[_prop_unescape("".join(key))] = _prop_unescape(val)
+    return res
+
+
+def _prop_unescape(s):
+    out_, j, n = [], 0, len(s)
+    while j < n:
+        c = s[j]
+        if c != "\\" or j + 1 >= n:
+            out_.append(c)
+            j += 1
+            continue
+        c = s[j + 1]
+        if c == "u" and re.match(r"[0-9a-fA-F]{4}$", s[j + 2:j + 6]):
+            out_.append(chr(int(s[j + 2:j + 6], 16)))
+            j += 6
+            continue
+        out_.append({"t": "\t", "n": "\n", "r": "\r", "f": "\f"}.get(c, c))
+        j += 2
+    return "".join(out_)
+
+
+def classify_db_datalink(prop_lines, envfile_lines, unit_texts, install_dir):
+    """DFDataLink：部署方给的 DB_URL（systemd 环境 / 进程环境 / dfdatalink.env）优先，其次是向导写的 data/datalink.properties。"""
+    url = None
+    for t in unit_texts:
+        m = re.search(PRODUCTS["dfdatalink"]["db_env_re"], t)
+        if m:
+            url = m.group(1)
+    for line in envfile_lines:
+        m = re.match(r"\s*(?:export\s+)?DB_URL=(.*)$", line)
+        v = m.group(1).strip().strip("\"'") if m else ""
+        if v and not url:
+            url = v
+    if not url and prop_lines:
+        url = parse_java_properties("\n".join(prop_lines)).get("DB_URL") or None
+    return describe_db_url(url, install_dir, "dfdatalink")
+
+
+def describe_db_url(url, install_dir, product="sight-report"):
     if not url:
-        return {"kind": "none", "desc": "尚未配置（还没走 /setup 向导）"}
+        return {"kind": "none", "desc": PRODUCTS[product]["db_none_desc"]}
     low = url.lower()
     if low.startswith("jdbc:h2:") and not low.startswith("jdbc:h2:tcp") and not low.startswith("jdbc:h2:ssl"):
         path = url[8:].split(";")[0]
@@ -1664,7 +1831,7 @@ def remote_jar_version(r, path):
 # =============================================================================
 
 def _n_restarts(r, product):
-    code, o, _ = r.run("systemctl show -p NRestarts %s 2>/dev/null" % shlex.quote(product))
+    code, o, _ = r.run("systemctl show -p NRestarts %s 2>/dev/null" % shlex.quote(svc_of(product)))
     m = re.search(r"NRestarts=(\d+)", o)
     return int(m.group(1)) if m else None
 
@@ -1691,16 +1858,21 @@ def wait_healthy(r, product, inst_dir, port, need_bootstrapped, timeout, use_uni
             h = None
         if h and h.get("status") == "UP":
             if not need_bootstrapped or h.get("bootstrapped"):
-                return done(True, h, "服务已就绪（用时 %s）" % fmt_secs(el))
+                res_ = done(True, h, "服务已就绪（用时 %s）" % fmt_secs(el))
+                if h.get("mode") == "waiting":
+                    warn("服务已响应，但元数据库连不上，正在等待并自动重试（数据库恢复后自动启动，无需重启）")
+                return res_
             msg = "已响应，正在初始化 / 升级数据库结构 …"
             if h.get("dbConfigured") and h.get("dbReachable") is False:
                 msg = "已响应，但连不上数据库 …"
+            if h.get("mode") == "waiting":
+                msg = "已响应，但元数据库连不上，服务在等待并自动重试 …"
         else:
             msg = "等待服务启动 …"
         if el - last_check > 10:
             last_check = el
             if use_unit:
-                code, o, _ = r.run("systemctl is-active %s" % shlex.quote(product))
+                code, o, _ = r.run("systemctl is-active %s" % shlex.quote(svc_of(product)))
                 n = _n_restarts(r, product) if restarts0 is not None else None
                 crashing = n is not None and n - restarts0 >= 2  # systemd 在反复自动拉起：启动即崩溃
                 if o.strip() == "failed" or crashing:
@@ -1724,17 +1896,86 @@ def wait_healthy(r, product, inst_dir, port, need_bootstrapped, timeout, use_uni
 def fetch_logs(r, product, inst_dir, unit, n=200):
     """取最近日志：systemd 日志 + 应用日志文件（错误日志优先）。返回 [(标题, 文本)]。"""
     parts = []
+    svc = svc_of(product)
     if unit:
         code, o, _ = r.run("journalctl -u %s -n %d --no-pager 2>/dev/null | tail -n %d" % (
-            shlex.quote(product), n, n), sudo=True)
+            shlex.quote(svc), n, n), sudo=True)
         if o.strip():
-            parts.append(("journalctl -u %s" % product, strip_ansi(o.rstrip())))
-    for f in ("logs/sight-data-error.log", "logs/console.out", "logs/sight-data-info.log"):
+            parts.append(("journalctl -u %s" % svc, strip_ansi(o.rstrip())))
+    for f in PRODUCTS[product]["log_files"]:
         path = posix_join(inst_dir, f)
         code, o, _ = r.run("[ -s %s ] && tail -n %d %s" % (shlex.quote(path), n, shlex.quote(path)), sudo=True)
         if o.strip():
             parts.append((f, strip_ansi(o.rstrip())))
     return parts
+
+
+TOKEN_RE = re.compile(r"初始化令牌[：:][ \t]*(\S[^\r\n]*)")
+_TOKEN_MASK_RE = re.compile(r"((?:初始化)?令牌[：:][ \t]*)\S[^\r\n]*")  # 等待模式的日志里是「令牌：<token>」
+
+
+def mask_token(text):
+    """本地日志里不留初始化令牌（一次性凭据，只显示在本次操作的界面上）。"""
+    return _TOKEN_MASK_RE.sub(r"\1***", text) if "令牌" in text else text
+
+
+def extract_setup_token(text):
+    """从服务日志里取最近一次打印的初始化令牌。返回 (令牌, 说明)：
+    令牌来自部署方的 FDL_SETUP_TOKEN / 配置文件时日志里只有说明（「（使用 FDL_SETUP_TOKEN 的值）」），令牌为 None。"""
+    found = None
+    for line in (text or "").splitlines():
+        m = TOKEN_RE.search(strip_ansi(line))
+        if m:
+            found = m.group(1).strip()
+    if not found:
+        return None, None
+    m = re.match(r"^[A-Za-z0-9_\-]{16,}(?=\s|$)", found)
+    if m:
+        return m.group(0), None
+    hint = found.strip("（）() ")
+    if "FDL_SETUP_TOKEN" in hint and "配置文件" in hint:
+        m = re.search(r"[：:]\s*(\S+)$", hint)
+        return None, "令牌为配置文件里的 FDL_SETUP_TOKEN%s" % ("（%s）" % m.group(1) if m else "")
+    if "FDL_SETUP_TOKEN" in hint:
+        return None, "令牌为部署时设置的 FDL_SETUP_TOKEN"
+    return None, ("初始化令牌没有打印在日志里：%s" % hint) if hint else None
+
+
+def find_setup_token(r, product, inst_dir, unit, tries=6):
+    """安装向导的令牌：系统服务看 journalctl，否则看安装目录 logs/ 下的日志（服务刚起来时可能还没写出，稍等重试）。"""
+    hint = None
+    svc = svc_of(product)
+    for i in range(tries):
+        texts = []
+        if unit:
+            code, o, _ = r.run("journalctl -u %s -n 400 --no-pager 2>/dev/null" % shlex.quote(svc), sudo=True)
+            texts.append(o)
+        for f in PRODUCTS[product]["log_files"]:
+            path = posix_join(inst_dir, f)
+            code, o, _ = r.run("[ -s %s ] && tail -n 400 %s" % (shlex.quote(path), shlex.quote(path)), sudo=True)
+            texts.append(o)
+        for t in texts:
+            token, h_ = extract_setup_token(t)
+            if token:
+                return token, None
+            hint = hint or h_
+        if hint:
+            return None, hint
+        for _ in range(4):
+            check_cancel()
+            time.sleep(0.5)
+    return None, ("没能从服务日志里找到初始化令牌，请在服务器上查看：%s" % (
+        "journalctl -u %s | grep 初始化令牌" % svc if unit else "grep 初始化令牌 %s/logs/*" % inst_dir))
+
+
+def emit_token(token):
+    """把令牌显示在时间线上（kv 一行，界面可复制），本地日志里只记 ***。"""
+    ev = {"t": "kv", "title": "初始化令牌（一次性凭据，只显示在本次操作里）",
+          "items": [["初始化令牌", token], ["说明", "安装向导和之后的「初始化管理员」都需要这个令牌，请妥善转交给实施人员"]]}
+    j = current_job()
+    if j:
+        j.emit(ev)
+    LOG.write("  [初始化令牌] ***（已显示在界面上，日志里不记录）")
 
 
 def show_logs(r, product, inst_dir, unit, n=60):
@@ -1754,7 +1995,8 @@ def show_logs(r, product, inst_dir, unit, n=60):
 
 def svc_functions(product, inst_dir, owner, unit, profile, env):
     """生成 stop_svc / start_svc / jar_pids 三个 bash 函数（升级、回滚、启停共用）。"""
-    jar = PRODUCTS[product]["jar"]
+    P = PRODUCTS[product]
+    jar = P["jar"]
     env_s = " ".join(shlex.quote("%s=%s" % (k, v)) for k, v in sorted((env or {}).items()))
     start_cmd = "cd %s || exit 1; $SS nohup env %s bash ./start.sh %s >> logs/console.out 2>&1 < /dev/null &" % (
         shlex.quote(inst_dir), env_s, shlex.quote(profile or "prod"))
@@ -1775,8 +2017,7 @@ cp_copy(){
         mkdir -p "$2/data" || exit 1
         for f in data/.[!.]* data/..?* data/*; do
           [ -e "$f" ] || [ -L "$f" ] || continue
-          case "${f#data/}" in backups|cache*|temp) continue;; esac
-          cp -a "$f" "$2/data/" || exit 1
+%(data_skip)s          cp -a "$f" "$2/data/" || exit 1
         done
       elif [ "$e" = data ] && [ "$3" != 1 ]; then continue
       else
@@ -1812,7 +2053,8 @@ start_svc(){
     bash -c %(start_q)s
   fi
 }
-''' % {"d": shlex.quote(inst_dir), "j": shlex.quote(jar), "svc": shlex.quote(product),
+''' % {"d": shlex.quote(inst_dir), "j": shlex.quote(jar), "svc": shlex.quote(P["service"]),
+       "data_skip": ('          case "${f#data/}" in %s) continue;; esac\n' % P["data_excludes"]) if P["data_excludes"] else "",
        "unit": "1" if unit else "0", "owner": shlex.quote(owner or "root"),
        "start_q": shlex.quote(start_cmd.replace("$SS", "$(command -v setsid)"))}
 
@@ -1823,10 +2065,10 @@ def have_archive_tools(r):
     return "yes" in o
 
 
-def tar_excludes():
+def tar_excludes(product="sight-report"):
     # $TAROPT（GNU tar 下为 --anchored --no-wildcards-match-slash）必须写在 --exclude 之前：
     # 让 ./*.pid 之类只匹配安装目录顶层，不会误伤 data/ 深处同名后缀的用户文件
-    return "$TAROPT " + " ".join("--exclude=%s" % shlex.quote(x) for x in BACKUP_EXCLUDES)
+    return "$TAROPT " + " ".join("--exclude=%s" % shlex.quote(x) for x in PRODUCTS[product]["backup_excludes"])
 
 
 def ensure_no_remote_task(r, staging):
@@ -1967,6 +2209,8 @@ def upload_package(r, pkg, staging):
 
 
 def copy_files_script(pkg, staging, inst_dir, owner):
+    if PRODUCTS[pkg.product]["owned_dirs"]:
+        owner = "root"  # 程序文件归 root（产品约定只把 data/、logs/ 交给运行账号）
     lines = []
     for rel, _, _, _ in pkg.files:
         src = posix_join(staging, "pkg", rel)
@@ -2105,7 +2349,7 @@ def online_install_java(r, env, min_major):
     code, o, e = r.run(cmd, sudo=True, timeout=900, on_line=logline)
     if code != 0:
         raise DeployError("在线安装失败（服务器可能无法访问软件源）", "改用「上传本机的 JDK 包」")
-    env2 = probe_env(r, "sight-report", "/opt", 1)
+    env2 = probe_env(r, env.get("product") or "sight-report", "/opt", 1)
     good = [j for j in env2["javas"] if j["major"] >= min_major]
     if not good:
         raise DeployError("安装完成但没找到 Java %d" % min_major)
@@ -2129,20 +2373,19 @@ def do_install(ctx, r, pkg):
     product = pkg.product
     P = PRODUCTS[product]
     if not pkg.full:
-        raise DeployError("首次安装需要完整安装包 sight-%s-版本.zip（单独的 jar 只能用于升级）" %
-                          product.split("-")[1])
+        raise DeployError("首次安装需要完整安装包 %s-版本.zip（单独的 jar 只能用于升级）" % P["zip_prefix"])
     step("首次安装 %s %s → %s" % (pkg.name, pkg.version, r.label()))
 
     def validate(v):
         if not v["dir"].startswith("/") or " " in v["dir"]:
-            return "安装目录请填不含空格的绝对路径，如 /opt/%s" % product
+            return "安装目录请填不含空格的绝对路径，如 %s" % P["dir"]
         if not v["port"].isdigit() or not 0 < int(v["port"]) < 65536:
             return "端口请填 1~65535 的数字"
         if v["xmx"] and not re.match(r"^\d+[gGmM]$", v["xmx"]):
             return "最大堆内存格式如 4g、8g、8192m，或留空"
         return None
     vals = ask_form("安装 %s %s 到 %s" % (pkg.name, pkg.version, r.label()), [
-        {"key": "dir", "label": "安装目录", "default": "/opt/%s" % product},
+        {"key": "dir", "label": "安装目录", "default": P["dir"]},
         {"key": "port", "label": "服务端口", "default": str(P["port"]), "type": "number"},
         {"key": "xmx", "label": "最大堆内存", "default": "", "placeholder": "留空 = 按服务器内存自适应",
          "help": "如 4g、8g。留空时程序按服务器可用内存的 75% 自动设置"},
@@ -2157,7 +2400,7 @@ def do_install(ctx, r, pkg):
         env = probe_env(r, product, inst_dir, port)
 
     if env.get("unit") == "1" and env.get("unit_dir", "").rstrip("/") not in ("", inst_dir):
-        raise DeployError("这台服务器已有 %s 系统服务，指向 %s" % (product, env["unit_dir"]),
+        raise DeployError("这台服务器已有 %s 系统服务，指向 %s" % (P["service"], env["unit_dir"]),
                           "同一台服务器每个产品只能注册一个系统服务。要升级它请直接用「升级」；"
                           "确实要另装一套，请先在原目录执行 sudo ./uninstall.sh")
     blocking = env_report(env, inst_dir, port, pkg)
@@ -2167,7 +2410,7 @@ def do_install(ctx, r, pkg):
     java_bin = resolve_java(r, env, max(MIN_JAVA, pkg.java_req))
     java_home = java_home_of(java_bin)
 
-    if env.get("fontconfig") == "0" or env.get("freetype") == "0":
+    if P["needs_fonts"] and (env.get("fontconfig") == "0" or env.get("freetype") == "0"):
         if env.get("pkg") and confirm("尝试在线安装字体库 fontconfig（服务器需能访问软件源；装不上也不影响启动）？", False):
             install_fonts(r, env["pkg"])
 
@@ -2182,7 +2425,7 @@ def do_install(ctx, r, pkg):
     step("确认安装计划")
     plan = [("产品", "%s %s" % (pkg.name, pkg.version)), ("服务器", r.label()), ("安装目录", inst_dir),
             ("端口", str(port)), ("Java", java_bin), ("内存", xmx or "自适应（可用内存的 75%）"),
-            ("运行方式", "系统服务 %s（开机自启、崩溃自动拉起），运行账号 %s" % (product, owner) if use_systemd
+            ("运行方式", "系统服务 %s（开机自启、崩溃自动拉起），运行账号 %s" % (P["service"], owner) if use_systemd
              else "后台进程（服务器没有 systemd，不会开机自启）")]
     kv("安装计划", plan)
     if not confirm("开始安装？", True, detail=["%s：%s" % x for x in plan]):
@@ -2202,9 +2445,12 @@ def do_install(ctx, r, pkg):
     s += "mkdir -p %s/logs %s/data\n" % (shlex.quote(inst_dir), shlex.quote(inst_dir))
     s += "chmod 600 %s\n" % shlex.quote(posix_join(inst_dir, MARKER))
     if owner != "root":
-        s += "chown -R %s: %s\n" % (shlex.quote(owner), shlex.quote(inst_dir))
+        if P["owned_dirs"]:
+            s += "chown -R %s: %s\n" % (shlex.quote(owner), " ".join(shlex.quote(posix_join(inst_dir, d)) for d in P["owned_dirs"]))
+        else:
+            s += "chown -R %s: %s\n" % (shlex.quote(owner), shlex.quote(inst_dir))
     if use_systemd:
-        dropin_dir = "/etc/systemd/system/%s.service.d" % product
+        dropin_dir = "/etc/systemd/system/%s.service.d" % P["service"]
         if env_vars:
             s += "mkdir -p %s\n" % dropin_dir
             s += heredoc(posix_join(dropin_dir, DROPIN_NAME), dropin_content(env_vars))
@@ -2216,6 +2462,7 @@ def do_install(ctx, r, pkg):
         r.run(s, sudo=True, check=True, what="安装", timeout=300, on_line=logline)
     else:
         start_env = dict(env_vars)
+        start_env.update({k: v.replace("{dir}", inst_dir) for k, v in P["start_env"].items()})
         start_env["PATH"] = java_home + "/bin:/usr/local/bin:/usr/bin:/bin"
         if xmx:
             start_env["JVM_XMX"] = xmx
@@ -2236,17 +2483,35 @@ def do_install(ctx, r, pkg):
         show_logs(r, product, inst_dir, use_systemd)
         raise DeployError("服务没能正常启动", "看上面的日志；修正后可在产品卡上点「启动」或「重启」")
     open_firewall(r, env, port)
-    url_path = "/setup" if h and h.get("bootstrapped") is False else "/"
+    need_setup = bool(h and h.get("bootstrapped") is False)
+    mode = (h or {}).get("mode")
+    url_path = P["setup_path"] if need_setup else "/"
     url = "http://%s:%d%s" % (r.host, port, url_path)
+    token, token_hint = None, None
+    if need_setup and P["setup_token"] and mode != "waiting":
+        token, token_hint = find_setup_token(r, product, inst_dir, use_systemd)
     reach = client_can_reach(r.host, port)
     step("安装完成")
     ok("%s %s 已安装并启动" % (pkg.name, pkg.version))
     info("访问地址：%s" % url)
-    if url_path == "/setup":
-        info("首次访问请按向导配置「数据库连接 + 管理员账号」")
+    if mode == "waiting":
+        warn("元数据库连不上，服务在等待并自动重试；数据库恢复后会自动启动，无需重启服务")
+        info("打开 %s 可以查看等待状态（改正连接配置需要初始化令牌）" % url)
+    elif need_setup:
+        info(P["setup_hint"])
+        if P["setup_token"]:
+            if token:
+                emit_token(token)
+            elif token_hint and token_hint.startswith("令牌为"):
+                info(token_hint)
+            else:
+                warn(token_hint or "没能从服务日志里找到初始化令牌")
     if not reach:
         warn("从本机连不上 %s:%d —— 服务在服务器上已正常，可能是网络/安全组/防火墙没放行" % (r.host, port))
-    return {"url": url}
+    res = {"url": url}
+    if P["setup_token"]:
+        res.update({"mode": mode, "setup_token": token, "token_hint": token_hint})
+    return res
 
 
 def _mem_of(x):
@@ -2283,7 +2548,9 @@ def env_report(env, inst_dir, port, pkg):
     else:
         others = ", ".join(j["version"] for j in env["javas"])
         warn("Java      未找到 %d+%s —— 下一步处理" % (max(MIN_JAVA, pkg.java_req), ("（现有 %s）" % others) if others else ""))
-    if env.get("fontconfig") == "1" and env.get("freetype") == "1":
+    if not PRODUCTS[pkg.product]["needs_fonts"]:
+        pass
+    elif env.get("fontconfig") == "1" and env.get("freetype") == "1":
         ok("字体库    fontconfig / freetype 已安装")
     else:
         warn("字体库    缺少 fontconfig 或 freetype：服务能启动，但导出 PDF / 图片可能报错")
@@ -2402,12 +2669,17 @@ def do_upgrade(ctx, r, pkg, inst):
                           "先点「日志」确认服务正常后再升级")
     if inst.get("other_unit_dir"):
         warn("本机的 %s 系统服务指向另一个目录 %s；本次只操作 %s（后台进程方式）" % (
-            product, inst["other_unit_dir"], inst_dir))
+            P["service"], inst["other_unit_dir"], inst_dir))
     if inst.get("data_link"):
         warn("data/ 是指向 %s 的链接：升级备份只会记录这个链接，不包含其中的数据" % inst["data_link"])
         if not confirm("请确认 %s 已另行备份，继续？" % inst["data_link"], False):
             raise DeployError("已取消：data/ 的数据未备份")
     db = inst["db"]
+    # 数据库结构版本（Flyway）：记进备份元数据，回滚时核对。只对本机访问返回，经 SSH 隧道访问 127.0.0.1 正好算本机
+    schema_before = (h_before or {}).get("schemaVersion") if P["schema_versioned"] else None
+    if P["schema_versioned"] and not schema_before:
+        warn("读不到当前的数据库结构版本（服务%s）：回滚时将无法自动核对数据库结构" % (
+            "没在运行" if not h_before else "还没连上元数据库或还没走完安装向导"))
 
     # Java 版本是否满足新包
     need_java = max(MIN_JAVA, pkg.java_req)
@@ -2427,7 +2699,7 @@ def do_upgrade(ctx, r, pkg, inst):
     bdir = backup_dir_for(ctx, r, product, inst_dir)
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     while True:
-        est = estimate_backup(r, inst_dir, bdir)
+        est = estimate_backup(r, inst_dir, bdir, product)
         if est["free_kb"] >= (est["size_kb"] // 2 if use_tar else est["size_kb"]) + pkg.total_size() // 1024 + 200 * 1024:
             break
         fail("备份目录 %s 所在磁盘剩余 %s，不够存放备份（最多 %s）" % (
@@ -2439,20 +2711,27 @@ def do_upgrade(ctx, r, pkg, inst):
 
     plan = [("产品", pkg.name), ("版本", "%s → %s" % (inst["version"], pkg.version)),
             ("服务器", r.label()), ("安装目录", "%s（运行账号 %s）" % (inst_dir, inst["owner"])),
-            ("服务", "%s，端口 %d，%s" % ("systemd 服务 %s" % product if inst["unit"] else "后台进程",
+            ("服务", "%s，端口 %d，%s" % ("systemd 服务 %s" % P["service"] if inst["unit"] else "后台进程",
                                      port, "运行中" if was_running else "未运行")),
-            ("数据库", db["desc"]),
-            ("升级前备份", "%s（不超过 %s，备份盘剩余 %s）" % (bfile, human_size(est["size_kb"] * 1024),
-                                                    human_size(est["free_kb"] * 1024)))]
+            ("数据库", db["desc"])]
+    if P["schema_versioned"]:
+        plan.append(("数据库结构版本", schema_before or "读不到"))
+    plan.append(("升级前备份", "%s（不超过 %s，备份盘剩余 %s）" % (bfile, human_size(est["size_kb"] * 1024),
+                                                          human_size(est["free_kb"] * 1024))))
     if not pkg.full:
         plan.append(("说明", "单独 jar 升级：只替换 %s，启停脚本保持不变" % P["jar"]))
     kv("升级计划", plan)
 
-    if db["kind"] == "external":
+    db_dump, pg_target = None, None
+    if db["kind"] == "external" and P["schema_versioned"]:
+        warn("使用的是外部数据库：本工具只备份程序和 data/ 目录，不备份数据库本身")
+        pg_target = confirm_external_db_backup(r, product, inst, bdir, stamp)
+        if pg_target is False:
+            return None
+    elif db["kind"] == "external":
         warn("使用的是外部数据库：本工具只备份程序和 data/ 目录，不备份数据库本身")
         if not confirm("已备份数据库，继续升级？", False, danger=True, detail=[
-                "新版本启动时可能会升级数据库结构，这一步不可逆。",
-                "升级前请先备份数据库，或在 SightReport / SightWall 管理台「系统管理 › 备份」创建一次完整备份。"]):
+                "新版本启动时可能会升级数据库结构，这一步不可逆。", P["db_backup_hint"]]):
             return None
     elif db["kind"] == "h2" and not db.get("inside"):
         warn(db["desc"])
@@ -2466,6 +2745,8 @@ def do_upgrade(ctx, r, pkg, inst):
     staging = staging_dir(r, product, inst_dir)
     if r.is_root:
         r.run("mkdir -p %s" % shlex.quote(staging), check=True)
+    if pg_target:
+        db_dump = run_pg_dump(r, pg_target, staging)  # 服务运行中做也是一致的（pg_dump 用快照）
     upload_package(r, pkg, staging)  # 服务仍在运行，缩短停机时间
 
     # ---------------- 后台执行：停 → 备份 → 替换 → 启
@@ -2487,9 +2768,12 @@ def do_upgrade(ctx, r, pkg, inst):
         dropin_env.setdefault("CHECK_PORT", str(port))
     marker = marker_json(product, pkg.version, port, profile, start_env,
                          new_java_home or inst["marker"].get("java_home"), inst["marker"])
-    meta = json.dumps({"product": product, "version": inst["version"], "upgraded_to": pkg.version,
-                       "install_dir": inst_dir, "created": stamp, "db": db["kind"],
-                       "tool": "sight-deploy " + TOOL_VERSION}, ensure_ascii=False)
+    meta = {"product": product, "version": inst["version"], "upgraded_to": pkg.version,
+            "install_dir": inst_dir, "created": stamp, "db": db["kind"],
+            "tool": "sight-deploy " + TOOL_VERSION}
+    if P["schema_versioned"]:
+        meta.update({"schema_version": schema_before, "db_dump": db_dump or None})
+    meta = json.dumps(meta, ensure_ascii=False)
     s = svc_functions(product, inst_dir, inst["owner"], inst["unit"], profile, start_env)
     s += r'''
 B=%(b)s; BD=%(bd)s
@@ -2522,14 +2806,14 @@ finish OK
 ''' % {"b": shlex.quote(bfile), "bd": shlex.quote(bdir),
        "restore": ('restore_old(){ tar $TAROPT -xzf "$B" -C "$D" --exclude=./data; start_svc; }' if use_tar
                    else 'restore_old(){ cp_copy "$B" "$D" 0; start_svc; }'),
-       "backup": ('( umask 077; exec tar -czf "$B.tmp" -C "$D" %s . ); rc=$?' % tar_excludes() if use_tar
+       "backup": ('( umask 077; exec tar -czf "$B.tmp" -C "$D" %s . ); rc=$?' % tar_excludes(product) if use_tar
                   else 'rm -rf "$B.tmp"; ( umask 077; cp_copy "$D" "$B.tmp" 1 ); rc=$?'),
        "bad": ('[ $rc -gt 1 ] || [ ! -s "$B.tmp" ]' if use_tar else '[ $rc -ne 0 ] || [ ! -d "$B.tmp" ]'),
        "meta": heredoc(bfile + ".json", meta),
        "copy": copy_files_script(pkg, staging, inst_dir, inst["owner"]),
        "marker": heredoc(posix_join(inst_dir, MARKER), marker), "markername": MARKER,
-       "dropin": ("mkdir -p /etc/systemd/system/%s.service.d\n" % product +
-                  heredoc("/etc/systemd/system/%s.service.d/%s" % (product, DROPIN_NAME), dropin_content(dropin_env)))
+       "dropin": ("mkdir -p /etc/systemd/system/%s.service.d\n" % P["service"] +
+                  heredoc("/etc/systemd/system/%s.service.d/%s" % (P["service"], DROPIN_NAME), dropin_content(dropin_env)))
        if dropin_env else ""}
     step("执行升级（在服务器后台运行，网络中断也会继续）")
     status = run_detached(r, staging, "upgrade", s)
@@ -2542,7 +2826,7 @@ finish OK
             code, o, _ = r.run("[ -s %s ] && echo yes" % shlex.quote(bfile), sudo=True)
             if "yes" in o:
                 warn("后台任务意外中止，正在用刚做的备份恢复旧版本程序 …")
-                do_rollback_file(ctx, r, product, inst, bfile, full=False, snapshot=False)
+                do_rollback_file(ctx, r, product, inst, bfile, full=False, snapshot=False, schema_check=False)
             else:
                 warn("后台任务在备份阶段中止，程序文件未改动，正在重新启动服务 …")
                 r.run(svc_functions(product, inst_dir, inst["owner"], inst["unit"], profile, start_env) +
@@ -2559,7 +2843,7 @@ finish OK
                           "稍后点「刷新」确认状态；如有问题用「回滚」。升级前备份：%s" % bfile)
     ver_ok = True
     if good:
-        v = r.app_version(port)
+        v = r.app_version(port, P["version_api"]) if P["version_api"] else (h or {}).get("version")
         if v and parse_version(pkg.version) and parse_version(v) != parse_version(pkg.version):
             warn("服务报告的版本是 %s，预期 %s" % (v, pkg.version))
             ver_ok = False
@@ -2587,24 +2871,184 @@ finish OK
     ok("%s %s → %s" % (pkg.name, inst["version"], pkg.version))
     info("访问地址：%s" % url)
     info("升级前备份：%s" % bfile)
+    if P["schema_versioned"]:
+        schema_after = (h or {}).get("schemaVersion")
+        if schema_after and schema_before and schema_after != schema_before:
+            info("数据库结构版本：%s → %s%s" % (schema_before, schema_after, "（外部库的结构升级不可逆，回滚前请先用数据库备份恢复）"
+                                            if db["kind"] == "external" else ""))
+        if db_dump:
+            info("元数据库备份（pg_dump）：%s" % db_dump)
     return {"url": url}
 
 
 def read_dropin(r, product):
-    t = r.read_file("/etc/systemd/system/%s.service.d/%s" % (product, DROPIN_NAME), sudo=True) or ""
+    t = r.read_file("/etc/systemd/system/%s.service.d/%s" % (svc_of(product), DROPIN_NAME), sudo=True) or ""
     return dict(re.findall(r"^Environment=([A-Z_]+)=(.*)$", t, re.M))
 
 
-def estimate_backup(r, inst_dir, bdir):
-    ex = " ".join(shlex.quote(posix_join(inst_dir, x[2:])) for x in BACKUP_EXCLUDES if "*" not in x)
+# ---------------------------------------------------------------- 外部元数据库（DFDataLink）
+
+def _checked(v):
+    """表单里复选框的值（网页传 true/false，ask_form 转成了字符串）。"""
+    return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def parse_pg_jdbc(url):
+    """jdbc:postgresql://host[:port]/db[?k=v&…] → {host, port, db, params}；多主机 / 其他写法返回 None（不提供一键备份）。"""
+    m = re.match(r"^jdbc:postgresql://([^/:,?\[\]]+)(?::(\d+))?/([^?;/]+)(?:\?(.*))?$", url or "", re.I)
+    if not m:
+        return None
+    params = dict(x.split("=", 1) for x in (m.group(4) or "").split("&") if "=" in x)
+    return {"host": m.group(1), "port": int(m.group(2) or 5432), "db": m.group(3), "params": params}
+
+
+def pg_dump_target(r, inst, bdir, stamp):
+    """能否在服务器上用 pg_dump 备份 DFDataLink 的元数据库：PostgreSQL、连接信息来自向导写的 data/datalink.properties、
+    服务器上有 pg_dump。凭据只留在内存里，执行时经 0600 临时文件传给 PGPASSWORD（不出现在命令行和日志里）。"""
+    pg = parse_pg_jdbc(inst["db"].get("url"))
+    if not pg:
+        return None
+    code, o, _ = r.run("command -v pg_dump", sudo=True)
+    if code != 0 or not o.strip():
+        return None
+    path = posix_join(inst["dir"], "data/datalink.properties")
+    text = None
+    try:
+        text = r.read_file(path)
+    except Exception:
+        text = None
+    if text is None:
+        text = r.read_file(path, sudo=True)
+    props = parse_java_properties(text or "")
+    if props.get("DB_URL") != inst["db"].get("url") or not props.get("DB_USERNAME"):
+        return None  # 连接信息是部署方用环境变量给的：凭据不在这里，不做一键备份
+    pg.update(user=props["DB_USERNAME"], password=props.get("DB_PASSWORD") or "",
+              out=posix_join(bdir, "dfdatalink-db-%s-%s.dump" % (re.sub(r"[^\w.]", "_", inst["version"]), stamp)))
+    return pg
+
+
+def confirm_external_db_backup(r, product, inst, bdir, stamp):
+    """外部元数据库升级前必须勾选「已备份」；PostgreSQL 且服务器上有 pg_dump 时可以勾选让本工具先备份一份。
+    返回 False = 取消升级，None = 用户已自行备份，dict = 要执行 pg_dump 的目标。"""
+    db = inst["db"]
+    pg = pg_dump_target(r, inst, bdir, stamp)
+    fields = []
+    if pg:
+        fields.append({"key": "pg_dump", "type": "checkbox", "default": "1",
+                       "label": "升级前先用服务器上的 pg_dump 备份元数据库（推荐）",
+                       "help": "备份到 %s（pg_dump 自定义格式，可用 pg_restore 恢复）" % pg["out"]})
+    fields.append({"key": "backed_up", "type": "checkbox", "default": "",
+                   "label": "我已自行备份元数据库，需要时能从备份恢复" if pg else "我已备份元数据库，需要时能从备份恢复"})
+
+    def validate(v):
+        if _checked(v.get("backed_up")) or _checked(v.get("pg_dump")):
+            return None
+        return "请先备份元数据库，并勾选确认" + ("（或勾选用 pg_dump 备份）" if pg else "")
+    try:
+        vals = ask_form("升级前确认：元数据库已备份", fields, validate, detail=[
+            "这台 %s 使用外部元数据库：%s。" % (PRODUCTS[product]["name"], db["desc"]),
+            "新版本启动时会用 Flyway 升级数据库结构，这一步不可逆；本工具只备份程序和 data/ 目录，不备份数据库本身。",
+            "升级失败时，必须先用数据库备份恢复元数据库，才能回滚到旧版本。"])
+    except UserAbort:
+        return False
+    return pg if pg and _checked(vals.get("pg_dump")) else None
+
+
+def run_pg_dump(r, pg, staging):
+    step("备份元数据库（pg_dump %s@%s:%d/%s）" % (pg["user"], pg["host"], pg["port"], pg["db"]))
+    if r.is_root:
+        r.run("mkdir -p %s" % shlex.quote(staging), check=True)
+    else:
+        r.mkdirs(staging)
+    ef = posix_join(staging, ".pgenv-%s" % uuid.uuid4().hex[:8])
+    env_lines = ["PGPASSWORD=%s" % shlex.quote(pg["password"]), "PGCONNECT_TIMEOUT=15"]
+    if pg["params"].get("sslmode"):
+        env_lines.append("PGSSLMODE=%s" % shlex.quote(pg["params"]["sslmode"]))
+    try:
+        with r.sftp.open(ef, "w") as f:  # 先建文件再写内容：建出来就是 0600
+            r.sftp.chmod(ef, 0o600)
+            f.write(("\n".join(env_lines) + "\n").encode("utf-8"))
+    except IOError as e:
+        raise DeployError("无法写入临时文件 %s：%s" % (ef, e))
+    out_ = pg["out"]
+    s = r'''
+EF=%(ef)s; OUT=%(out)s
+trap 'rm -f "$EF"' EXIT
+set -a; . "$EF"; set +a; rm -f "$EF"
+mkdir -p "$(dirname "$OUT")" || exit 1
+umask 077
+pg_dump -h %(host)s -p %(port)d -U %(user)s -d %(db)s -Fc -f "$OUT.tmp" || { rm -f "$OUT.tmp"; exit 1; }
+mv -f "$OUT.tmp" "$OUT" && echo "size=$(du -sh "$OUT" | cut -f1)"
+''' % {"ef": shlex.quote(ef), "out": shlex.quote(out_), "host": shlex.quote(pg["host"]), "port": pg["port"],
+       "user": shlex.quote(pg["user"]), "db": shlex.quote(pg["db"])}
+    code, o, e = r.run(s, sudo=True, timeout=3600, on_line=logline)
+    r.run("rm -f %s" % shlex.quote(ef), sudo=True)
+    if code != 0:
+        raise DeployError("升级前备份元数据库失败（没有对服务器做任何改动）：%s" % ((e or o).strip().splitlines() or ["pg_dump 退出码 %s" % code])[-1],
+                          "常见原因：服务器上的 pg_dump 版本比数据库低、账号没有备份权限。请手动备份数据库后重新升级，勾选「我已自行备份」")
+    m = re.search(r"size=(\S+)", o)
+    ok("元数据库已备份：%s%s" % (out_, "（%s）" % m.group(1) if m else ""))
+    return out_
+
+
+def read_backup_meta(r, bfile):
+    t = r.read_file(bfile + ".json", sudo=True)
+    try:
+        return json.loads(t) if t else {}
+    except Exception:
+        return {}
+
+
+def schema_rollback_decision(db_kind, recorded, current, full):
+    """回滚前核对数据库结构版本（Flyway）。返回 (结论, 说明)：ok / warn / unknown（要用户确认）/ refuse。
+    外部库不在备份里：结构版本变了就不能只回滚程序（旧程序用不了新结构）；H2 在 data/ 里，随「程序 + 数据」一起恢复。"""
+    if db_kind == "external":
+        if recorded and current:
+            if recorded == current:
+                return "ok", "数据库结构版本一致（%s）" % current
+            return "refuse", ("外部元数据库的结构已从 %s 升级到 %s，不能只回滚程序：旧版本程序用不了新结构的数据库" % (recorded, current))
+        return "unknown", ("无法核对数据库结构版本（备份时记录：%s，当前：%s）" % (recorded or "没有记录", current or "读不到，服务没有正常运行"))
+    if db_kind == "h2" and not full and recorded and current and recorded != current:
+        return "warn", ("内置 H2 的结构已从 %s 升级到 %s；「仅程序」回滚后旧版本可能用不了现在的数据，建议选「程序 + 数据」" % (recorded, current))
+    return "ok", None
+
+
+def guard_schema_rollback(r, product, inst, bfile, full):
+    if not PRODUCTS[product]["schema_versioned"]:
+        return
+    recorded = read_backup_meta(r, bfile).get("schema_version")
+    h = r.health(inst["port"])
+    current = (h or {}).get("schemaVersion")
+    verdict, msg = schema_rollback_decision(inst["db"]["kind"], recorded, current, full)
+    if verdict == "refuse":
+        raise DeployError(msg + "（没有对服务器做任何改动）",
+                          "请先用升级前的数据库备份恢复元数据库（恢复后结构版本会回到 %s），再回滚；"
+                          "或者继续使用新版本，排除问题后重新升级" % recorded)
+    if verdict == "unknown":
+        warn(msg)
+        if not confirm("无法确认数据库结构没有变化，仍要回滚？", False, danger=True, detail=[
+                msg + "。", "外部元数据库不在备份里。如果新版本已经升级过数据库结构，旧版本程序将无法正常工作。",
+                "请确认数据库结构没有被新版本改动，或已经用升级前的数据库备份恢复了数据库，再继续。"]):
+            raise UserAbort()
+    elif verdict == "warn":
+        warn(msg)
+    elif msg:
+        ok(msg)
+
+
+def estimate_backup(r, inst_dir, bdir, product="sight-report"):
+    exs = PRODUCTS[product]["backup_excludes"]
+    ex = " ".join(shlex.quote(posix_join(inst_dir, x[2:])) for x in exs if "*" not in x)
+    # 带通配符的排除项里只有 data/ 下的（如 data/cache*）占空间；顶层的 *.pid 之类可以忽略
+    globs = "".join(' "$D"/%s' % x[2:] for x in exs if "*" in x and x.startswith("./data/"))
     s = r'''
 D=%s; BD=%s
 t=$(du -sk "$D" 2>/dev/null | awk '{print $1}'); x=0
-for p in %s "$D"/data/cache*; do [ -e "$p" ] && x=$((x + $(du -sk "$p" 2>/dev/null | awk '{print $1}'))); done
+for p in %s%s; do [ -e "$p" ] && x=$((x + $(du -sk "$p" 2>/dev/null | awk '{print $1}'))); done
 echo "size_kb=$((t - x))"
 d="$BD"; while [ ! -d "$d" ]; do d=$(dirname "$d"); done
 df -Pk "$d" | awk 'NR==2{print "free_kb=" $4}'
-''' % (shlex.quote(inst_dir), shlex.quote(bdir), ex)
+''' % (shlex.quote(inst_dir), shlex.quote(bdir), ex, globs)
     code, o, _ = r.run(s, sudo=True, timeout=300)
     kv = parse_kv(o)
     return {"size_kb": max(_int(kv.get("size_kb")), 0), "free_kb": _int(kv.get("free_kb"))}
@@ -2635,9 +3079,12 @@ def prune_backups(r, bdir, product, keep_n, keep):
 # 回滚
 # =============================================================================
 
-def do_rollback_file(ctx, r, product, inst, bfile, full, snapshot=True):
-    """用备份恢复。full=True 连同 data/ 一起恢复；snapshot=True 时先把当前状态另存一份（回滚也能撤销）。"""
+def do_rollback_file(ctx, r, product, inst, bfile, full, snapshot=True, schema_check=True):
+    """用备份恢复。full=True 连同 data/ 一起恢复；snapshot=True 时先把当前状态另存一份（回滚也能撤销）。
+    schema_check：核对数据库结构版本（只对 schema_versioned 的产品；新版本还没启动过时不用核对）。"""
     step("回滚：%s（%s）" % (bfile.rsplit("/", 1)[-1], "程序 + 数据" if full else "仅程序"))
+    if schema_check:
+        guard_schema_rollback(r, product, inst, bfile, full)
     staging = staging_dir(r, product, inst["dir"])
     if r.is_root:
         r.run("mkdir -p %s" % shlex.quote(staging), check=True)
@@ -2673,7 +3120,7 @@ say "启动服务 …"
 start_svc || { finish FAIL:start; exit 1; }
 finish OK
 ''' % {"b": shlex.quote(bfile), "snap": shlex.quote(snap),
-       "snap_cmd": ('( umask 077; exec tar -czf "$SNAP.tmp" -C "$D" %s . ); rc=$?' % tar_excludes() if use_tar
+       "snap_cmd": ('( umask 077; exec tar -czf "$SNAP.tmp" -C "$D" %s . ); rc=$?' % tar_excludes(product) if use_tar
                     else 'rm -rf "$SNAP.tmp"; ( umask 077; cp_copy "$D" "$SNAP.tmp" 1 ); rc=$?'),
        "snap_bad": ('[ $rc -gt 1 ] || [ ! -s "$SNAP.tmp" ]' if use_tar else '[ $rc -ne 0 ] || [ ! -d "$SNAP.tmp" ]'),
        "extract": ('cp_copy "$B" "$D" %d' % (1 if full else 0)) if bfile.endswith(".dir") else
@@ -2757,7 +3204,7 @@ class Ctx:
 SITE_BASE = (os.environ.get("SIGHT_DEPLOY_SITE") or "https://www.sightdata.top").rstrip("/")
 GH_REPO = "Sight-Data/sight_deploy"
 GH_DL_PREFIX = os.environ.get("GH_DL_PREFIX", "")  # 国内访问 GitHub 慢时的下载加速前缀
-SITE_PRODUCT_IDS = {"sight-report": "dl-report", "sight-wall": "dl-wall"}
+SITE_PRODUCT_IDS = {k: v["site_id"] for k, v in PRODUCTS.items()}  # 官网上线前查不到的条目当作「没有可下载的包」
 SITE_TOOL_IDS = {"windows-x64": "dl-deploy-win", "windows7-x64": "dl-deploy-win7",
                  "mac-arm64": "dl-deploy-mac", "mac-x86_64": "dl-deploy-mac"}
 ONLINE_TTL = 600  # 秒：同一次运行里，重复检查直接用缓存
@@ -2995,7 +3442,7 @@ def _local_same_file(name, size):
 
 
 def _check_zip_product(path, product):
-    """zip 里必须有该产品的 jar（sight-wall.jar / sight-report.jar），防止官网条目或本机同名文件拿错包。"""
+    """zip 里必须有该产品的 jar（sight-wall.jar / sight-report.jar / dfdatalink.jar），防止官网条目或本机同名文件拿错包。"""
     jar = PRODUCTS[product]["jar"]
     try:
         with zipfile.ZipFile(path) as zf:
@@ -3140,6 +3587,12 @@ def job_status(ctx, p):
                     "last_backup": "%s（%s）" % (bs[0]["time"], bs[0]["version"]) if bs else ""}
             if h and h.get("mode") == "CLUSTER":
                 item["cluster_nodes"] = h.get("activeNodes")
+            if h and h.get("mode") in ("setup", "waiting", "normal"):
+                item["mode"] = h["mode"]  # DFDataLink：setup = 安装向导，waiting = 等元数据库
+            if h and "adminInitialized" in h:
+                item["admin_initialized"] = bool(h["adminInitialized"])
+            if P["setup_path"] != "/setup":
+                item["setup_url"] = "http://%s:%d%s" % (r.host, inst["port"], P["setup_path"])
             res["products"].append(item)
             ctx.store.set_product(r.alias, prod, {"install_dir": inst["dir"], "port": inst["port"],
                                                   "version": inst["version"]})
@@ -3163,6 +3616,17 @@ def job_deploy(ctx, p):
         if want in PRODUCTS and pkg.product != want:
             raise DeployError("选错了安装包：这是 %s 的包，但你要升级的是 %s（没有对服务器做任何改动）" % (
                 pkg.name, PRODUCTS[want]["name"]), "请重新选择 %s 的安装包" % PRODUCTS[want]["name"])
+        if len(hosts) > 1 and not PRODUCTS[pkg.product]["rolling_upgrade"]:
+            step("多台服务器：%s 不做自动滚动升级" % pkg.name)
+            warn("如果这几台是 %s 集群（共用一个外部元数据库），不能边运行边逐台升级" % pkg.name)
+            if not confirm("已按集群升级的顺序准备好，继续依次处理 %d 台？" % len(hosts), False, danger=True, detail=[
+                    "集群（多台共用一个外部元数据库）请这样升级：",
+                    "1. 先把所有服务器上的 %s 全部停止；" % pkg.name,
+                    "2. 先只升级第一台，等它启动完成（数据库结构迁移完成）；",
+                    "3. 再升级其余服务器。",
+                    "本工具这一期不做自动集群编排：选「确定」会按列表顺序依次处理，每台都会单独确认。",
+                    "互相独立的几台（各用各的数据库）可以直接继续。"]):
+                raise UserAbort()
         for i, name in enumerate(hosts, 1):
             if len(hosts) > 1:
                 step("第 %d/%d 台：%s" % (i, len(hosts), name))
@@ -3174,7 +3638,11 @@ def job_deploy(ctx, p):
                 res = do_upgrade(ctx, r, pkg, inst) if inst else do_install(ctx, r, pkg)
                 if not res and len(hosts) == 1:
                     raise UserAbort()  # 用户在确认框里选了「取消」：整个任务算取消，而不是「完成」
-                results.append({"host": name, "status": "完成" if res else "跳过", "url": (res or {}).get("url")})
+                item = {"host": name, "status": "完成" if res else "跳过", "url": (res or {}).get("url")}
+                for k in ("mode", "setup_token", "token_hint"):  # DFDataLink 安装向导：模式与初始化令牌
+                    if (res or {}).get(k):
+                        item[k] = res[k]
+                results.append(item)
             except (DeployError, UserAbort) as e:
                 results.append({"host": name, "status": "失败" if isinstance(e, DeployError) else "取消"})
                 if len(hosts) == 1:
@@ -3245,15 +3713,37 @@ def job_follow_logs(ctx, p):
     r = open_host(ctx.store, p.get("host"))
     try:
         inst = _get_install(ctx, r, product)
-        f = posix_join(inst["dir"], "logs/sight-data-info.log")
+        P = PRODUCTS[product]
+        if P["follow_journal"] and inst["unit"]:
+            f = "journalctl -u %s" % P["service"]
+            cmd = "journalctl -u %s -n 30 -f --no-pager" % shlex.quote(P["service"])
+        else:
+            f = posix_join(inst["dir"], P["follow_log"])
+            cmd = "tail -n 30 -F %s" % shlex.quote(f)
         step("实时日志 %s" % f)
         try:
-            r.run("tail -n 30 -F %s" % shlex.quote(f), sudo=True, timeout=0, on_line=logline, cancellable=True)
+            r.run(cmd, sudo=True, timeout=0, on_line=logline, cancellable=True)
         except JobCancelled:
             return {}
         return {}
     finally:
         r.close()
+
+
+def backup_metas(r, files):
+    """一次读出多份备份的元数据（<备份>.json）。"""
+    if not files:
+        return {}
+    code, o, _ = r.run("for f in %s; do [ -f \"$f.json\" ] && printf 'meta=%%s\\t%%s\\n' \"$f\" \"$(tr -d '\\n' < \"$f.json\")\"; done; true"
+                       % " ".join(shlex.quote(f) for f in files), sudo=True)
+    res = {}
+    for item in as_list(parse_kv(o).get("meta")):
+        f, _, js = item.partition("\t")
+        try:
+            res[f] = json.loads(js)
+        except Exception:
+            pass
+    return res
 
 
 def job_list_backups(ctx, p):
@@ -3262,8 +3752,15 @@ def job_list_backups(ctx, p):
     try:
         inst = _get_install(ctx, r, product)
         bdir = backup_dir_for(ctx, r, product, inst["dir"])
-        return {"backup_dir": bdir, "current_version": inst["version"], "db_kind": inst["db"]["kind"],
-                "backups": list_backups(r, bdir, product)}
+        res = {"backup_dir": bdir, "current_version": inst["version"], "db_kind": inst["db"]["kind"],
+               "backups": list_backups(r, bdir, product)}
+        if PRODUCTS[product]["schema_versioned"]:
+            # 备份时记录的数据库结构版本，与当前的比较：界面据此提示外部库不能只回滚程序（后端回滚时还会再核对）
+            res["current_schema_version"] = (r.health(inst["port"]) or {}).get("schemaVersion")
+            metas = backup_metas(r, [b["file"] for b in res["backups"]])
+            for b in res["backups"]:
+                b["schema_version"] = metas.get(b["file"], {}).get("schema_version")
+        return res
     finally:
         r.close()
 
@@ -3454,7 +3951,8 @@ PREFERRED_PORT = 17880
 
 
 def _guess_pkg(name):
-    m = re.match(r"(sight-(?:report|wall))(?:-(\d[\w.]*?))?\.(?:zip|jar)$", name)
+    prefixes = "|".join(re.escape(v["zip_prefix"]) for v in PRODUCTS.values())
+    m = re.match(r"(%s)(?:-(\d[\w.]*?))?\.(?:zip|jar)$" % prefixes, name)
     return (m.group(1), m.group(2)) if m else (None, None)
 
 
@@ -3539,7 +4037,10 @@ def api_state():
                       "auth": c.get("auth", "password"), "last_used": c.get("last_used", ""),
                       "products": {k: v for k, v in (c.get("products") or {}).items() if k in PRODUCTS}})
     return {"version": TOOL_VERSION, "busy": APP.busy(), "settings": APP.ctx.settings, "hosts": hosts,
-            "products": {k: {"name": v["name"], "port": v["port"]} for k, v in PRODUCTS.items()},
+            "products": {k: {"name": v["name"], "port": v["port"], "dir": v["dir"], "zip_prefix": v["zip_prefix"],
+                             "setup_path": v["setup_path"], "setup_token": v["setup_token"],
+                             "rolling_upgrade": v["rolling_upgrade"], "schema_versioned": v["schema_versioned"]}
+                         for k, v in PRODUCTS.items()},
             "log_path": str(LOG.path or "")}
 
 

@@ -26,11 +26,21 @@
      "last_used": "2026-10-10 01:16",
      "products": {"sight-report": {"install_dir": "/opt/sight-report", "port": 9091, "version": "2.0.71"}}}
   ],
-  "products": {"sight-report": {"name": "SightReport", "port": 9091}, "sight-wall": {"name": "SightWall", "port": 9090}},
+  "products": {"sight-report": {"name": "SightReport", "port": 9091, "dir": "/opt/sight-report", "zip_prefix": "sight-report",
+                               "setup_path": "/setup", "setup_token": false, "rolling_upgrade": true, "schema_versioned": false},
+               "sight-wall": {...},
+               "dfdatalink": {"name": "DFDataLink", "port": 18680, "dir": "/opt/dfdatalink", "zip_prefix": "dfdatalink",
+                              "setup_path": "/", "setup_token": true, "rolling_upgrade": false, "schema_versioned": true}},
   "log_path": "/Users/x/.sight-deploy/logs/sight-deploy-20261010.log"
 }
 ```
 `hosts[].products` 是**上次查到的缓存**，可能过时；真实状态以 `status` 任务结果为准。
+
+`products` 是产品描述（后端 `PRODUCTS`），界面上的产品卡、默认端口、安装包文件名识别（`<zip_prefix>-<版本>.zip`）都按它来，不要在页面里写死产品：
+- `setup_path`：未初始化时让实施人员打开的地址（SightReport / SightWall 是 `/setup`，DFDataLink 的安装向导在根路径 `/`）。
+- `setup_token`：初始化要用服务日志里的一次性令牌（DFDataLink）。
+- `rolling_upgrade=false`：多选服务器时不做自动滚动升级（DFDataLink 集群共用外部库），要提示先全部停止、再逐台升级。
+- `schema_versioned=true`：健康检查报告数据库结构版本（Flyway `schemaVersion`），升级时记进备份元数据，回滚前核对。
 
 `POST /api/settings` `{"keep_backups": 3, "health_timeout": 300, "auto_check": true}` → `{"ok": true}`（`auto_check` 可省略：是否在启动时自动联网检查更新，默认开）
 
@@ -92,13 +102,13 @@
 | `edit_host` | `name, password` 或 `name, key_passphrase` | `{"name": ...}` |
 | `test_host` | `name` | `{"root": true}` |
 | `status` | `host` | 见下 |
-| `deploy` | `hosts: [名字...], package: 本机路径` | `{"results": [{"host": "生产-1", "status": "完成/跳过/失败/取消", "url": "http://..."}]}` |
+| `deploy` | `hosts: [名字...], package: 本机路径, product`（可选：从产品卡点的是哪个产品，包不对时直接失败） | `{"results": [{"host": "生产-1", "status": "完成/跳过/失败/取消", "url": "http://..."}]}`；DFDataLink 首次安装还可能有 `mode`（`setup` 安装向导 / `waiting` 等元数据库）、`setup_token`（从服务日志取到的初始化令牌）、`token_hint`（没取到令牌时的说明，如「令牌为部署时设置的 FDL_SETUP_TOKEN」） |
 | `service` | `host, product, action("start"/"stop"/"restart")` | `{}` |
 | `logs` | `host, product, lines(默认200)` | `{"text": "日志文本"}` |
 | `follow_logs` | `host, product` | 不会自己结束；通过 `log` 事件推送新行，用户点「停止」→ cancel |
-| `list_backups` | `host, product` | `{"backup_dir": "...", "current_version": "2.0.71", "db_kind": "h2/external/none", "backups": [{"file": "...", "version": "2.0.69", "time": "2026-10-10 01:16", "size": 30000000}]}` |
-| `rollback` | `host, product, file, full(bool)` | `{}` |
-| `download_package` | `product`（`sight-report` / `sight-wall`） | `{"path", "name", "size", "product", "version", "mtime", "dir", "reused"}`：从官网下载该产品最新版到 `~/.sight-deploy/uploads/`（断点续传、zip 完整性校验）；本机常用位置已有同名同大小的包就直接复用（`reused=true`）。拿到的 `path` 直接用于 `deploy` |
+| `list_backups` | `host, product` | `{"backup_dir": "...", "current_version": "2.0.71", "db_kind": "h2/external/none", "backups": [{"file": "...", "version": "2.0.69", "time": "2026-10-10 01:16", "size": 30000000}]}`；`schema_versioned` 的产品（DFDataLink）另有 `current_schema_version` 和每份备份的 `schema_version`（备份时记录的数据库结构版本，旧备份为 null） |
+| `rollback` | `host, product, file, full(bool)` | `{}`。DFDataLink：外部库且备份时记录的结构版本与当前不同 → 直接失败（不论 `full`），提示先用数据库备份恢复；读不到版本时会用 `confirm` 再问一次 |
+| `download_package` | `product`（`sight-report` / `sight-wall` / `dfdatalink`；官网条目 id 分别是 `dl-report` / `dl-wall` / `dl-datalink`） | `{"path", "name", "size", "product", "version", "mtime", "dir", "reused"}`：从官网下载该产品最新版到 `~/.sight-deploy/uploads/`（断点续传、zip 完整性校验）；本机常用位置已有同名同大小的包就直接复用（`reused=true`）。拿到的 `path` 直接用于 `deploy` |
 | `download_tool` | 无 | `{"path", "name", "dir", "version", "howto": [...]}`：下载新版部署助手到「下载」目录；已是最新时失败。不会自动替换正在运行的程序 |
 
 `status` 结果：
@@ -112,9 +122,16 @@
    "port": 9091, "url": "http://10.0.0.5:9091/", "reachable": true,
    "java": "21.0.4（/usr/lib/jvm/.../java）", "db": "内置 H2 数据库（…）", "db_kind": "h2",
    "disk_free": 31876000000, "backups": 2, "last_backup": "2026-10-10 01:16（2.0.69）"},
-  {"product": "sight-wall", "name": "SightWall", "installed": false}
+  {"product": "sight-wall", "name": "SightWall", "installed": false},
+  {"product": "dfdatalink", "name": "DFDataLink", "installed": true, "version": "0.2.0", "port": 18680,
+   "running": true, "healthy": true, "bootstrapped": false, "db_reachable": null,
+   "mode": "setup",                                    // 健康检查的 mode：setup（安装向导）/ waiting（等元数据库）/ normal
+   "admin_initialized": false,                         // 健康检查有 adminInitialized 时才有：false = 还没「初始化管理员」
+   "setup_url": "http://10.0.0.7:18680/",             // setup_path 不是 /setup 的产品才有
+   "db": "尚未配置（还没走安装向导）", "db_kind": "none", ...}
  ]}
 ```
+DFDataLink 的数据库描述来自 `data/datalink.properties` 的 `DB_URL`（Java properties 转义），部署方在 systemd 环境、进程环境或 `dfdatalink.env` 里给的 `DB_URL` 优先。
 
 ### 任务事件
 
@@ -152,7 +169,7 @@
 | `confirm` | `default`(bool), `danger`(bool) | `true` / `false`（按钮「确定」「取消」；default 那个按钮为主按钮；danger 时主按钮红色） |
 | `typed` | `word` | 用户输入的字符串（提示「请输入 <word> 确认」，输入一致才能点确定） |
 | `choose` | `options: [{"label": "...", "desc": "可选副标题"}], default`(0 起的下标) | 选中的下标（整数） |
-| `form` | `fields: [{"key","label","default","placeholder","help","type":"text/password/number"}]` | `{"key": "值", ...}` |
+| `form` | `fields: [{"key","label","default","placeholder","help","type":"text/password/number/checkbox"}]` | `{"key": "值", ...}`（`checkbox` 的值是 `true` / `false`，`default` 为 `"1"` 时默认勾选） |
 | `file` | `file_kind`("jdk"/"package"/"key"), `label` | 本机文件路径（复用安装包选择器：自动发现列表 + 浏览 + 拖入上传） |
 
 `POST /api/jobs/<id>/answer` `{"qid": "q7", "value": ...}`；用户点「取消 / 返回」时 `{"qid": "q7", "cancel": true}`（任务会中止）。
@@ -163,18 +180,18 @@
 ## 页面要做的事（产品需求）
 
 1. **服务器列表**（左栏）：名字、user@host、已知产品徽标；「+ 添加服务器」。选中一台就跑 `status` 任务，结果显示在右侧。
-2. **服务器详情**（右侧）：顶部名字/地址 +「刷新」「修改密码」「删除」；两张产品卡（SightReport、SightWall）：
+2. **服务器详情**（右侧）：顶部名字/地址 +「刷新」「修改密码」「删除」；每个产品一张卡（SightReport、SightWall、DFDataLink，按 `/api/state` 的 `products`）：
    - 未安装：灰卡 +「安装」按钮。
-   - 已安装：状态徽标（运行中 / 启动中或无响应 / 未运行）、版本、访问地址（可点击，新窗口打开）、目录、端口、服务方式、Java、数据库、健康（未初始化时提示去 /setup）、备份数、磁盘剩余。
+   - 已安装：状态徽标（运行中 / 启动中或无响应 / 未运行）、版本、访问地址（可点击，新窗口打开）、目录、端口、服务方式、Java、数据库、健康（未初始化时提示去 `setup_url` 或 `/setup`；`mode=setup` 徽标「安装向导」并提示需要初始化令牌；`mode=waiting` 徽标「等待数据库」并说明服务在自动重试；`admin_initialized=false` 提示去「初始化管理员」）、备份数、磁盘剩余。
      按钮：「升级」「重启」「停止 / 启动」「日志」「回滚」。
 3. **安装 / 升级**：打开「选择安装包」对话框（顶部是「官网最新版」条目——选中后点「下一步」才跑 `download_package`，下完再进第 2 步；本机已有同版本时不再显示官网条目；下面是自动发现列表，按时间倒序，显示产品+版本+大小+目录；「浏览…」文件浏览器；拖入区域，拖进来先上传再选中）；
-   然后「选择服务器」（默认当前服务器，可多选做滚动升级，说明“多台会依次处理，某台失败会询问是否继续”）→ 开始 `deploy` 任务。
+   然后「选择服务器」（默认当前服务器，可多选做滚动升级，说明“多台会依次处理，某台失败会询问是否继续”；`rolling_upgrade=false` 的产品多选时显示集群升级顺序的提醒）→ 开始 `deploy` 任务。
    从产品卡点「安装/升级」时，安装包列表优先显示该产品的包。
 4. **任务面板**：任务开始后弹出大面板（或右侧抽屉）展示时间线：step 为节点，其下 ok/warn/fail/info 行、进度条、live 行、可折叠的 log。
    顶部显示任务标题与耗时；运行中有「停止」按钮（cancel，需二次确认）。结束后显示成功/失败横幅（失败显示 error + hint）、「关闭」按钮；
-   deploy 成功且 result 里有 url 时显示「打开 SightReport」按钮。关闭后自动刷新当前服务器状态。
+   deploy 成功且 result 里有 url 时显示「打开 SightReport」按钮（`mode=setup` 时为「打开安装向导」）。results 里有 `setup_token` 时在结果横幅里醒目显示令牌 +「复制令牌」，并说明安装向导和之后的「初始化管理员」都要用同一个令牌；`mode=waiting` 时说明元数据库连不上、服务在自动重试。关闭后自动刷新当前服务器状态。
 5. **日志**：对话框，等宽字体显示 `logs` 结果，「刷新」「实时跟踪」开关（开=`follow_logs` 任务，把 log 事件追加到底部并自动滚动；关=cancel）。
-6. **回滚**：先跑 `list_backups`，列出备份（时间、版本、大小），选一份 + 选范围（程序+数据 / 仅程序，附说明；外部数据库时提示数据库不在备份里）→ 二次确认 → `rollback` 任务。
+6. **回滚**：先跑 `list_backups`，列出备份（时间、版本、大小；`schema_versioned` 的产品另显示结构版本），选一份 + 选范围（程序+数据 / 仅程序，附说明；外部数据库时提示数据库不在备份里；外部库结构版本不同时红色说明并禁用「回滚…」）→ 二次确认 → `rollback` 任务。
 7. **添加服务器**：表单（地址、SSH 端口 22、账号 root、登录方式 密码/密钥文件、密码 / 私钥路径（带「浏览…」）+ 私钥密码、名称（默认=地址））→ `add_host` 任务（会做连接测试；任务里可能还会问 sudo 密码）。成功后列表刷新并选中它。
 8. **设置**：升级备份保留份数、等待服务就绪秒数。页脚显示本地日志路径（可复制）与「退出程序」。
 9. 首次打开且没有服务器时，右侧显示引导：三步说明（添加服务器 → 选择安装包 → 一键安装/升级）+ 大号「添加服务器」按钮。
