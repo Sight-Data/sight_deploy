@@ -64,6 +64,8 @@ RES_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 MIN_JAVA = 21
 DROPIN_NAME = "10-sight-deploy.conf"
 MARKER = ".sight-deploy.json"
+# 升级后新版本持续处于等待模式（mode=waiting，连不上元数据库）这么多秒，就不再等满 health_timeout，按升级失败处理
+WAITING_FAIL_SECS = 60
 # 备份时排除的内容（相对安装目录，tar 成员名形如 ./logs）。SightReport / SightWall 用这一份；
 # 各产品可在描述里用 backup_excludes 换成自己的（见 PRODUCTS）
 BACKUP_EXCLUDES = ["./logs", "./data/backups", "./data/cache*", "./data/temp", "./.sight-staging",
@@ -100,6 +102,7 @@ def _sight_product(key, name, port, start_class, site_id):
         "site_id": site_id,                 # 官网下载中心条目 id
         "rolling_upgrade": True,            # 多台服务器可以依次滚动升级
         "schema_versioned": False,          # 健康检查报告 schemaVersion，升级 / 回滚时核对
+        "waiting_mode": False,              # 健康检查有 mode=waiting（服务已启动但连不上元数据库，自动重试）
         "db_backup_hint": "升级前请先备份数据库，或在 SightReport / SightWall 管理台「系统管理 › 备份」创建一次完整备份。",
     }
 
@@ -133,6 +136,7 @@ PRODUCTS = {
         "site_id": "dl-datalink",
         "rolling_upgrade": False,           # 多台共用一个外部库（集群）时不能自动滚动升级
         "schema_versioned": True,           # Flyway：外部库的表结构升级不可逆
+        "waiting_mode": True,               # 连不上元数据库时 mode=waiting：安装时照常提示，升级时持续一段时间算失败
         "db_backup_hint": "DFDataLink 用 Flyway 升级元数据库结构，外部库升级后不能只靠回滚程序恢复。",
         "license": "DFDataLink 按其自带的 Sustainable Use License 分发（见安装包里的 LICENSING.md）",
     },
@@ -1836,12 +1840,49 @@ def _n_restarts(r, product):
     return int(m.group(1)) if m else None
 
 
-def wait_healthy(r, product, inst_dir, port, need_bootstrapped, timeout, use_unit):
+def waiting_mode_check(h, since, now, limit):
+    """升级后的等待模式判定（纯函数，便于测试）。h = 本次健康检查结果；since = 从何时起一直处于等待模式（None = 之前不是）。
+    返回 (新的 since, 是否已持续满 limit 秒)。limit 为空 = 不把等待模式当失败（安装、启停、回滚，以及没有等待模式的产品）。
+    只有服务已响应（status=UP）且 mode=waiting 才算；没响应、mode 变了都重新计时。"""
+    if not limit or not h or h.get("status") != "UP" or h.get("mode") != "waiting":
+        return None, False
+    since = now if since is None else since
+    return since, now - since >= limit
+
+
+_DB_SECRET_RES = (
+    (re.compile(r"(//[^/\s:@]+:)[^@\s/]+(@)"), r"\1***\2"),  # jdbc:…//user:pass@host
+    (re.compile(r"((?:password|passwd|pwd|secret)\s*[=:]\s*)(?!\s*(?:YES|NO)\))[^\s&;,)'\"]+", re.I), r"\1***"),
+)
+
+
+def sanitize_db_error(text, limit=300):
+    """健康检查 lastError 显示前脱敏：连接串里的口令、password=… 之类一律打码，只留一行、限长。"""
+    t = strip_ansi(str(text or "")).replace("\r", " ").replace("\n", " ").strip()
+    for rx, sub in _DB_SECRET_RES:
+        t = rx.sub(sub, t)
+    t = _mask(t)
+    return t if len(t) <= limit else t[:limit] + " …"
+
+
+def waiting_failure_lines(h, secs):
+    """升级后持续等待模式时的说明：[失败标题, 最近一次错误（若有）]。"""
+    lines = ["服务已启动但连不上元数据库（等待模式，已持续 %s）" % fmt_secs(secs)]
+    err = sanitize_db_error((h or {}).get("lastError"))
+    if err:
+        lines.append("最近一次连接错误：%s" % err)
+    return lines
+
+
+def wait_healthy(r, product, inst_dir, port, need_bootstrapped, timeout, use_unit, waiting_limit=None):
+    """等服务就绪。waiting_limit（秒）：升级时用，服务持续处于等待模式（mode=waiting，连不上元数据库）这么久就判失败，
+    不再等满 timeout；不传时等待模式照旧算已响应（安装时给出提示）。"""
     t0 = time.time()
     last_check = 0
     restarts0 = _n_restarts(r, product) if use_unit else None
     lid = "wait%d" % int(t0 * 1000)
     msg = ""
+    waiting_since = None
 
     def done(res, h, text=None, good=True):
         live(lid, "")
@@ -1856,8 +1897,15 @@ def wait_healthy(r, product, inst_dir, port, need_bootstrapped, timeout, use_uni
             h = r.health(port)
         except DeployError:
             h = None
+        waiting_since, waited_out = waiting_mode_check(h, waiting_since, el, waiting_limit)
+        if waited_out:
+            lines = waiting_failure_lines(h, el - waiting_since)
+            res_ = done(False, h, lines[0], False)
+            for x in lines[1:]:
+                info(x)
+            return res_
         if h and h.get("status") == "UP":
-            if not need_bootstrapped or h.get("bootstrapped"):
+            if waiting_since is None and (not need_bootstrapped or h.get("bootstrapped")):
                 res_ = done(True, h, "服务已就绪（用时 %s）" % fmt_secs(el))
                 if h.get("mode") == "waiting":
                     warn("服务已响应，但元数据库连不上，正在等待并自动重试（数据库恢复后自动启动，无需重启）")
@@ -1867,6 +1915,9 @@ def wait_healthy(r, product, inst_dir, port, need_bootstrapped, timeout, use_uni
                 msg = "已响应，但连不上数据库 …"
             if h.get("mode") == "waiting":
                 msg = "已响应，但元数据库连不上，服务在等待并自动重试 …"
+                if waiting_since is not None:
+                    msg = "已响应，但元数据库连不上（等待模式 %s，持续 %s 仍连不上按升级失败处理）…" % (
+                        fmt_secs(el - waiting_since), fmt_secs(waiting_limit))
         else:
             msg = "等待服务启动 …"
         if el - last_check > 10:
@@ -2837,7 +2888,8 @@ finish OK
     step("等待新版本就绪（会自动升级数据库结构，可能需要几分钟）")
     need_boot = bool(h_before and h_before.get("bootstrapped"))
     try:
-        good, h = wait_healthy(r, product, inst_dir, port, need_boot, ctx.settings["health_timeout"], inst["unit"])
+        good, h = wait_healthy(r, product, inst_dir, port, need_boot, ctx.settings["health_timeout"], inst["unit"],
+                               waiting_limit=WAITING_FAIL_SECS if P["waiting_mode"] else None)
     except KeyboardInterrupt:
         raise DeployError("已停止等待：新版本 %s 已替换完毕，服务正在启动" % pkg.version,
                           "稍后点「刷新」确认状态；如有问题用「回滚」。升级前备份：%s" % bfile)
@@ -2851,6 +2903,9 @@ finish OK
             ok("版本确认：%s" % v)
     if not good or not ver_ok:
         show_logs(r, product, inst_dir, inst["unit"])
+        if not good and P["waiting_mode"] and (h or {}).get("mode") == "waiting":
+            info("请检查元数据库是否在运行、网络 / 防火墙是否放行、连接配置（data/datalink.properties 或 DB_URL）是否正确；"
+                 "数据库恢复后服务会自动继续启动，也可以回滚到升级前")
         info("升级前备份：%s" % bfile)
         if confirm("新版本没有正常运行，回滚到升级前？", True, detail=[
                 "将用升级前的备份恢复程序和数据（data/），服务恢复到 %s。" % inst["version"],
@@ -2861,6 +2916,8 @@ finish OK
         raise DeployError("升级后服务未就绪", "稍后点「刷新」「日志」查看；需要时用「回滚」")
 
     prune_backups(r, bdir, product, ctx.settings["keep_backups"], keep=bfile)
+    if P["schema_versioned"]:
+        prune_db_dumps(r, bdir, product, ctx.settings["keep_backups"], keep=db_dump)
     r.run("rm -rf %s" % shlex.quote(posix_join(staging, "pkg")), sudo=True)
     if r.alias:
         ctx.store.set_product(r.alias, product, {"install_dir": inst_dir, "port": port, "version": pkg.version,
@@ -2902,7 +2959,7 @@ def parse_pg_jdbc(url):
     return {"host": m.group(1), "port": int(m.group(2) or 5432), "db": m.group(3), "params": params}
 
 
-def pg_dump_target(r, inst, bdir, stamp):
+def pg_dump_target(r, product, inst, bdir, stamp):
     """能否在服务器上用 pg_dump 备份 DFDataLink 的元数据库：PostgreSQL、连接信息来自向导写的 data/datalink.properties、
     服务器上有 pg_dump。凭据只留在内存里，执行时经 0600 临时文件传给 PGPASSWORD（不出现在命令行和日志里）。"""
     pg = parse_pg_jdbc(inst["db"].get("url"))
@@ -2923,7 +2980,7 @@ def pg_dump_target(r, inst, bdir, stamp):
     if props.get("DB_URL") != inst["db"].get("url") or not props.get("DB_USERNAME"):
         return None  # 连接信息是部署方用环境变量给的：凭据不在这里，不做一键备份
     pg.update(user=props["DB_USERNAME"], password=props.get("DB_PASSWORD") or "",
-              out=posix_join(bdir, "dfdatalink-db-%s-%s.dump" % (re.sub(r"[^\w.]", "_", inst["version"]), stamp)))
+              out=posix_join(bdir, db_dump_name(product, inst["version"], stamp)))
     return pg
 
 
@@ -2931,7 +2988,7 @@ def confirm_external_db_backup(r, product, inst, bdir, stamp):
     """外部元数据库升级前必须勾选「已备份」；PostgreSQL 且服务器上有 pg_dump 时可以勾选让本工具先备份一份。
     返回 False = 取消升级，None = 用户已自行备份，dict = 要执行 pg_dump 的目标。"""
     db = inst["db"]
-    pg = pg_dump_target(r, inst, bdir, stamp)
+    pg = pg_dump_target(r, product, inst, bdir, stamp)
     fields = []
     if pg:
         fields.append({"key": "pg_dump", "type": "checkbox", "default": "1",
@@ -3073,6 +3130,33 @@ def prune_backups(r, bdir, product, keep_n, keep):
     if old:
         r.run("rm -rf %s" % " ".join(shlex.quote(f) + " " + shlex.quote(f + ".json") for f in old), sudo=True)
         info(dim("已清理 %d 份较早的备份（保留最近 %d 份）" % (len(old), keep_n)))
+
+
+def db_dump_name(product, version, stamp):
+    """本工具升级前用 pg_dump 做的元数据库备份的文件名（放在程序备份同一目录）。"""
+    return "%s-db-%s-%s.dump" % (product, re.sub(r"[^\w.]", "_", version), stamp)
+
+
+def db_dumps_to_prune(names, product, keep_n, keep=None):
+    """要清理的元数据库备份（纯函数，便于测试）：names 是备份目录里的文件名（不含路径），
+    只认本工具自己的命名 <产品>-db-<版本>-<yyyymmdd-hhmmss>.dump，按文件名里的时间从新到旧保留 keep_n 份；
+    keep（刚做的那份，可带路径）总是保留。其他文件（.tmp、手工放的、别的产品的）一律不动。"""
+    rx = re.compile(r"^%s-db-[\w.]+-(\d{8}-\d{6})\.dump$" % re.escape(product), re.ASCII)
+    keep_base = keep.rsplit("/", 1)[-1] if keep else None
+    mine = sorted((n for n in set(names) if rx.match(n)), key=lambda n: (rx.match(n).group(1), n), reverse=True)
+    return [n for n in mine[max(keep_n, 0):] if n != keep_base]
+
+
+def prune_db_dumps(r, bdir, product, keep_n, keep=None):
+    """元数据库备份（pg_dump）与程序备份用同样的保留份数。只看备份目录本层的普通文件（不跟符号链接）。"""
+    code, o, _ = r.run('for f in %s/%s-db-*.dump; do [ -f "$f" ] && [ ! -L "$f" ] && echo "${f##*/}"; done; true'
+                       % (shlex.quote(bdir), product), sudo=True)
+    if code != 0:
+        return
+    old = db_dumps_to_prune([x.strip() for x in o.splitlines() if x.strip()], product, keep_n, keep)
+    if old:
+        r.run("rm -f -- %s" % " ".join(shlex.quote(posix_join(bdir, n)) for n in old), sudo=True)
+        info(dim("已清理 %d 份较早的元数据库备份（pg_dump，保留最近 %d 份）" % (len(old), keep_n)))
 
 
 # =============================================================================

@@ -102,7 +102,7 @@
 | `edit_host` | `name, password` 或 `name, key_passphrase` | `{"name": ...}` |
 | `test_host` | `name` | `{"root": true}` |
 | `status` | `host` | 见下 |
-| `deploy` | `hosts: [名字...], package: 本机路径, product`（可选：从产品卡点的是哪个产品，包不对时直接失败） | `{"results": [{"host": "生产-1", "status": "完成/跳过/失败/取消", "url": "http://..."}]}`；DFDataLink 首次安装还可能有 `mode`（`setup` 安装向导 / `waiting` 等元数据库）、`setup_token`（从服务日志取到的初始化令牌）、`token_hint`（没取到令牌时的说明，如「令牌为部署时设置的 FDL_SETUP_TOKEN」） |
+| `deploy` | `hosts: [名字...], package: 本机路径, product`（可选：从产品卡点的是哪个产品，包不对时直接失败） | `{"results": [{"host": "生产-1", "status": "完成/跳过/失败/取消", "url": "http://..."}]}`；DFDataLink 升级后持续 60 秒处于 `mode=waiting`（连不上元数据库）按未就绪处理：`fail` 事件「服务已启动但连不上元数据库（等待模式…）」+ `info`「最近一次连接错误：…」（健康检查的 `lastError`，口令打码），随后照常显示日志并 `confirm` 是否回滚；首次安装还可能有 `mode`（`setup` 安装向导 / `waiting` 等元数据库）、`setup_token`（从服务日志取到的初始化令牌）、`token_hint`（没取到令牌时的说明，如「令牌为部署时设置的 FDL_SETUP_TOKEN」） |
 | `service` | `host, product, action("start"/"stop"/"restart")` | `{}` |
 | `logs` | `host, product, lines(默认200)` | `{"text": "日志文本"}` |
 | `follow_logs` | `host, product` | 不会自己结束；通过 `log` 事件推送新行，用户点「停止」→ cancel |
@@ -193,7 +193,7 @@ DFDataLink 的数据库描述来自 `data/datalink.properties` 的 `DB_URL`（Ja
 5. **日志**：对话框，等宽字体显示 `logs` 结果，「刷新」「实时跟踪」开关（开=`follow_logs` 任务，把 log 事件追加到底部并自动滚动；关=cancel）。
 6. **回滚**：先跑 `list_backups`，列出备份（时间、版本、大小；`schema_versioned` 的产品另显示结构版本），选一份 + 选范围（程序+数据 / 仅程序，附说明；外部数据库时提示数据库不在备份里；外部库结构版本不同时红色说明并禁用「回滚…」）→ 二次确认 → `rollback` 任务。
 7. **添加服务器**：表单（地址、SSH 端口 22、账号 root、登录方式 密码/密钥文件、密码 / 私钥路径（带「浏览…」）+ 私钥密码、名称（默认=地址））→ `add_host` 任务（会做连接测试；任务里可能还会问 sudo 密码）。成功后列表刷新并选中它。
-8. **设置**：升级备份保留份数、等待服务就绪秒数。页脚显示本地日志路径（可复制）与「退出程序」。
+8. **设置**：升级备份保留份数（DFDataLink 升级前做的 pg_dump 元数据库备份同样按它清理）、等待服务就绪秒数。页脚显示本地日志路径（可复制）与「退出程序」。
 9. 首次打开且没有服务器时，右侧显示引导：三步说明（添加服务器 → 选择安装包 → 一键安装/升级）+ 大号「添加服务器」按钮。
 10. **在线更新提示**：启动后（设置里没关「启动时自动检查更新」）后台调 `GET /api/online`：
     - 部署助手有新版本 → 页面顶部横幅「下载新版本 / 忽略此版本」，侧栏版本号旁出现「有新版本」；点「下载新版本」跑 `download_tool`，成功后提供「在文件夹中显示」。

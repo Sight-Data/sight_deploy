@@ -67,7 +67,8 @@ SightReport / SightWall / DFDataLink 的产品安装包同样在[官网下载中
   - 「停服 → 备份程序和 `data/` → 替换程序 → 启动」这一段在服务器后台执行，网络断了也会执行完。
   - 启动后检查健康状态并核对版本号，失败时一键回滚，程序和数据一起恢复。
   - 用外部数据库时会提醒先备份数据库。
-  - DFDataLink 用外部元数据库时，升级前必须勾选确认已备份；PostgreSQL 且服务器上有 `pg_dump` 时可勾选让本工具先备份到 `sight-backups/`（密码经 `PGPASSWORD` 传入，不出现在命令行和日志里）。升级前记录数据库结构版本（`schemaVersion`），回滚时外部库结构版本变了就拒绝只回滚程序，提示先用数据库备份恢复；内置 H2 在 `data/` 里，随备份一起恢复。
+  - DFDataLink 用外部元数据库时，升级前必须勾选确认已备份；PostgreSQL 且服务器上有 `pg_dump` 时可勾选让本工具先备份到 `sight-backups/`（`dfdatalink-db-<版本>-<时间>.dump`；密码经 `PGPASSWORD` 传入，不出现在命令行和日志里；与程序备份一样按「保留份数」清理较早的，只清理本工具按这个命名生成的文件）。升级前记录数据库结构版本（`schemaVersion`），回滚时外部库结构版本变了就拒绝只回滚程序，提示先用数据库备份恢复；内置 H2 在 `data/` 里，随备份一起恢复。
+  - DFDataLink 升级后新版本持续 60 秒处于等待模式（`mode=waiting`，连不上元数据库）时，不再等满「等待服务就绪秒数」：直接说明「服务已启动但连不上元数据库」并显示最近一次连接错误（口令打码），随后照常显示日志、询问是否回滚。首次安装时等待模式不算失败。
   - 可以多选服务器依次滚动升级，某台失败时会询问是否继续处理剩下的。DFDataLink 不做自动滚动升级：多选时提醒集群（共用外部库）要先全部停止、先升级一台等迁移完成再升级其余，确认后才依次处理。
 - **在线检查更新**：启动时（可在设置里关闭）联网查询官网下载中心，只读取版本信息，不上传任何数据。
   - 部署助手有新版本时，页面顶部提示，点一下就下载到「下载」文件夹（断点续传）。
@@ -95,7 +96,7 @@ SightReport / SightWall / DFDataLink 的产品安装包同样在[官网下载中
 | 默认端口 | SightReport 9091、SightWall 9090、DFDataLink 18680 |
 | 系统服务 | systemd 服务 `sight-report` / `sight-wall` / `dfdatalink` |
 | 健康检查 | `/api/health`（`status=="UP"`；DFDataLink 另有 `mode=setup/waiting/normal` 与仅本机可见的 `schemaVersion`） |
-| 升级备份 | `<安装目录上级>/sight-backups/<产品>/`，含程序文件与 `data/`；不含 logs（SightReport / SightWall 另不含 data/cache*、data/temp、data/backups；DFDataLink 的 `data/` 整个备份：向导配置与连接密钥、内置 H2、驱动、受管文件）；默认保留 3 份。DFDataLink 的备份元数据（`<备份>.json`）记录 `schema_version` |
+| 升级备份 | `<安装目录上级>/sight-backups/<产品>/`，含程序文件与 `data/`；不含 logs（SightReport / SightWall 另不含 data/cache*、data/temp、data/backups；DFDataLink 的 `data/` 整个备份：向导配置与连接密钥、内置 H2、驱动、受管文件）；默认保留 3 份（DFDataLink 的 pg_dump 元数据库备份同样保留 3 份）。DFDataLink 的备份元数据（`<备份>.json`）记录 `schema_version` |
 | 文件属主 | SightReport / SightWall：整个安装目录交给运行账号；DFDataLink：与包内 `install.sh` 一致，程序文件归 root，只有 `data/`、`logs/` 归运行账号 |
 | 数据库配置 | SightReport / SightWall：`data/work/database.config`、环境变量 `MR_DB_URL`；DFDataLink：`data/datalink.properties` 的 `DB_URL`，环境变量 / `dfdatalink.env` 里的 `DB_URL` 优先 |
 | 初始化 | SightReport / SightWall：`/setup`；DFDataLink：安装向导在 `/`，令牌见服务日志「初始化令牌：」（无 systemd 时在 `logs/console.out`） |

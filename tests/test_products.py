@@ -299,5 +299,158 @@ class SchemaRollback(unittest.TestCase):
         self.assertEqual(len(asked), 1)
 
 
+class FakeClock:
+    """替代 sd.time：sleep 只推进假时钟。"""
+    def __init__(self):
+        self.t = 1000.0
+
+    def time(self):
+        return self.t
+
+    def sleep(self, n):
+        self.t += n
+
+
+class WaitingMode(unittest.TestCase):
+    UP_WAIT = {"status": "UP", "mode": "waiting", "bootstrapped": True, "dbConfigured": True, "dbReachable": False}
+
+    def test_descriptor_flag(self):
+        self.assertTrue(sd.PRODUCTS["dfdatalink"]["waiting_mode"])
+        self.assertFalse(sd.PRODUCTS["sight-report"]["waiting_mode"] or sd.PRODUCTS["sight-wall"]["waiting_mode"])
+        self.assertEqual(sd.WAITING_FAIL_SECS, 60)
+
+    def test_check(self):
+        C, W = sd.waiting_mode_check, self.UP_WAIT
+        self.assertEqual(C(W, None, 10, None), (None, False))          # 不启用（安装 / 其他产品）
+        self.assertEqual(C(W, None, 10, 60), (10, False))              # 开始计时
+        self.assertEqual(C(W, 10, 69, 60), (10, False))
+        self.assertEqual(C(W, 10, 70, 60), (10, True))                 # 持续满 60 秒
+        self.assertEqual(C(dict(W, mode="normal"), 10, 70, 60), (None, False))  # 中途恢复：重新计时
+        self.assertEqual(C(None, 10, 70, 60), (None, False))           # 没响应不算等待模式
+        self.assertEqual(C(dict(W, status="DOWN"), 10, 70, 60), (None, False))
+
+    def test_sanitize(self):
+        S = sd.sanitize_db_error
+        t = S("FATAL: password authentication failed for user \"fdl\"; url=jdbc:postgresql://fdl:S3cret!@db:5432/fdl?password=S3cret!&ssl=true")
+        self.assertNotIn("S3cret", t)
+        self.assertIn("password authentication failed", t)
+        self.assertIn("jdbc:postgresql://fdl:***@db", t)
+        self.assertNotIn("S3cret", S("DB_PASSWORD=S3cret! pwd: S3cret!"))
+        self.assertIn("using password: YES)", S("Access denied for user 'fdl'@'10.0.0.5' (using password: YES)"))
+        self.assertEqual(S(None), "")
+        self.assertTrue(S("x" * 1000).endswith(" …") and len(S("x" * 1000)) < 310)
+        self.assertNotIn("\n", S("a\nb"))
+
+    def test_failure_lines(self):
+        L = sd.waiting_failure_lines(dict(self.UP_WAIT, lastError="Connection refused (password=abc)"), 61)
+        self.assertIn("等待模式", L[0])
+        self.assertIn("1:01", L[0])
+        self.assertEqual(len(L), 2)
+        self.assertNotIn("abc", L[1])
+        self.assertEqual(len(sd.waiting_failure_lines(self.UP_WAIT, 61)), 1)
+
+    def _wait(self, healths, limit, need_boot=True):
+        """用假时钟跑 wait_healthy；healths(秒) → 健康检查结果。返回 (good, h, 用时, 失败信息)。"""
+        clock = FakeClock()
+
+        class FakeR:
+            def health(self, port):
+                return healths(clock.t - 1000.0)
+
+            def run(self, cmd, sudo=False, **k):
+                return 0, "alive\n", ""
+        msgs = []
+        saved = sd.time, sd.fail, sd.info, sd.ok, sd.warn
+        sd.time = clock
+        sd.fail, sd.info = (lambda m: msgs.append(("fail", m))), (lambda m: msgs.append(("info", m)))
+        sd.ok = sd.warn = lambda m: None
+        try:
+            good, h = sd.wait_healthy(FakeR(), "dfdatalink", "/opt/dfdatalink", 18680, need_boot, 300, False,
+                                      waiting_limit=limit)
+        finally:
+            sd.time, sd.fail, sd.info, sd.ok, sd.warn = saved
+        return good, h, clock.t - 1000.0, msgs
+
+    def test_upgrade_waiting_fails_after_limit(self):
+        err = "Connection to db:5432 refused. url=jdbc:postgresql://fdl:pw123@db:5432/fdl"
+        good, h, el, msgs = self._wait(
+            lambda t: None if t < 20 else dict(self.UP_WAIT, lastError=err), 60)
+        self.assertFalse(good)
+        self.assertEqual(h["mode"], "waiting")
+        self.assertTrue(80 <= el < 90, el)                       # 20 秒起动 + 60 秒等待模式，远早于 300 秒
+        self.assertEqual(msgs[0][0], "fail")
+        self.assertIn("连不上元数据库", msgs[0][1])
+        self.assertIn("最近一次连接错误", msgs[1][1])
+        self.assertNotIn("pw123", "".join(m for _, m in msgs))
+
+    def test_upgrade_waiting_recovers(self):
+        good, h, el, _ = self._wait(
+            lambda t: dict(self.UP_WAIT) if t < 40 else {"status": "UP", "mode": "normal", "bootstrapped": True}, 60)
+        self.assertTrue(good)
+        self.assertEqual(h["mode"], "normal")
+
+    def test_upgrade_waiting_not_bootstrapped_still_times_out_early(self):
+        good, _, el, _ = self._wait(lambda t: dict(self.UP_WAIT, bootstrapped=False), 60)
+        self.assertFalse(good)
+        self.assertLess(el, 70)
+
+    def test_install_waiting_is_ok(self):
+        good, h, el, _ = self._wait(lambda t: dict(self.UP_WAIT, bootstrapped=False), None, need_boot=False)
+        self.assertTrue(good)
+        self.assertEqual(h["mode"], "waiting")
+        self.assertLess(el, 1)
+
+
+class DbDumpPrune(unittest.TestCase):
+    def test_name(self):
+        self.assertEqual(sd.db_dump_name("dfdatalink", "0.2.0-rc 1", "20261018-101500"),
+                         "dfdatalink-db-0.2.0_rc_1-20261018-101500.dump")
+        # 本工具自己起的名字一定能被清理逻辑认出来
+        n = sd.db_dump_name("dfdatalink", "0.2.0-rc 1", "20261018-101500")
+        self.assertEqual(sd.db_dumps_to_prune([n], "dfdatalink", 0), [n])
+
+    def test_select(self):
+        P = sd.db_dumps_to_prune
+        names = ["dfdatalink-db-0.1.8-20261001-091000.dump", "dfdatalink-db-0.1.9-20261012-150200.dump",
+                 "dfdatalink-db-0.2.0-20261018-101500.dump", "dfdatalink-db-0.1.7-20260901-080000.dump",
+                 # 不是本工具的命名，一律不动
+                 "dfdatalink-db-0.2.1-20261019-101500.dump.tmp", "dfdatalink-0.1.9-20261012-150200.tar.gz",
+                 "dfdatalink-db-0.2.0-20261018-101500.dump.json", "my-dfdatalink-db-0.1-20200101-000000.dump",
+                 "dfdatalink-db-手工-20200101-000000.dump", "dfdatalink-db-x-2020.dump", "sight-report-db-1-20200101-000000.dump",
+                 "dfdatalink-db-../x-20200101-000000.dump"]
+        self.assertEqual(P(names, "dfdatalink", 3),
+                         ["dfdatalink-db-0.1.7-20260901-080000.dump"])
+        self.assertEqual(P(names, "dfdatalink", 1),
+                         ["dfdatalink-db-0.1.9-20261012-150200.dump", "dfdatalink-db-0.1.8-20261001-091000.dump",
+                          "dfdatalink-db-0.1.7-20260901-080000.dump"])
+        # 刚做的那份总是保留（带路径也行）
+        self.assertNotIn("dfdatalink-db-0.1.7-20260901-080000.dump",
+                         P(names, "dfdatalink", 1, keep="/opt/sight-backups/dfdatalink/dfdatalink-db-0.1.7-20260901-080000.dump"))
+        self.assertEqual(P(names, "dfdatalink", 10), [])
+        self.assertEqual(P([], "dfdatalink", 3), [])
+
+    def test_prune_remote(self):
+        class FakeR:
+            def __init__(self):
+                self.cmds = []
+
+            def run(self, cmd, sudo=False, **k):
+                self.cmds.append(cmd)
+                if cmd.startswith("for f in"):
+                    return 0, "dfdatalink-db-0.1.8-20261001-091000.dump\ndfdatalink-db-0.1.9-20261012-150200.dump\n" \
+                              "dfdatalink-db-0.2.0-20261018-101500.dump\nnotes.txt\n", ""
+                return 0, "", ""
+        r = FakeR()
+        saved = sd.info
+        sd.info = lambda m: None
+        try:
+            sd.prune_db_dumps(r, "/data/sight backups/dfdatalink", "dfdatalink", 2,
+                              keep="/data/sight backups/dfdatalink/dfdatalink-db-0.2.0-20261018-101500.dump")
+        finally:
+            sd.info = saved
+        self.assertIn("'/data/sight backups/dfdatalink'/dfdatalink-db-*.dump", r.cmds[0])
+        self.assertEqual(r.cmds[1], "rm -f -- '/data/sight backups/dfdatalink/dfdatalink-db-0.1.8-20261001-091000.dump'")
+
+
 if __name__ == "__main__":
     unittest.main()
