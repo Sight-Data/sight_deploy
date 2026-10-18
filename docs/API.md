@@ -109,7 +109,7 @@
 | `list_backups` | `host, product` | `{"backup_dir": "...", "current_version": "2.0.71", "db_kind": "h2/external/none", "backups": [{"file": "...", "version": "2.0.69", "time": "2026-10-10 01:16", "size": 30000000}]}`；`schema_versioned` 的产品（Sight DataLink）另有 `current_schema_version` 和每份备份的 `schema_version`（备份时记录的数据库结构版本，旧备份为 null） |
 | `rollback` | `host, product, file, full(bool)` | `{}`。Sight DataLink：外部库且备份时记录的结构版本与当前不同 → 直接失败（不论 `full`），提示先用数据库备份恢复；读不到版本时会用 `confirm` 再问一次 |
 | `download_package` | `product`（`sight-report` / `sight-wall` / `sight-datalink`；官网条目 id 分别是 `dl-report` / `dl-wall` / `dl-datalink`） | `{"path", "name", "size", "product", "version", "mtime", "dir", "reused"}`：从官网下载该产品最新版到 `~/.sight-deploy/uploads/`（断点续传、zip 完整性校验）；本机常用位置已有同名同大小的包就直接复用（`reused=true`）。拿到的 `path` 直接用于 `deploy` |
-| `download_tool` | 无 | `{"path", "name", "dir", "version", "howto": [...]}`：下载新版部署助手到「下载」目录；已是最新时失败。不会自动替换正在运行的程序 |
+| `download_tool` | 无 | `{"path", "name", "dir", "version", "howto": [...], "can_apply"}`：下载新版部署助手到「下载」目录；已是最新时失败。下载本身不会替换正在运行的程序；Windows 打包版 `can_apply=true`，可再调 `POST /api/apply_update` 自更新 |
 
 `status` 结果：
 ```json
@@ -196,7 +196,7 @@ Sight DataLink 的数据库描述来自 `data/datalink.properties` 的 `DB_URL`�
 8. **设置**：升级备份保留份数（Sight DataLink 升级前做的 pg_dump 元数据库备份同样按它清理）、等待服务就绪秒数。页脚显示本地日志路径（可复制）与「退出程序」。
 9. 首次打开且没有服务器时，右侧显示引导：三步说明（添加服务器 → 选择安装包 → 一键安装/升级）+ 大号「添加服务器」按钮。
 10. **在线更新提示**：启动后（设置里没关「启动时自动检查更新」）后台调 `GET /api/online`：
-    - 部署助手有新版本 → 页面顶部横幅「下载新版本 / 忽略此版本」，侧栏版本号旁出现「有新版本」；点「下载新版本」跑 `download_tool`，成功后提供「在文件夹中显示」。
+    - 部署助手有新版本 → 页面顶部横幅「下载新版本 / 忽略此版本」，侧栏版本号旁出现「有新版本」；点「下载新版本」跑 `download_tool`，成功后提供「在文件夹中显示」；Windows 打包版还提供「立即更新并重启」（`POST /api/apply_update`：写 `~/.sight-deploy/update.ps1`，等本进程退出后用新 exe 覆盖当前 exe 并重新启动，覆盖失败就直接启动下载的 exe）。
     - 产品卡：已安装版本低于官网最新时，版本旁出现「官网有 X」标签和一条提示；点「升级」自动预选版本最高的包（本机包与官网最新版里选高的，同版本优先用本机的）。
     - 侧栏「检查更新」：强制刷新（`?refresh=1`）并弹出汇总（部署助手、两个产品的最新版本、哪些已添加的服务器可升级）；连不上官网时说明原因。
     - 联网失败一律不打断使用：自动检查失败时静默，选包对话框里提示「只能使用本机上的安装包」。

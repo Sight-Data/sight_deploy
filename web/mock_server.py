@@ -519,7 +519,7 @@ def s_download_tool(job):
     for i in range(1, 11):
         job.sleep(0.1)
         job.emit(t="progress", id="p2", label="下载 Sight 部署助手 %s" % t["latest"], done=i * 1_430_000, total=14_300_000, speed=5_000_000, eta=(10 - i) // 3)
-    return {"path": "/Users/demo/Downloads/" + t["file_name"], "name": t["file_name"], "dir": "/Users/demo/Downloads", "version": t["latest"],
+    return {"path": "/Users/demo/Downloads/" + t["file_name"], "name": t["file_name"], "dir": "/Users/demo/Downloads", "version": t["latest"], "can_apply": "--win" in sys.argv,
             "howto": ["先退出当前的部署助手（界面左下角「退出程序」）", "解压 zip，用新的「Sight部署助手.app」替换旧的；第一次打开仍需右键 → 打开"]}
 
 
@@ -641,6 +641,9 @@ class H(BaseHTTPRequestHandler):
                     return self._send(200, {"error": "无法连接官网（官网：域名解析失败，电脑可能没有联网）", "tool": None, "products": {}, "site": ONLINE["site"]})
                 time.sleep(1.2)
                 return self._send(200, dict(ONLINE, checked_at=int(time.time())))
+            if p == "/api/apply_update":
+                self._body()
+                return self._send(200, {"ok": True})
             if p == "/api/reveal":
                 self._body()
                 return self._send(200, {"ok": True})

@@ -3431,7 +3431,7 @@ def check_online(force=False):
         if tool:
             tool.update(current=TOOL_VERSION, platform=tool_platform(), page=SITE_BASE + "/downloads",
                         update=parse_version(tool["latest"]) > parse_version(TOOL_VERSION),
-                        can_download=bool(tool.get("url")))
+                        can_download=bool(tool.get("url")), self_update=can_self_update())
             res["tool"] = tool
         if not res["source"]:
             res["error"] = "无法连接官网（%s）" % "；".join(errs)
@@ -3603,13 +3603,65 @@ def job_download_tool(ctx, p):
     step("下载 %s" % name)
     dest = download_file(t["url"], d / name, "下载 Sight 部署助手 %s" % t["latest"], _remote_size(t["url"]))
     APP.tool_download = str(dest)
-    if (tool_platform() or "").startswith("windows"):
+    can_apply = can_self_update()
+    if can_apply:
+        howto = ["点下面的「立即更新并重启」：程序会退出，用新版本替换当前的 %s，然后自动重新打开" % Path(sys.executable).name,
+                 "服务器信息会保留；新版本下载的 exe 在替换成功后会自动删除"]
+    elif (tool_platform() or "").startswith("windows"):
         howto = ["先退出当前的部署助手（界面左下角「退出程序」，或右下角通知区图标右键 → 退出）", "再双击新下载的 exe 运行；旧版本的 exe 可以删除"]
     else:
         howto = ["先退出当前的部署助手（界面左下角「退出程序」）", "解压 zip，用新的「Sight部署助手.app」替换旧的；第一次打开仍需右键 → 打开"]
     for x in howto:
         info(x)
-    return {"path": str(dest), "name": dest.name, "dir": str(d), "version": t["latest"], "howto": howto}
+    return {"path": str(dest), "name": dest.name, "dir": str(d), "version": t["latest"], "howto": howto, "can_apply": can_apply}
+
+
+def can_self_update():
+    """只有 Windows 打包版的 exe 能自己替换自己（运行中的 exe 不能覆盖，要等进程退出后由一个脚本来做）。"""
+    return bool(FROZEN and os.name == "nt")
+
+
+def _ps_quote(s):
+    return "'" + str(s).replace("'", "''") + "'"
+
+
+def apply_tool_update():
+    """Windows：写一个 PowerShell 脚本，等当前进程退出后用新下载的 exe 覆盖当前 exe，再启动它。
+    覆盖失败（目录没有写权限等）就直接启动下载的那个 exe，保证用户总能跑上新版本。"""
+    if not can_self_update():
+        raise DeployError("当前系统不支持自动更新", "请手动退出程序后运行新下载的版本")
+    new = Path(APP.tool_download or "")
+    if not APP.tool_download or not new.is_file():
+        raise DeployError("找不到刚下载的新版本", "请重新点「下载新版本」")
+    target = Path(sys.executable).resolve()
+    same = os.path.normcase(str(new.resolve())) == os.path.normcase(str(target))
+    script = CONF_DIR / "update.ps1"
+    lines = [
+        "$ErrorActionPreference = 'Continue'",
+        "$old = %d; $new = %s; $target = %s" % (os.getpid(), _ps_quote(new), _ps_quote(target)),
+        "for ($i = 0; $i -lt 120; $i++) { if (-not (Get-Process -Id $old -ErrorAction SilentlyContinue)) { break }; Start-Sleep -Milliseconds 500 }",
+        "$ok = $false",
+        "if ($new -ieq $target) { $ok = $true } else {",
+        "  for ($i = 0; $i -lt 30 -and -not $ok; $i++) {",
+        "    try { Copy-Item -LiteralPath $new -Destination $target -Force -ErrorAction Stop; $ok = $true } catch { Start-Sleep -Milliseconds 500 }",
+        "  }",
+        "}",
+        "if ($ok) { if ($new -ine $target) { Remove-Item -LiteralPath $new -Force -ErrorAction SilentlyContinue }; Start-Process -FilePath $target }",
+        "else { Start-Process -FilePath $new }",
+    ]
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    script.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8-sig")  # 带 BOM，PowerShell 才会按 UTF-8 读中文路径
+    # 打包版 exe 是「解压到临时目录再运行」：必须清掉 PyInstaller 留在环境里的变量，否则新进程会误用旧进程已被删除的临时目录
+    env = {k: v for k, v in os.environ.items() if not k.startswith("_PYI") and k != "_MEIPASS2"}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    flags = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+    try:
+        subprocess.Popen(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+                         env=env, creationflags=flags, close_fds=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as e:
+        raise DeployError("无法启动更新脚本：%s" % e, "请手动退出程序后运行新下载的版本：%s" % new)
+    LOG.write("  [自更新] 已启动更新脚本 %s：%s → %s%s" % (script, new, target, "（同一个文件）" if same else ""))
 
 
 def reveal_file(path):
@@ -4280,6 +4332,13 @@ class Handler(BaseHTTPRequestHandler):
                     return self._err("没有可显示的文件")
                 reveal_file(f)
                 return self._json({"ok": True})
+            if u.path == "/api/apply_update":
+                if APP.busy():
+                    return self._err("有任务正在执行，请等它结束再更新", 409)
+                apply_tool_update()
+                self._json({"ok": True})
+                threading.Thread(target=_shutdown, daemon=True).start()
+                return
             if u.path == "/api/hosts/delete":
                 if APP.busy():
                     return self._err("有任务正在执行，请稍后再删", 409)
