@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Sight Data](https://img.shields.io/badge/官网-www.sightdata.top-2f6fed.svg)](https://www.sightdata.top)
 
-[**Sight Data**](https://www.sightdata.top) 旗下 **SightReport（报表）/ SightWall（数据大屏）/ Sight DataLink（数据集成）** 的远程安装与升级工具。
+[**Sight Data**](https://www.sightdata.top) 旗下 **SightReport（报表）/ SightWall（数据大屏）/ Sight DataLink（数据集成）/ Sight 移动网关** 的远程安装与升级工具。
 
 双击打开，操作界面在浏览器里。通过 SSH 连到 Linux 服务器，三步完成部署：添加服务器 → 选择安装包 → 一键安装 / 升级。
 不用敲命令，客户电脑上也不用装 Python。
@@ -48,7 +48,7 @@
 - **Mac**：第一次打开会提示「无法验证开发者」，右键 →「打开」即可。macOS 15 起要到「系统设置 › 隐私与安全性」点「仍要打开」。
 - **Windows**：个别杀毒软件可能误报，加入信任即可。
 
-SightReport / SightWall / Sight DataLink 的产品安装包同样在[官网下载中心](https://www.sightdata.top/downloads)下载（Sight DataLink 的包名为 `sight-datalink-<版本>.zip`）。
+SightReport / SightWall / Sight DataLink / Sight 移动网关的产品安装包同样在[官网下载中心](https://www.sightdata.top/downloads)下载（Sight DataLink 的包名为 `sight-datalink-<版本>.zip`；Sight 移动网关按服务器 CPU 分包，包名为 `sight-mobile-gateway-<版本>-linux-<amd64|arm64|loong64>.zip`，不要改名）。
 
 > Sight DataLink 按它自己的 Sustainable Use License 分发，见 [LICENSING.md](https://github.com/qianxl2011/DataLink/blob/main/LICENSING.md)；本工具（Apache-2.0）只负责安装与升级。
 
@@ -70,9 +70,16 @@ SightReport / SightWall / Sight DataLink 的产品安装包同样在[官网下�
   - Sight DataLink 用外部元数据库时，升级前必须勾选确认已备份；PostgreSQL 且服务器上有 `pg_dump` 时可勾选让本工具先备份到 `sight-backups/`（`sight-datalink-db-<版本>-<时间>.dump`；密码经 `PGPASSWORD` 传入，不出现在命令行和日志里；与程序备份一样按「保留份数」清理较早的，只清理本工具按这个命名生成的文件）。升级前记录数据库结构版本（`schemaVersion`），回滚时外部库结构版本变了就拒绝只回滚程序，提示先用数据库备份恢复；内置 H2 在 `data/` 里，随备份一起恢复。
   - Sight DataLink 升级后新版本持续 60 秒处于等待模式（`mode=waiting`，连不上元数据库）时，不再等满「等待服务就绪秒数」：直接说明「服务已启动但连不上元数据库」并显示最近一次连接错误（口令打码），随后照常显示日志、询问是否回滚。首次安装时等待模式不算失败。
   - 可以多选服务器依次滚动升级，某台失败时会询问是否继续处理剩下的。Sight DataLink 不做自动滚动升级：多选时提醒集群（共用外部库）要先全部停止、先升级一台等迁移完成再升级其余，确认后才依次处理。
+- **Sight 移动网关**（SightReport 配套的手机访问入口，Go 单文件程序，部署在手机能访问到的前置机 / DMZ 上，**不是 SightReport 所在的那台机器**；没有 Java、没有数据库，不用联网）：
+  - 首次安装：检查 CPU 架构与安装包一致（`uname -m` 的 x86_64 / aarch64 / loongarch64 对应 amd64 / arm64 / loong64）、systemd、手机侧端口（默认 8080）和隧道端口（7443）是否被占用、磁盘。界面里填「SightReport 访问网关用的域名或 IP」（可多个，会写进证书）和手机侧端口，然后上传解压 → 先在服务器上试跑 `version` → `init -hostnames …` → `install` → `start` → 用 `curl -sk https://127.0.0.1:7443/healthz` 确认返回 `{"agents":n}`。
+  - 安装完成页醒目显示**网关地址、证书指纹、接入令牌**（可一键复制），并写明下一步：到 SightReport「移动 › 设置 › 网络与部署」启用移动网关，网关地址填 `wss://<主机>:7443/tunnel`。令牌是机密：只显示在界面上，不写进本地日志和历史记录；之后可在服务器详情点「查看接入信息」（执行 `show`）再看。
+  - 升级：停服务 → 备份旧程序（`sight-backups/sight-mobile-gateway/*.bin`）→ 替换 → 启动 → 核对 `sight-mobile-gateway version` 等于新版本且 `/healthz` 正常；新程序会在停服务之前先在服务器上试跑一次。失败时自动放回旧程序，也可以一键回滚。**`gateway.yaml` 和 `data/` 绝不覆盖**，接入令牌和证书指纹不会变，SightReport 里不用重新填。
+  - 状态页显示版本、服务状态和 SightReport 连接数（`agents`）；连接数为 0 时提示「SightReport 还没有连上来」。
+  - 版本配套：网关版本必须与 SightReport 一致。升级 SightReport 后，助手里登记的移动网关版本不同，会提醒「移动网关需同步升级到 x.y.z」；网关卡片上也会提示。
+  - 只支持 Linux 服务器（Windows 请用网关安装包里的说明手工部署）。
 - **在线检查更新**：启动时（可在设置里关闭）联网查询官网下载中心，只读取版本信息，不上传任何数据。
   - 部署助手有新版本时，页面顶部提示，点一下就下载到「下载」文件夹（断点续传）。
-  - 服务器上的 SightReport / SightWall / Sight DataLink 低于官网最新版时，在产品卡上标出；点「升级」会预选最新版，没下载过的自动从官网下载并校验，再部署。
+  - 服务器上的 SightReport / SightWall / Sight DataLink / Sight 移动网关低于官网最新版时，在产品卡上标出；点「升级」会预选最新版，没下载过的自动从官网下载并校验，再部署。
   - 左下角「检查更新」随时手动检查，并汇总哪些服务器可升级。连不上官网（内网）时不影响使用，仍可用本机的安装包。
 - **日常运维**：启动、停止、重启；查看日志（可实时跟踪）；回滚到任意一份升级备份。回滚前会先把当前状态另存一份，回滚本身也能撤销。
 
@@ -92,18 +99,19 @@ SightReport / SightWall / Sight DataLink 的产品安装包同样在[官网下�
 
 | 项 | 约定 |
 |---|---|
-| 安装目录 | 默认 `/opt/sight-report`、`/opt/sight-wall`、`/opt/sight-datalink` |
-| 默认端口 | SightReport 9091、SightWall 9090、Sight DataLink 18680 |
-| 系统服务 | systemd 服务 `sight-report` / `sight-wall` / `sight-datalink` |
-| 健康检查 | `/api/health`（`status=="UP"`；Sight DataLink 另有 `mode=setup/waiting/normal` 与仅本机可见的 `schemaVersion`） |
+| 安装目录 | 默认 `/opt/sight-report`、`/opt/sight-wall`、`/opt/sight-datalink`、`/opt/sight-mobile-gateway` |
+| 默认端口 | SightReport 9091、SightWall 9090、Sight DataLink 18680；Sight 移动网关 手机侧 8080（`gateway.yaml` 的 `listen`）、隧道 7443（`tunnel.listen`） |
+| 系统服务 | systemd 服务 `sight-report` / `sight-wall` / `sight-datalink`；Sight 移动网关由程序自己的 `install` 命令注册为 `sight-mobile-gateway` |
+| 健康检查 | 移动网关：隧道端口上的 `GET /healthz`（自签证书，用 `curl -sk`），返回 `{"agents":n}`（SightReport 连进来的数量）。其余产品：`/api/health`（`status=="UP"`；Sight DataLink 另有 `mode=setup/waiting/normal` 与仅本机可见的 `schemaVersion`） |
 | 升级备份 | `<安装目录上级>/sight-backups/<产品>/`，含程序文件与 `data/`；不含 logs（SightReport / SightWall 另不含 data/cache*、data/temp、data/backups；Sight DataLink 的 `data/` 整个备份：向导配置与连接密钥、内置 H2、驱动、受管文件）；默认保留 3 份（Sight DataLink 的 pg_dump 元数据库备份同样保留 3 份）。Sight DataLink 的备份元数据（`<备份>.json`）记录 `schema_version` |
 | 文件属主 | SightReport / SightWall：整个安装目录交给运行账号；Sight DataLink：与包内 `install.sh` 一致，程序文件归 root，只有 `data/`、`logs/` 归运行账号 |
 | 数据库配置 | SightReport / SightWall：`data/work/database.config`、环境变量 `MR_DB_URL`；Sight DataLink：`data/datalink.properties` 的 `DB_URL`，环境变量 / `sight-datalink.env` 里的 `DB_URL` 优先 |
 | 初始化 | SightReport / SightWall：`/setup`；Sight DataLink：安装向导在 `/`，令牌见服务日志「初始化令牌：」（无 systemd 时在 `logs/console.out`） |
 | 非默认端口 | `/etc/systemd/system/<服务>.service.d/10-sight-deploy.conf` |
+| 移动网关的备份与配置 | 升级前备份旧可执行文件到 `<安装目录上级>/sight-backups/sight-mobile-gateway/sight-mobile-gateway-<版本>-<时间>.bin`（保留份数同上）；`gateway.yaml`（含接入令牌）和 `data/`（含证书私钥）升级、回滚都不动 |
 | 安装记录 | 安装目录下的 `.sight-deploy.json`（版本、端口、启动参数） |
 
-支持的服务器：x86_64 / aarch64 的 Linux，有无 systemd 都可以（没有 systemd 时以后台进程方式运行）。
+支持的服务器：x86_64 / aarch64 的 Linux，有无 systemd 都可以（没有 systemd 时以后台进程方式运行）。Sight 移动网关另支持龙芯 loongarch64，但必须有 systemd。
 
 ## 从源码运行
 

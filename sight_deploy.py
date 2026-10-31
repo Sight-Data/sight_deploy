@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-Sight 部署助手 —— SightReport / SightWall / Sight DataLink 远程安装与升级（网页界面）
+Sight 部署助手 —— SightReport / SightWall / Sight DataLink / Sight 移动网关 远程安装与升级（网页界面）
 
 开源地址：https://github.com/Sight-Data/sight_deploy    产品官网：https://www.sightdata.top
 
@@ -50,7 +50,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-TOOL_VERSION = "2.2.2"
+TOOL_VERSION = "2.3.0"
 CONF_DIR = Path(os.environ.get("SIGHT_DEPLOY_HOME") or (Path.home() / ".sight-deploy"))
 FROZEN = getattr(sys, "frozen", False)
 # 程序所在目录：打包后是 exe/.app 所在目录（用来找同目录下的安装包），源码运行是本文件目录
@@ -142,6 +142,41 @@ PRODUCTS = {
     },
 }
 
+# ---- Sight 移动网关：SightReport 配套的 Go 单文件程序，部署在 DMZ 前置机上（与 SightReport 不是同一台机器）。
+# 没有 Java / jar / 数据库 / install.sh，不走 Java 产品的那一套（见下面「Sight 移动网关」一节）。
+GATEWAY = "sight-mobile-gateway"
+GATEWAY_BIN = "sight-mobile-gateway"       # 安装目录里的可执行文件名
+GATEWAY_MOBILE_PORT = 8080                 # 手机侧默认端口（gateway.yaml 的 listen）
+GATEWAY_TUNNEL_PORT = 7443                 # 隧道默认端口（gateway.yaml 的 tunnel.listen），SightReport 连进来
+# 安装包 sight-mobile-gateway-<版本>-linux-<架构>.zip；uname -m ↔ 架构 ↔ ELF e_machine ↔ 官网下载项
+GATEWAY_ARCHES = {
+    "amd64": {"label": "x86_64", "uname": ("x86_64", "amd64"), "elf": 0x3E, "site_id": "dl-gateway-linux-amd64"},
+    "arm64": {"label": "ARM64", "uname": ("aarch64", "arm64"), "elf": 0xB7, "site_id": "dl-gateway-linux-arm64"},
+    "loong64": {"label": "龙芯 LoongArch64", "uname": ("loongarch64", "loong64"), "elf": 0x102,
+                "site_id": "dl-gateway-linux-loong64"},
+}
+GATEWAY_ZIP_RE = re.compile(r"^sight-mobile-gateway-(\d+(?:\.\d+)*)-linux-(amd64|arm64|loong64)\.zip$", re.I)
+
+PRODUCTS[GATEWAY] = {
+    "kind": "gateway",                      # 非 Java 产品：安装 / 升级 / 状态 / 回滚走单独的流程
+    "name": "Sight 移动网关", "jar": None, "binary": GATEWAY_BIN, "zip_prefix": GATEWAY,
+    "port": GATEWAY_MOBILE_PORT, "tunnel_port": GATEWAY_TUNNEL_PORT, "dir": "/opt/" + GATEWAY,
+    "service": GATEWAY,                     # 由程序自己的 install 命令注册成 systemd 服务
+    "health": "/healthz",                   # 隧道端口上的 GET /healthz（无需鉴权），返回 {"agents":n}
+    "setup_path": None, "setup_token": False, "setup_hint": "", "db_none_desc": "", "db_reader": None,
+    "version_api": None, "needs_fonts": False, "owned_dirs": None, "waiting_mode": False,
+    "rolling_upgrade": True, "schema_versioned": False,
+    "log_files": ("logs/gateway.log",), "follow_log": "logs/gateway.log", "follow_journal": True,
+    "site_id": None,                        # 官网按架构分三个下载项，见 GATEWAY_ARCHES[...]["site_id"]
+    # 下面几项是 Java 产品才用的，留空值只为让通用代码按字段读取时不出错
+    "start_class": None, "db_env_re": "", "proc_env_re": "", "backup_excludes": [], "data_excludes": "",
+    "start_env": {}, "db_backup_hint": "",
+}
+
+
+def is_gateway(product):
+    return (PRODUCTS.get(product) or {}).get("kind") == "gateway"
+
 
 def svc_of(product):
     """systemd 服务名。"""
@@ -149,7 +184,7 @@ def svc_of(product):
 
 
 def product_by_jar(jar_name):
-    return next((k for k, v in PRODUCTS.items() if v["jar"] == jar_name), None)
+    return next((k for k, v in PRODUCTS.items() if v["jar"] and v["jar"] == jar_name), None)
 
 
 def product_names():
@@ -674,6 +709,7 @@ class Package:
         self.tmp = None
         self.files = []  # [(相对路径, 本地路径, 大小, sha256)]
         self.full = False
+        self.arch = None  # 只有移动网关的包有：amd64 / arm64 / loong64
         try:
             self._load()
         except BaseException:  # 包括用户点「停止」：解压出来的临时文件（几百 MB）要清掉
@@ -688,6 +724,9 @@ class Package:
             jar_local, rel_root = p, None
             self.full = False
             members = [(p.name, p)]
+        elif p.suffix.lower() == ".zip" and (GATEWAY_ZIP_RE.match(p.name) or p.name.lower().startswith(GATEWAY + "-")):
+            self._load_gateway()
+            return
         elif p.suffix.lower() == ".zip":
             self.tmp = Path(tempfile.mkdtemp(prefix="sight-deploy-"))
             with zipfile.ZipFile(p) as zf:
@@ -696,7 +735,7 @@ class Package:
                 jars = [n for n in names if product_by_jar(n.rsplit("/", 1)[-1])]
                 if not jars:
                     raise DeployError("这个 zip 里没有 %s，不是 %s 安装包：%s" % (
-                        " / ".join(v["jar"] for v in PRODUCTS.values()), product_names(), p.name))
+                        " / ".join(v["jar"] for v in PRODUCTS.values() if v["jar"]), product_names(), p.name))
                 jar_name = sorted(jars, key=len)[0]
                 rel_root = jar_name[: -len(Path(jar_name).name)]
                 out(dim("    解压安装包 …"))
@@ -736,6 +775,45 @@ class Package:
             self.files.append((rel.replace("\\", "/"), str(local), size, sha))
         self.files.sort(key=lambda x: (x[0] == self.jar, x[0]))  # jar 最后传
 
+    def _load_gateway(self):
+        """移动网关安装包：sight-mobile-gateway-<版本>-linux-<架构>.zip，里面一层目录，含可执行文件和 README.md。"""
+        p = self.path
+        m = GATEWAY_ZIP_RE.match(p.name)
+        if not m:
+            if "windows" in p.name.lower():
+                raise DeployError("%s 是 Windows 版的移动网关安装包，本工具只支持 Linux 服务器" % p.name,
+                                  "请改选 sight-mobile-gateway-<版本>-linux-<amd64|arm64|loong64>.zip")
+            raise DeployError("无法识别的移动网关安装包名：%s" % p.name,
+                              "文件名应形如 sight-mobile-gateway-2.0.96-linux-amd64.zip（不要改名）")
+        self.version, self.arch = m.group(1), m.group(2).lower()
+        self.tmp = Path(tempfile.mkdtemp(prefix="sight-deploy-"))
+        with zipfile.ZipFile(p) as zf:
+            names = [n for n in zf.namelist() if not n.endswith("/") and "__MACOSX" not in n and not n.endswith(".DS_Store")]
+            bins = [n for n in names if n.rsplit("/", 1)[-1] == GATEWAY_BIN]
+            if not bins:
+                raise DeployError("这个 zip 里没有 %s 可执行文件，不是移动网关安装包：%s" % (GATEWAY_BIN, p.name))
+            bin_name = sorted(bins, key=len)[0]
+            rel_root = bin_name[: -len(GATEWAY_BIN)]
+            members = []
+            for n in names:
+                rel = n[len(rel_root):]
+                if not n.startswith(rel_root) or "/" in rel or rel not in (GATEWAY_BIN, "README.md"):
+                    continue  # 只取可执行文件和说明；其他东西（含任何配置文件）一律不上传
+                dest = self.tmp / rel
+                with zf.open(n) as src, open(dest, "wb") as dst:
+                    shutil.copyfileobj(src, dst, 1 << 20)
+                members.append((rel, dest))
+        self.full = True
+        self.jar = GATEWAY_BIN  # 与 Java 产品共用的字段：这里是「主程序文件名」
+        self.product = GATEWAY
+        self.java_req = 0
+        err = elf_arch_error(self.tmp / GATEWAY_BIN, self.arch)
+        if err:
+            raise DeployError("%s：%s" % (p.name, err), "请到官网下载中心重新下载对应架构的安装包")
+        for rel, local in members:
+            self.files.append((rel, str(local), os.path.getsize(local), sha256_file(local)))
+        self.files.sort(key=lambda x: (x[0] == GATEWAY_BIN, x[0]))  # 可执行文件最后传
+
     @property
     def name(self):
         return PRODUCTS[self.product]["name"]
@@ -750,6 +828,23 @@ class Package:
     def cleanup(self):
         if self.tmp and self.tmp.exists():
             shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+def elf_arch_error(path, arch):
+    """可执行文件必须是 Linux ELF，且 CPU 架构与包名里的一致（防止包被改名 / 打错）。返回错误说明，没问题返回 None。"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(20)
+    except OSError as e:
+        return "读取程序文件失败：%s" % e
+    if len(head) < 20 or head[:4] != b"\x7fELF":
+        return "里面的 %s 不是 Linux 可执行文件" % GATEWAY_BIN
+    machine = int.from_bytes(head[18:20], "little" if head[5] == 1 else "big")
+    want = GATEWAY_ARCHES[arch]["elf"]
+    if machine != want:
+        got = next((a for a, sp in GATEWAY_ARCHES.items() if sp["elf"] == machine), "未知架构(%#x)" % machine)
+        return "包名是 %s，但里面的程序是 %s 的，这个包可能被改过名或打错了包" % (arch, got)
+    return None
 
 
 def search_dirs():
@@ -997,9 +1092,11 @@ class Remote:
         return self._sftp
 
     # ------------------------------------------------------------ 命令执行
-    def run_raw(self, cmd, stdin=None, pty=False, timeout=600, on_line=None, wait_for=None, cancellable=False):
+    def run_raw(self, cmd, stdin=None, pty=False, timeout=600, on_line=None, wait_for=None, cancellable=False,
+                secret_out=False):
         """执行一条命令。wait_for：先等输出里出现这个提示再发送 stdin（pty 下的 sudo 密码，避免被回显）。
-        cancellable：用户点「停止」时立即断开（只用于看日志这类可随时中断的命令）。"""
+        cancellable：用户点「停止」时立即断开（只用于看日志这类可随时中断的命令）。
+        secret_out：输出里有机密（如移动网关 init 打印的接入令牌），本地日志只记退出码，不记输出。"""
         check_cancel()  # 用户点了「停止」：在两条命令之间中止（不会打断正在执行的命令）
         LOG.write("  [%s] $ %s" % (self.host, cmd if len(cmd) < 600 else cmd[:600] + " …"))
         if not self.t or not self.t.is_active():
@@ -1071,11 +1168,15 @@ class Remote:
         e = clean(b"".join(errb).decode("utf-8", "replace"))
         if pty:
             o = o.replace("\r\n", "\n")
+        if secret_out:
+            LOG.write("    → exit %s（输出含机密，不记录）" % code)
+            return code, o, e
         LOG.write(_mask("    → exit %s%s%s" % (code, ("\n    " + o.strip()[-1500:].replace("\n", "\n    ")) if o.strip() else "",
                                                 ("\n    [stderr] " + e.strip()[-800:]) if e.strip() else "")))
         return code, o, e
 
-    def run(self, script, sudo=False, timeout=600, check=False, on_line=None, what=None, cancellable=False):
+    def run(self, script, sudo=False, timeout=600, check=False, on_line=None, what=None, cancellable=False,
+            secret_out=False):
         inner = "bash -c " + shlex.quote(PRELUDE + script)
         stdin, pty = None, False
         if sudo and not self.is_root:
@@ -1091,7 +1192,7 @@ class Remote:
         else:
             cmd = inner
         code, o, e = self.run_raw(cmd, stdin=stdin, pty=pty, timeout=timeout, on_line=on_line,
-                                  wait_for=SUDO_PROMPT if pty else None, cancellable=cancellable)
+                                  wait_for=SUDO_PROMPT if pty else None, cancellable=cancellable, secret_out=secret_out)
         if check and code != 0:
             msg = (e.strip() or o.strip()).splitlines()[-5:]
             raise DeployError("%s失败（退出码 %s）%s" % (what or "服务器命令", code,
@@ -1289,6 +1390,8 @@ def _mask(s):
     """日志脱敏：数据库密码、各类 PASSWORD 环境变量。"""
     s = re.sub(r'("password"\s*:\s*")[^"]*(")', r"\1***\2", s, flags=re.I)
     s = mask_token(s)
+    s = re.sub(r"(接入令牌\s*[:：]\s*)\S+", r"\1***", s)  # 移动网关 init / show 的输出、gateway.yaml 里的 token 都不能进日志
+    s = re.sub(r"(^\s*token\s*:\s*)\S+", r"\1***", s, flags=re.M)
     return re.sub(r"((?:PASSWORD|SECRET|TOKEN)[A-Z_]*=)\S+", r"\1***", s, flags=re.I)
 
 
@@ -3232,6 +3335,8 @@ finish OK
 
 def locate_install(ctx, r, product, quiet=False, ask_user=True):
     """返回 inst dict 或 None（未安装）。"""
+    if is_gateway(product):
+        return locate_gateway(ctx, r, quiet, ask_user)
     P = PRODUCTS[product]
     saved = (ctx.host_product(r, product) or {}).get("install_dir")
     cands = find_installs(r, product)
@@ -3256,6 +3361,822 @@ def locate_install(ctx, r, product, quiet=False, ask_user=True):
     if not quiet:
         out("读取安装信息 …")
     return inspect_install(r, product, d)
+
+
+# =============================================================================
+# Sight 移动网关（Go 单文件程序）：安装 / 升级 / 状态 / 回滚
+#   部署在 DMZ 前置机上；没有 Java、jar、数据库、install.sh。命令、输出格式见网关仓库 apps/sight-mobile-gateway：
+#   init -hostnames a,b 生成 gateway.yaml + data/tunnel.crt|key 并打印「证书指纹」「接入令牌」；
+#   install 注册 systemd 服务；start / stop；version 打印「sight-mobile-gateway <版本>」；
+#   隧道端口上的 GET /healthz 返回 {"agents":n}（SightReport 连进来的数量）。
+#   gateway.yaml（含令牌）和 data/（含证书私钥）升级时绝不覆盖：令牌和指纹不能变。
+# =============================================================================
+
+GW_FP_RE = re.compile(r"证书指纹[^:：\n]*[:：][ \t]*([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){31})")
+GW_TOKEN_RE = re.compile(r"接入令牌[ \t]*[:：][ \t]*([A-Za-z0-9_\-]{16,})")
+GW_VER_RE = re.compile(r"sight-mobile-gateway\s+(\S+)")
+GW_BACKUP_RE = re.compile(r"-(\d[\w.]*)-(\d{8}-\d{6})\.bin$")
+GW_IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+GW_HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.\-]*[A-Za-z0-9])?$")
+GW_IPV6_RE = re.compile(r"^[0-9A-Fa-f:]*:[0-9A-Fa-f:.]*$")
+
+
+def parse_gateway_secrets(text):
+    """解析网关 init / show 的输出，返回 {"fingerprint": …, "token": …}，没有的为 None。
+    隧道没启用 TLS（tunnel.tls: false）时 show 只打印令牌，没有指纹。"""
+    text = strip_ansi(text or "")
+    fp = GW_FP_RE.search(text)
+    tk = GW_TOKEN_RE.search(text)
+    return {"fingerprint": fp.group(1).upper() if fp else None, "token": tk.group(1) if tk else None}
+
+
+def parse_gateway_version(text):
+    """`sight-mobile-gateway version` 的输出（「sight-mobile-gateway 2.0.96」）→ 版本号，读不到返回 None。"""
+    m = GW_VER_RE.search(strip_ansi(text or ""))
+    return m.group(1) if m else None
+
+
+def gateway_arch_of(uname_m):
+    """uname -m → 安装包架构名（amd64 / arm64 / loong64），不认识返回 None。"""
+    u = (uname_m or "").strip().lower()
+    return next((a for a, sp in GATEWAY_ARCHES.items() if u in sp["uname"]), None)
+
+
+def gateway_arch_error(uname_m, pkg_arch):
+    """服务器 CPU 架构必须与安装包一致。匹配返回 None，否则返回给人看的说明。"""
+    have = gateway_arch_of(uname_m)
+    if have == pkg_arch:
+        return None
+    if have is None:
+        return "服务器的 CPU 架构是 %s，移动网关只提供 x86_64（amd64）、ARM64、龙芯（loong64）三种" % (uname_m or "未知")
+    return "服务器的 CPU 是 %s（%s），但这个安装包是 %s（%s）的：请换成文件名里带 linux-%s 的安装包" % (
+        uname_m.strip(), GATEWAY_ARCHES[have]["label"], pkg_arch, GATEWAY_ARCHES[pkg_arch]["label"], have)
+
+
+def parse_gateway_hostnames(text):
+    """界面上填的「SightReport 访问网关用的域名或 IP」（可多个，逗号 / 空格 / 分号分隔）→ (列表, 错误说明)。"""
+    items = [x for x in re.split(r"[\s,;，；、]+", text or "") if x]
+    if not items:
+        return [], "请填写 SightReport 访问网关用的域名或 IP（至少一个）"
+    seen = []
+    for x in items:
+        if GW_IPV4_RE.match(x):
+            if any(int(o) > 255 for o in x.split(".")):
+                return [], "「%s」不是有效的 IP 地址" % x
+        elif GW_IPV6_RE.match(x) and ":" in x:
+            pass
+        elif not GW_HOST_RE.match(x) or len(x) > 253:
+            return [], "「%s」不是有效的域名或 IP（只能含字母、数字、点和横线，不要带 http:// 或端口）" % x
+        if x not in seen:
+            seen.append(x)
+    return seen, None
+
+
+def _port_in(value):
+    """从 yaml 里 `listen: ":8080"` 这样的值（可带 IP、引号、注释）取端口。"""
+    v = (value or "").split("#", 1)[0]
+    v = v.split(":", 1)[1] if v.lstrip().startswith("listen") else v
+    m = re.search(r":(\d+)(?=[\"'\s]|$)", v)
+    return int(m.group(1)) if m else None
+
+
+def parse_gateway_config(kv_):
+    """INSPECT 脚本输出的 cfg_* 行 → {"mobile_port", "tunnel_port", "tunnel_tls", "hostnames"}（读不到的用默认值）。
+    只读 listen / tls / hostnames 这几处，不读令牌。"""
+    mobile = _port_in(as_list(kv_.get("cfg_mobile"))[0] if kv_.get("cfg_mobile") else "")
+    tunnel = _port_in(as_list(kv_.get("cfg_tunnel"))[0] if kv_.get("cfg_tunnel") else "")
+    tls_raw = (as_list(kv_.get("cfg_tunnel_tls")) or [""])[0].split("#", 1)[0].lower()
+    hosts = [x.strip("\"' ") for x in as_list(kv_.get("cfg_host")) if x.strip("\"' ")]
+    return {"mobile_port": mobile or GATEWAY_MOBILE_PORT, "tunnel_port": tunnel or GATEWAY_TUNNEL_PORT,
+            "tunnel_tls": "false" not in tls_raw, "hostnames": hosts}
+
+
+def parse_gateway_healthz(body):
+    """GET /healthz 的响应 {"agents":n} → {"agents": n}；不是这个格式（端口上是别的程序）返回 None。"""
+    try:
+        j = json.loads(body)
+    except Exception:
+        return None
+    if isinstance(j, dict) and isinstance(j.get("agents"), int) and not isinstance(j.get("agents"), bool):
+        return {"agents": j["agents"]}
+    return None
+
+
+def gateway_sync_notices(hosts, report_version):
+    """升级 SightReport 之后的配套提醒（纯函数）：助手里登记的移动网关版本与 SightReport 不一致，就给出提醒。
+    hosts = Store.snapshot()["hosts"]；返回 [{"host", "gateway", "target", "text"}]。"""
+    res = []
+    rv = parse_version(report_version)
+    if not rv:
+        return res
+    for name, c in sorted((hosts or {}).items()):
+        gv = ((c.get("products") or {}).get(GATEWAY) or {}).get("version")
+        if not gv or not parse_version(gv) or parse_version(gv) == rv:
+            continue
+        older = parse_version(gv) < rv
+        res.append({"host": name, "gateway": gv, "target": report_version,
+                    "text": ("移动网关需同步升级到 %s：%s 上的移动网关现在是 %s（网关版本必须与 SightReport 一致）" % (report_version, name, gv)) if older
+                    else ("移动网关版本比 SightReport 新，请核对：%s 上的移动网关是 %s，SightReport 是 %s（两者版本必须一致）" % (name, gv, report_version))})
+    return res
+
+
+def gateway_backup_version(bfile):
+    m = GW_BACKUP_RE.search(bfile or "")
+    return m.group(1) if m else None
+
+
+def gateway_backup_name(version, stamp):
+    return "%s-%s-%s.bin" % (GATEWAY, re.sub(r"[^\w.]", "_", version), stamp)
+
+
+# 服务器端脚本片段 ---------------------------------------------------------------
+
+GW_PORT_FN = r'''
+port_busy(){
+  if command -v ss >/dev/null 2>&1; then ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]$1\$" && return 0
+  elif command -v netstat >/dev/null 2>&1; then netstat -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]$1\$" && return 0
+  elif (exec 3<>/dev/tcp/127.0.0.1/$1) 2>/dev/null; then return 0; fi
+  return 1
+}
+'''
+
+GW_PROBE_SH = GW_PORT_FN + r'''
+D=__DIR__; MP=__MP__; TP=__TP__; SVC=__SVC__; BIN=__BIN__
+echo "os=$(uname -s)"; echo "arch=$(uname -m)"
+if [ -r /etc/os-release ]; then . /etc/os-release; echo "distro=${PRETTY_NAME:-$ID}"; fi
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then echo systemd=1; else echo systemd=0; fi
+d="$D"; while [ ! -d "$d" ]; do d=$(dirname "$d"); done
+df -Pk "$d" 2>/dev/null | awk 'NR==2{print "disk_free_mb=" int($4/1024); print "disk_mount=" $6}'
+port_busy "$MP" && echo mobile_busy=1 || echo mobile_busy=0
+port_busy "$TP" && echo tunnel_busy=1 || echo tunnel_busy=0
+if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then echo http_tool=1; else echo http_tool=0; fi
+if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+  echo fw=firewalld; firewall-cmd --query-port=$MP/tcp >/dev/null 2>&1 && echo fw_open=1 || echo fw_open=0
+elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+  echo fw=ufw; ufw status 2>/dev/null | grep -Eq "^$MP(/tcp)?[[:space:]].*ALLOW" && echo fw_open=1 || echo fw_open=0
+else echo fw=none; fi
+[ -e "$D" ] && echo dir_exists=1 && echo "dir_entries=$(ls -A "$D" 2>/dev/null | wc -l)"
+[ -f "$D/$BIN" ] && echo dir_has_bin=1
+[ -f "$D/gateway.yaml" ] && echo dir_has_cfg=1
+if [ -f "/etc/systemd/system/$SVC.service" ]; then
+  echo unit=1; echo "unit_dir=$(sed -n 's/^WorkingDirectory=//p' "/etc/systemd/system/$SVC.service" | head -1)"
+fi
+true
+'''
+
+GW_DETECT_SH = r'''
+SVC=__SVC__; BIN=__BIN__
+u="/etc/systemd/system/$SVC.service"
+if [ -f "$u" ]; then w=$(sed -n 's/^WorkingDirectory=//p' "$u" | head -1); [ -n "$w" ] && [ -x "$w/$BIN" ] && echo "cand=$w|unit"; fi
+for p in $(pgrep -f -- "$BIN" 2>/dev/null); do
+  e=$(readlink -f "/proc/$p/exe" 2>/dev/null); [ "$(basename "$e" 2>/dev/null)" = "$BIN" ] && echo "cand=$(dirname "$e")|proc"
+done
+for d in /opt/$SVC /usr/local/$SVC /data/$SVC /srv/$SVC /root/$SVC /home/*/$SVC /opt/*/$SVC; do
+  [ -x "$d/$BIN" ] && echo "cand=$d|dir"
+done
+true
+'''
+
+# 注意：这里只读 listen / tls / hostnames 这几处配置，绝不输出 gateway.yaml 的其他内容（里面有接入令牌）
+GW_INSPECT_SH = r'''
+D=__DIR__; SVC=__SVC__; BIN=__BIN__
+R=$(readlink -f "$D")
+[ -x "$D/$BIN" ] && echo exe=1
+echo "ver=$("$D/$BIN" version 2>/dev/null | head -1)"
+if [ -f "$D/gateway.yaml" ]; then
+  echo cfg=1
+  grep -E '^listen:' "$D/gateway.yaml" | head -1 | sed 's/^/cfg_mobile=/'
+  grep -E '^[[:space:]]+listen:' "$D/gateway.yaml" | head -1 | sed 's/^/cfg_tunnel=/'
+  grep -E '^[[:space:]]+tls:' "$D/gateway.yaml" | head -1 | sed 's/^/cfg_tunnel_tls=/'
+  awk '/^[[:space:]]+hostnames:/{f=1; next} f && /^[[:space:]]+- /{print "cfg_host=" $2; next} f{f=0}' "$D/gateway.yaml"
+fi
+U="/etc/systemd/system/$SVC.service"; mine=0
+if [ -f "$U" ]; then
+  w=$(sed -n 's/^WorkingDirectory=//p' "$U" | head -1); [ "$(readlink -f "$w" 2>/dev/null)" = "$R" ] && mine=1
+  [ $mine = 0 ] && echo "other_unit_dir=$w"
+fi
+echo unit=$mine
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+  echo systemd=1
+  [ $mine = 1 ] && echo "active=$(systemctl is-active "$SVC" 2>/dev/null)"
+else echo systemd=0; fi
+for p in $(pgrep -f -- "$D/$BIN" 2>/dev/null); do
+  e=$(readlink -f "/proc/$p/exe" 2>/dev/null); [ "$(basename "$e" 2>/dev/null)" = "$BIN" ] && echo "pid=$p"
+done
+[ -f "$D/__MARKER__" ] && echo "marker=$(tr -d '\n' < "$D/__MARKER__")"
+df -Pk "$D" 2>/dev/null | awk 'NR==2{print "disk_free_mb=" int($4/1024)}'
+true
+'''
+
+
+def gateway_healthz_cmd(port, tls=True):
+    """在服务器本机访问隧道端口的 /healthz（自签证书所以用 -k）。没有 curl / wget 时退出码 127。"""
+    scheme = "https" if tls else "http"
+    return ('if command -v curl >/dev/null 2>&1; then curl -sk -m 5 %(u)s; '
+            'elif command -v wget >/dev/null 2>&1; then wget -q --no-check-certificate -T 5 -O - %(u)s; '
+            'else exit 127; fi' % {"u": shlex.quote("%s://127.0.0.1:%d/healthz" % (scheme, port))})
+
+
+def gateway_healthz(r, port, tls=True):
+    """返回 {"agents": n}；服务没起来 / 端口上不是网关返回 None；服务器没有 curl 和 wget 返回 {"agents": None, "no_tool": True}。"""
+    try:
+        code, o, _ = r.run(gateway_healthz_cmd(port, tls), timeout=20)
+    except DeployError:
+        return None
+    if code == 127:
+        return {"agents": None, "no_tool": True}
+    return parse_gateway_healthz(o.strip()) if code == 0 else None
+
+
+def gateway_wait_ready(r, inst_dir, tunnel_port, tls, timeout):
+    """等网关起来：隧道端口的 /healthz 返回 {"agents":n}。返回 (是否就绪, healthz 结果)。"""
+    t0 = time.time()
+    lid = "gwwait%d" % int(t0 * 1000)
+    last_check, h = 0, None
+    while True:
+        check_cancel()
+        el = time.time() - t0
+        h = gateway_healthz(r, tunnel_port, tls)
+        if h and h.get("no_tool"):  # 服务器没有 curl / wget：退而求其次，只看服务状态和端口
+            code, o, _ = r.run(GW_PORT_FN + 'systemctl is-active --quiet %s && port_busy %d && echo up; true' % (
+                shlex.quote(svc_of(GATEWAY)), tunnel_port))
+            h = {"agents": None, "no_tool": True} if "up" in o else None
+        if h:
+            live(lid, "")
+            ok("网关已就绪（用时 %s）" % fmt_secs(el))
+            return True, h
+        if el - last_check > 6:
+            last_check = el
+            code, o, _ = r.run("systemctl is-active %s" % shlex.quote(svc_of(GATEWAY)))
+            if o.strip() == "failed":
+                live(lid, "")
+                fail("服务启动失败（systemd 状态 failed）")
+                return False, None
+        if el > timeout:
+            live(lid, "")
+            fail("等待 %d 秒仍未就绪：隧道端口 %d 上没有返回 /healthz" % (timeout, tunnel_port))
+            return False, None
+        live(lid, "等待网关启动 … %s" % fmt_secs(el))
+        for _ in range(4):
+            check_cancel()
+            time.sleep(0.5)
+
+
+def gateway_env_findings(env, pkg_arch, mobile_port, tunnel_port, inst_dir, need_mb):
+    """首次安装的环境检查结果（纯函数，便于测试）：[(级别 ok/warn/fail, 说明)]，fail 为阻止安装的问题。"""
+    f = []
+    osname, arch = env.get("os", "?"), env.get("arch", "?")
+    if osname != "Linux":
+        f.append(("fail", "操作系统 %s —— 本工具只支持 Linux 服务器" % osname))
+    else:
+        f.append(("ok", "系统      %s  %s" % (env.get("distro", "Linux"), arch)))
+        err = gateway_arch_error(arch, pkg_arch)
+        f.append(("fail", "CPU 架构  " + err) if err else ("ok", "CPU 架构  %s，与安装包（%s）一致" % (arch, pkg_arch)))
+    if env.get("systemd") == "1":
+        f.append(("ok", "systemd   可用（网关将注册为开机自启服务）"))
+    else:
+        f.append(("fail", "systemd   不可用：移动网关通过 systemd 服务运行，这台服务器不满足"))
+    free = _int(env.get("disk_free_mb"))
+    if free < need_mb:
+        f.append(("fail", "磁盘      %s 剩余 %s，不够（至少需要 %s）" % (env.get("disk_mount", ""), human_size(free << 20), human_size(need_mb << 20))))
+    else:
+        f.append(("ok", "磁盘      %s 剩余 %s" % (env.get("disk_mount", ""), human_size(free << 20))))
+    if env.get("mobile_busy") == "1":
+        f.append(("fail", "手机侧端口 %d 已被占用" % mobile_port))
+    else:
+        f.append(("ok", "手机侧端口 %d 空闲" % mobile_port))
+    if env.get("tunnel_busy") == "1":
+        f.append(("fail", "隧道端口 %d 已被占用（SightReport 用它连网关）：请先释放，或联系技术支持改用其他隧道端口" % tunnel_port))
+    else:
+        f.append(("ok", "隧道端口 %d 空闲" % tunnel_port))
+    if env.get("http_tool") != "1":
+        f.append(("warn", "curl / wget  都没有：安装后无法自动访问 /healthz 确认，只能检查服务状态和端口"))
+    fw = env.get("fw")
+    if fw in ("firewalld", "ufw"):
+        f.append(("ok" if env.get("fw_open") == "1" else "warn",
+                  "防火墙    %s %s手机侧端口 %d" % (fw, "已放行" if env.get("fw_open") == "1" else "未放行", mobile_port)))
+    if env.get("unit") == "1" and env.get("unit_dir", "").rstrip("/") not in ("", inst_dir):
+        f.append(("fail", "这台服务器已有 %s 系统服务，指向 %s：同一台服务器只能装一套" % (GATEWAY, env["unit_dir"])))
+    if env.get("dir_has_cfg") == "1" or env.get("dir_has_bin") == "1":
+        f.append(("fail", "目录      %s 里已经有移动网关的程序 / 配置：为保住原来的令牌和证书指纹，不会覆盖" % inst_dir))
+    elif env.get("dir_exists") == "1" and _int(env.get("dir_entries")) > 0:
+        f.append(("warn", "目录      %s 已存在且非空" % inst_dir))
+    return f
+
+
+def gateway_env_report(env, pkg, inst_dir, mobile_port, tunnel_port):
+    step("环境检查")
+    need = pkg.total_size() // (1024 * 1024) * 3 + 100
+    blocking = []
+    for level, text in gateway_env_findings(env, pkg.arch, mobile_port, tunnel_port, inst_dir, need):
+        {"ok": ok, "warn": warn, "fail": fail}[level](text)
+        if level == "fail":
+            blocking.append(text.strip())
+    return blocking
+
+
+def find_gateway_installs(r):
+    code, o, _ = r.run(render(GW_DETECT_SH, svc=GATEWAY, bin=GATEWAY_BIN), sudo=True, timeout=60)
+    cands = []
+    for item in as_list(parse_kv(o).get("cand")):
+        d, _, src = item.partition("|")
+        d = d.rstrip("/")
+        if d and d not in [c[0] for c in cands]:
+            cands.append((d, src))
+    return cands
+
+
+def inspect_gateway(r, install_dir):
+    code, o, _ = r.run(render(GW_INSPECT_SH, dir=install_dir, svc=GATEWAY, bin=GATEWAY_BIN, marker=MARKER),
+                       sudo=True, timeout=60)
+    kv_ = parse_kv(o)
+    cfg = parse_gateway_config(kv_)
+    try:
+        marker = json.loads(kv_.get("marker") or "{}")
+    except Exception:
+        marker = {}
+    version = parse_gateway_version(kv_.get("ver")) or marker.get("version") or "未知"
+    return {"product": GATEWAY, "dir": install_dir, "owner": "root", "version": version, "has_config": kv_.get("cfg") == "1",
+            "unit": kv_.get("unit") == "1", "systemd": kv_.get("systemd") == "1", "active": kv_.get("active", ""),
+            "other_unit_dir": kv_.get("other_unit_dir"), "pids": as_list(kv_.get("pid")),
+            "port": cfg["mobile_port"], "mobile_port": cfg["mobile_port"], "tunnel_port": cfg["tunnel_port"],
+            "tunnel_tls": cfg["tunnel_tls"], "hostnames": cfg["hostnames"], "marker": marker, "disk_free_mb": _int(kv_.get("disk_free_mb")),
+            "db": {"kind": "none", "desc": ""}, "profile": "", "java": None}
+
+
+def locate_gateway(ctx, r, quiet=False, ask_user=True):
+    saved = (ctx.host_product(r, GATEWAY) or {}).get("install_dir")
+    cands = find_gateway_installs(r)
+    if saved:
+        code, o, _ = r.run("[ -x %s ] && echo yes" % shlex.quote(posix_join(saved, GATEWAY_BIN)), sudo=True)
+        if "yes" in o and saved not in [c[0] for c in cands]:
+            cands.append((saved, "saved"))
+    if not cands:
+        return None
+    if len(cands) == 1:
+        d = cands[0][0]
+    elif saved and saved in [c[0] for c in cands] and not ask_user:
+        d = saved
+    elif not ask_user:
+        d = cands[0][0]
+    else:
+        src_name = {"unit": "系统服务", "proc": "运行中", "dir": "目录", "saved": "上次记录"}
+        d = choose("服务器上找到多个移动网关安装，选择要操作的",
+                   [(c[0], c[0], src_name.get(c[1], c[1])) for c in cands], 1)
+        if d is None:
+            raise UserAbort()
+    if not quiet:
+        out("读取安装信息 …")
+    return inspect_gateway(r, d)
+
+
+def gateway_trial_run(r, staged_bin, expect_version):
+    """上传完成后、动服务器之前：先在服务器上试跑新程序的 `version`，架构 / 系统不兼容在这里就能发现，不会造成停机。"""
+    code, o, e = r.run("chmod 755 %(b)s && %(b)s version" % {"b": shlex.quote(staged_bin)}, sudo=True, timeout=60)
+    ver = parse_gateway_version(o)
+    if code != 0 or not ver:
+        raise DeployError("新程序在这台服务器上跑不起来：%s" % ((e or o).strip().splitlines() or ["没有输出"])[-1][:200],
+                          "确认安装包的 CPU 架构与服务器一致；/tmp 或安装目录所在分区不能用 noexec 挂载（服务器没有做任何改动）")
+    if parse_version(expect_version) and parse_version(ver) != parse_version(expect_version):
+        raise DeployError("安装包里的程序版本是 %s，与文件名里的 %s 不一致" % (ver, expect_version),
+                          "安装包可能被替换过，请重新下载（服务器没有做任何改动）")
+    ok("新程序在服务器上试跑正常（版本 %s）" % ver)
+    return ver
+
+
+def gateway_port_edit_cmd(port):
+    """init 之后把手机侧端口从默认值改成用户填的；只动顶格的 listen 这一行，改完核对。"""
+    return ("sed -i -E 's/^listen:[[:space:]]*\":%(d)d\"/listen: \":%(p)d\"/' gateway.yaml && grep -q '^listen: \":%(p)d\"' gateway.yaml"
+            % {"d": GATEWAY_MOBILE_PORT, "p": port})
+
+
+def do_gateway_install(ctx, r, pkg):
+    P = PRODUCTS[GATEWAY]
+    step("首次安装 %s %s → %s" % (pkg.name, pkg.version, r.label()))
+    tp = P["tunnel_port"]
+    try:
+        default_host = r.host if parse_gateway_hostnames(r.host)[1] is None else ""
+    except Exception:
+        default_host = ""
+
+    def validate(v):
+        if not v["dir"].startswith("/") or " " in v["dir"]:
+            return "安装目录请填不含空格的绝对路径，如 %s" % P["dir"]
+        if parse_gateway_hostnames(v["hostnames"])[1]:
+            return parse_gateway_hostnames(v["hostnames"])[1]
+        if not v["port"].isdigit() or not 0 < int(v["port"]) < 65536:
+            return "端口请填 1~65535 的数字"
+        if int(v["port"]) == tp:
+            return "手机侧端口不能和隧道端口（%d）相同" % tp
+        return None
+    vals = ask_form("安装 %s %s 到 %s" % (pkg.name, pkg.version, r.label()), [
+        {"key": "dir", "label": "安装目录", "default": P["dir"]},
+        {"key": "hostnames", "label": "SightReport 访问网关用的域名或 IP", "default": default_host,
+         "placeholder": "如 gw.example.com,203.0.113.10（多个用英文逗号分隔）",
+         "help": "会写进网关的证书里，SightReport 将用这里填的地址连接网关。填错了以后改地址要重新生成证书（接入令牌和证书指纹会跟着变）。"},
+        {"key": "port", "label": "手机访问端口", "default": str(P["port"]), "type": "number",
+         "help": "手机访问网关用的端口，需要对公网开放。SightReport 连接网关用的隧道端口固定为 %d，不对公网开放。" % tp},
+    ], validate)
+    inst_dir, mobile_port = vals["dir"].rstrip("/"), int(vals["port"])
+    hostnames, _ = parse_gateway_hostnames(vals["hostnames"])
+
+    out("检查服务器环境 …")
+    env = _gateway_probe(r, inst_dir, mobile_port, tp)
+    while env.get("mobile_busy") == "1":
+        fail("手机侧端口 %d 已被占用" % mobile_port)
+        mobile_port = int(ask("端口 %d 已被占用，换一个手机访问端口" % mobile_port, str(mobile_port + 1),
+                              validator=lambda s: None if s.isdigit() and 0 < int(s) < 65536 and int(s) != tp
+                              else "端口请填 1~65535 的数字，且不能是隧道端口 %d" % tp))
+        env = _gateway_probe(r, inst_dir, mobile_port, tp)
+    blocking = gateway_env_report(env, pkg, inst_dir, mobile_port, tp)
+    if blocking:
+        raise DeployError("环境不满足：" + "；".join(blocking))
+
+    step("确认安装计划")
+    plan = [("产品", "%s %s（%s）" % (pkg.name, pkg.version, pkg.arch)), ("服务器", r.label()), ("安装目录", inst_dir),
+            ("证书里的域名 / IP", "、".join(hostnames)), ("手机侧端口", "%d（对公网开放）" % mobile_port),
+            ("隧道端口", "%d（只允许 SightReport 所在机器访问）" % tp),
+            ("运行方式", "系统服务 %s（开机自启、崩溃自动拉起）" % P["service"])]
+    kv("安装计划", plan)
+    if not confirm("开始安装？", True, detail=["%s：%s" % x for x in plan]):
+        raise UserAbort()
+
+    staging = staging_dir(r, GATEWAY, inst_dir)
+    if r.is_root:
+        r.run("mkdir -p %s" % shlex.quote(staging), check=True)
+    upload_package(r, pkg, staging)
+    gateway_trial_run(r, posix_join(staging, "pkg", GATEWAY_BIN), pkg.version)
+
+    step("安装")
+    d, b = shlex.quote(inst_dir), shlex.quote(posix_join(inst_dir, GATEWAY_BIN))
+    marker = marker_json(GATEWAY, pkg.version, mobile_port, "", {}, None)
+    s = "set -e\nmkdir -p %s\n" % d
+    s += "cp -f %s %s.new && chmod 755 %s.new && mv -f %s.new %s\n" % (
+        shlex.quote(posix_join(staging, "pkg", GATEWAY_BIN)), b, b, b, b)
+    s += "[ ! -f %s ] || cp -f %s %s\n" % (shlex.quote(posix_join(staging, "pkg", "README.md")),
+                                          shlex.quote(posix_join(staging, "pkg", "README.md")), shlex.quote(posix_join(inst_dir, "README.md")))
+    s += heredoc(posix_join(inst_dir, MARKER), marker) + "chmod 600 %s\n" % shlex.quote(posix_join(inst_dir, MARKER))
+    r.run(s, sudo=True, check=True, what="复制程序文件", timeout=120)
+    if r.alias:  # 先记下来：即使后面某步失败，也能在服务器详情里「查看接入信息」
+        ctx.store.set_product(r.alias, GATEWAY, {"install_dir": inst_dir, "port": mobile_port, "tunnel_port": tp,
+                                                 "version": pkg.version})
+
+    # init 的输出里有接入令牌：不进本地日志，也不进时间线
+    code, o, _ = r.run("cd %s && ./%s init -hostnames %s" % (d, GATEWAY_BIN, shlex.quote(",".join(hostnames))),
+                       sudo=True, timeout=60, secret_out=True)
+    secrets = parse_gateway_secrets(o)
+    if code != 0 or not secrets["token"] or not secrets["fingerprint"]:
+        reason = "；".join(x.strip() for x in o.splitlines() if x.strip().startswith("错误"))[:200]
+        raise DeployError("生成网关配置和证书失败%s" % ("：" + reason if reason else "（没有解析到证书指纹或接入令牌）"),
+                          "登录服务器在 %s 目录手工执行 ./%s init -hostnames … 查看原因" % (inst_dir, GATEWAY_BIN))
+    ok("已生成配置文件 gateway.yaml 和隧道证书（证书指纹、接入令牌见安装完成页）")
+    if mobile_port != GATEWAY_MOBILE_PORT:
+        r.run("cd %s && %s" % (d, gateway_port_edit_cmd(mobile_port)), sudo=True, check=True, what="修改手机侧端口")
+        ok("手机侧端口已改为 %d" % mobile_port)
+
+    r.run("cd %s && ./%s install && ./%s start" % (d, GATEWAY_BIN, GATEWAY_BIN), sudo=True, check=True,
+          what="注册并启动服务", timeout=120, on_line=logline)
+    r.run("rm -rf %s" % shlex.quote(posix_join(staging, "pkg")), sudo=True)
+
+    step("等待网关启动")
+    good, h = gateway_wait_ready(r, inst_dir, tp, True, min(ctx.settings["health_timeout"], 120))
+    if r.alias:
+        ctx.store.set_product(r.alias, GATEWAY, {"install_dir": inst_dir, "port": mobile_port, "tunnel_port": tp,
+                                                 "version": pkg.version, "updated": _dt.datetime.now().strftime("%Y-%m-%d %H:%M")})
+    if not good:
+        show_logs(r, GATEWAY, inst_dir, True)
+        raise DeployError("网关没能正常启动", "看上面的日志；修正后可在产品卡上点「启动」或「重启」。接入令牌 / 证书指纹可以在服务器详情里点「查看接入信息」再次查看")
+    open_firewall(r, env, mobile_port)
+    step("安装完成")
+    ok("%s %s 已安装并启动" % (pkg.name, pkg.version))
+    wss = gateway_tunnel_url(r.host, hostnames, tp)
+    info("下一步：到 SightReport「移动 › 设置 › 网络与部署」启用移动网关，网关地址填 %s，再粘贴安装完成页上的接入令牌和证书指纹" % wss)
+    info("隧道端口 %d 请只放行给 SightReport 所在机器，不要对公网开放；手机侧端口 %d 需要对公网开放" % (tp, mobile_port))
+    if h and h.get("agents") == 0:
+        info("SightReport 还没有连上来（连接数 0），按上面的步骤在 SightReport 里启用后，这里会变成 1")
+    return {"url": None, "gateway": gateway_result(r.host, hostnames, mobile_port, tp, pkg.version, secrets, h)}
+
+
+def gateway_tunnel_url(host, hostnames, tunnel_port, tls=True):
+    """SightReport「网络与部署」里要填的网关地址。优先用证书里登记的第一个域名 / IP，没有就用 SSH 连接的地址。"""
+    h0 = (hostnames or [host])[0]
+    return "%s://%s:%d/tunnel" % ("wss" if tls else "ws", h0 if ":" not in h0 else "[%s]" % h0, tunnel_port)
+
+
+def gateway_result(host, hostnames, mobile_port, tunnel_port, version, secrets=None, health=None, tls=True):
+    """给界面的结果。secrets（指纹 + 令牌）只放在任务结果里，不写本地日志、不存本机配置。"""
+    res = {"version": version, "mobile_port": mobile_port, "tunnel_port": tunnel_port, "hostnames": list(hostnames or []),
+           "tunnel_url": gateway_tunnel_url(host, hostnames, tunnel_port, tls), "agents": (health or {}).get("agents")}
+    if secrets:
+        res.update({"fingerprint": secrets.get("fingerprint"), "token": secrets.get("token")})
+    return res
+
+
+def _gateway_probe(r, inst_dir, mobile_port, tunnel_port):
+    code, o, _ = r.run(render(GW_PROBE_SH, dir=inst_dir, mp=mobile_port, tp=tunnel_port, svc=GATEWAY, bin=GATEWAY_BIN),
+                       sudo=True, timeout=120)
+    return parse_kv(o)
+
+
+def gateway_upgrade_script(inst_dir, bfile, meta_json, staged_bin, staged_readme, marker_json_text, registered=True):
+    """升级用的后台脚本（纯函数，便于测试命令序列）：停服务 → 备份旧程序 → 替换 → 启动。
+    只动可执行文件、README.md 和安装记录；gateway.yaml 与 data/（令牌、证书私钥）一律不碰。
+    失败时在脚本里就把旧程序放回去并重新启动；结果写进 $ST（OK / FAIL:原因）。"""
+    q = shlex.quote
+    bdir = posixdir(bfile)
+    start_new = '"$BIN" start' if registered else '"$BIN" install && "$BIN" start'
+    return r'''
+D=%(d)s; BIN="$D/%(bin)s"; SVC=%(svc)s; B=%(b)s; BD=%(bd)s; NEW=%(new)s
+finish(){ echo "$1" > "$ST"; }
+say(){ echo ">> $*"; }
+gw_active(){ systemctl is-active --quiet "$SVC"; }
+restore_old(){ cp -f "$B" "$BIN.new" && chmod 755 "$BIN.new" && mv -f "$BIN.new" "$BIN"; }
+%(stop)s
+say "备份旧版本程序 …"
+mkdir -p "$BD"
+if ! cp -p "$BIN" "$B.tmp"; then
+  rm -f "$B.tmp"; say "备份失败（磁盘满或权限问题？），重新启动旧版本 …"; %(restart_old)s; finish FAIL:backup; exit 1
+fi
+mv -f "$B.tmp" "$B"
+%(meta)s
+say "替换程序 …"
+if ! { cp -f "$NEW" "$BIN.new" && chmod 755 "$BIN.new" && mv -f "$BIN.new" "$BIN"; }; then
+  rm -f "$BIN.new"; say "替换失败，恢复旧版本并启动 …"; restore_old; %(restart_old)s; finish FAIL:swap; exit 1
+fi
+%(readme)s
+%(marker)s
+chmod 600 "$D/%(markername)s"
+say "启动新版本 …"
+if ! { %(start_new)s; }; then
+  say "启动命令失败，恢复旧版本程序并启动 …"; "$BIN" stop >/dev/null 2>&1; restore_old; "$BIN" start; finish FAIL:start; exit 1
+fi
+finish OK
+''' % {"d": q(inst_dir), "bin": GATEWAY_BIN, "svc": q(GATEWAY), "b": q(bfile), "bd": q(bdir), "new": q(staged_bin),
+       "meta": heredoc(bfile + ".json", meta_json),
+       "stop": (r'''say "停止服务 …"
+"$BIN" stop >/dev/null 2>&1 || true
+i=0; while gw_active && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done
+if gw_active; then say "服务没能停止（未做任何改动）"; finish FAIL:stop; exit 1; fi'''
+                if registered else 'say "服务还没有注册为系统服务，跳过停止"'),
+       "restart_old": '"$BIN" start' if registered else "true",
+       "readme": ('[ ! -f %s ] || cp -f %s "$D/README.md" || true' % (q(staged_readme), q(staged_readme))) if staged_readme else "",
+       "marker": heredoc(posix_join(inst_dir, MARKER), marker_json_text), "markername": MARKER,
+       "start_new": start_new}
+
+
+def gateway_rollback_script(inst_dir, bfile, snap_file, snap_meta_json):
+    """回滚用的后台脚本：停服务 → （可选）把当前程序另存一份 → 用备份的程序替换 → 启动。同样不碰 gateway.yaml 与 data/。"""
+    q = shlex.quote
+    snap = (r'''say "先把当前版本另存一份：$SNAP"
+if ! cp -p "$BIN" "$SNAP.tmp"; then rm -f "$SNAP.tmp"; say "另存失败（磁盘空间不足？），已取消回滚并重新启动服务"; "$BIN" start; finish FAIL:snapshot; exit 1; fi
+mv -f "$SNAP.tmp" "$SNAP"
+''' + heredoc(snap_file + ".json", snap_meta_json)) if snap_file else ""
+    return r'''
+D=%(d)s; BIN="$D/%(bin)s"; SVC=%(svc)s; B=%(b)s; SNAP=%(snap_f)s
+finish(){ echo "$1" > "$ST"; }
+say(){ echo ">> $*"; }
+gw_active(){ systemctl is-active --quiet "$SVC"; }
+[ -s "$B" ] || { say "备份文件不存在：$B"; finish FAIL:nofile; exit 1; }
+say "停止服务 …"
+"$BIN" stop >/dev/null 2>&1 || true
+i=0; while gw_active && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done
+if gw_active; then say "服务没能停止（未做任何改动）"; finish FAIL:stop; exit 1; fi
+%(snap)s
+say "用备份的程序替换 …"
+if ! { cp -f "$B" "$BIN.new" && chmod 755 "$BIN.new" && mv -f "$BIN.new" "$BIN"; }; then
+  rm -f "$BIN.new"; say "替换失败，重新启动 …"; "$BIN" start; finish FAIL:swap; exit 1
+fi
+say "启动服务 …"
+"$BIN" start || { finish FAIL:start; exit 1; }
+finish OK
+''' % {"d": q(inst_dir), "bin": GATEWAY_BIN, "svc": q(GATEWAY), "b": q(bfile), "snap_f": q(snap_file or ""), "snap": snap}
+
+
+def gateway_list_backups(r, bdir):
+    code, o, _ = r.run("ls -1dt %s/%s-*.bin 2>/dev/null | while read f; do echo \"$f|$(du -sk \"$f\" | cut -f1)\"; done"
+                       % (shlex.quote(bdir), GATEWAY), sudo=True)
+    res = []
+    for line in o.splitlines():
+        f, _, kb = line.partition("|")
+        m = GW_BACKUP_RE.search(f)
+        res.append({"file": f, "size": _int(kb) * 1024, "version": m.group(1) if m else "?",
+                    "time": _dt.datetime.strptime(m.group(2), "%Y%m%d-%H%M%S").strftime("%Y-%m-%d %H:%M") if m else "?"})
+    return res
+
+
+def gateway_prune_backups(r, bdir, keep_n, keep):
+    old = [b["file"] for b in gateway_list_backups(r, bdir)[keep_n:] if b["file"] != keep]
+    if old:
+        r.run("rm -f %s" % " ".join(shlex.quote(f) + " " + shlex.quote(f + ".json") for f in old), sudo=True)
+        info(dim("已清理 %d 份较早的程序备份（保留最近 %d 份）" % (len(old), keep_n)))
+
+
+def gateway_installed_version(r, inst_dir):
+    code, o, _ = r.run('%s version' % shlex.quote(posix_join(inst_dir, GATEWAY_BIN)), sudo=True)
+    return parse_gateway_version(o) if code == 0 else None
+
+
+def do_gateway_upgrade(ctx, r, pkg, inst):
+    inst_dir = inst["dir"]
+    step("升级 %s：%s → %s" % (pkg.name, inst["version"], pkg.version))
+    code, o, _ = r.run("uname -m")
+    err = gateway_arch_error(o.strip(), pkg.arch)
+    if err:
+        raise DeployError(err, "没有对服务器做任何改动")
+    if not inst["has_config"]:
+        raise DeployError("%s 里没有 gateway.yaml，不像是装好的网关" % inst_dir, "首次安装请先清理这个目录，或换一个安装目录")
+    if not inst["systemd"]:
+        raise DeployError("这台服务器没有 systemd，无法管理移动网关服务")
+    if inst["pids"] and not inst["unit"]:
+        raise DeployError("网关正在以命令行方式运行（没有注册成系统服务），本工具不能安全地停止它",
+                          "请先在服务器上停掉这个进程（或执行 ./%s install 注册成服务）再升级" % GATEWAY_BIN)
+    staging = staging_dir(r, GATEWAY, inst_dir)
+    ensure_no_remote_task(r, staging)
+    cur_v, new_v = parse_version(inst["version"]), parse_version(pkg.version)
+    if cur_v and new_v and new_v == cur_v:
+        info("服务器上已经是 %s" % pkg.version)
+        if not confirm("仍然重新覆盖安装？", False):
+            return None
+    elif cur_v and new_v and new_v < cur_v:
+        fail("你选的版本 %s 比服务器上的 %s 更旧（降级）" % (pkg.version, inst["version"]))
+        if not confirm_typed("仍然要降级到 %s？" % pkg.version, "降级", detail=[
+                "移动网关版本必须与 SightReport 一致，降级前请确认 SightReport 的版本。", "推荐的做法是用「回滚」恢复升级前的程序。"]):
+            return None
+    if inst.get("other_unit_dir"):
+        warn("本机的 %s 系统服务指向另一个目录 %s，不是 %s" % (GATEWAY, inst["other_unit_dir"], inst_dir))
+        if not confirm("仍然升级 %s 里的程序？" % inst_dir, False, danger=True):
+            return None
+
+    h_before = gateway_healthz(r, inst["tunnel_port"], inst["tunnel_tls"])
+    bdir = backup_dir_for(ctx, r, GATEWAY, inst_dir)
+    stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    bfile = posix_join(bdir, gateway_backup_name(inst["version"], stamp))
+    plan = [("产品", pkg.name), ("版本", "%s → %s" % (inst["version"], pkg.version)), ("服务器", r.label()),
+            ("安装目录", inst_dir),
+            ("服务", "systemd 服务 %s，%s" % (GATEWAY, "运行中" if inst["active"] == "active" else "未运行" if inst["unit"] else "还没有注册")),
+            ("手机侧 / 隧道端口", "%d / %d" % (inst["mobile_port"], inst["tunnel_port"])),
+            ("升级前备份", "%s（旧程序，约 10 MB）" % bfile),
+            ("不会改动", "gateway.yaml 和 data/（接入令牌、证书指纹保持不变）")]
+    kv("升级计划", plan)
+    if not confirm("开始升级？", True, detail=["%s：%s" % x for x in plan] + ["", "升级过程中网关会停止几秒到几十秒，期间手机访问不了；失败时可一键回滚。"]):
+        return None
+
+    if r.is_root:
+        r.run("mkdir -p %s" % shlex.quote(staging), check=True)
+    upload_package(r, pkg, staging)  # 服务仍在运行，缩短停机时间
+    staged = posix_join(staging, "pkg", GATEWAY_BIN)
+    gateway_trial_run(r, staged, pkg.version)
+
+    marker = marker_json(GATEWAY, pkg.version, inst["mobile_port"], "", {}, None, inst["marker"])
+    meta = json.dumps({"product": GATEWAY, "version": inst["version"], "upgraded_to": pkg.version, "install_dir": inst_dir,
+                       "created": stamp, "tool": "sight-deploy " + TOOL_VERSION}, ensure_ascii=False)
+    has_readme = any(f[0] == "README.md" for f in pkg.files)
+    script = gateway_upgrade_script(inst_dir, bfile, meta, staged, posix_join(staging, "pkg", "README.md") if has_readme else None,
+                                    marker, registered=inst["unit"])
+    step("执行升级（在服务器后台运行，网络中断也会继续）")
+    status = run_detached(r, staging, "upgrade", script)
+    if status != "OK":
+        fail("升级步骤失败：%s" % status)
+        if status in ("FAIL:stop", "FAIL:backup", "FAIL:swap", "FAIL:start"):
+            info("已恢复为旧版本 %s 并重新启动，gateway.yaml 和 data/ 没有动过。" % inst["version"])
+        else:
+            code, o, _ = r.run("[ -s %s ] && echo yes" % shlex.quote(bfile), sudo=True)
+            if "yes" in o:
+                warn("后台任务意外中止，正在用刚做的备份恢复旧版本程序 …")
+                do_gateway_rollback(ctx, r, inst, bfile, snapshot=False)
+            else:
+                warn("后台任务在备份阶段中止，程序没有改动，正在重新启动服务 …")
+                r.run('%s start' % shlex.quote(posix_join(inst_dir, GATEWAY_BIN)), sudo=True)
+        show_logs(r, GATEWAY, inst_dir, True)
+        raise DeployError("升级未完成（%s）" % status)
+
+    step("核对新版本")
+    try:
+        good, h = gateway_wait_ready(r, inst_dir, inst["tunnel_port"], inst["tunnel_tls"], min(ctx.settings["health_timeout"], 120))
+    except KeyboardInterrupt:
+        raise DeployError("已停止等待：新版本 %s 已替换完毕，服务正在启动" % pkg.version,
+                          "稍后点「刷新」确认状态；如有问题用「回滚」。升级前备份：%s" % bfile)
+    ver_ok, now_v = True, None
+    if good:
+        now_v = gateway_installed_version(r, inst_dir)
+        if parse_version(now_v) != parse_version(pkg.version):
+            fail("`%s version` 报告的版本是 %s，预期 %s" % (GATEWAY, now_v or "（读不到）", pkg.version))
+            ver_ok = False
+        else:
+            ok("版本确认：%s" % now_v)
+    if not good or not ver_ok:
+        show_logs(r, GATEWAY, inst_dir, True)
+        info("升级前备份：%s" % bfile)
+        if confirm("新版本没有正常运行，回滚到升级前？", True, detail=[
+                "将用升级前备份的旧程序替换，服务恢复到 %s。gateway.yaml 和 data/ 不受影响。" % inst["version"],
+                "备份文件：%s" % bfile, "日志见上方「最近日志」。"]):
+            do_gateway_rollback(ctx, r, inst, bfile, snapshot=False)
+            raise DeployError("升级失败，已回滚到 %s" % inst["version"],
+                              "把本地日志 %s 发给技术支持排查" % LOG.path if LOG.path else None)
+        raise DeployError("升级后网关未就绪", "稍后点「刷新」「日志」查看；需要时用「回滚」")
+
+    gateway_prune_backups(r, bdir, ctx.settings["keep_backups"], keep=bfile)
+    r.run("rm -rf %s" % shlex.quote(posix_join(staging, "pkg")), sudo=True)
+    if r.alias:
+        ctx.store.set_product(r.alias, GATEWAY, {"install_dir": inst_dir, "port": inst["mobile_port"], "tunnel_port": inst["tunnel_port"],
+                                                 "version": pkg.version, "backup_dir": bdir,
+                                                 "updated": _dt.datetime.now().strftime("%Y-%m-%d %H:%M")})
+    step("升级完成")
+    ok("%s %s → %s" % (pkg.name, inst["version"], pkg.version))
+    info("升级前备份：%s" % bfile)
+    info("gateway.yaml 和 data/ 没有改动，接入令牌与证书指纹保持不变，SightReport 不用重新填写")
+    agents = (h or {}).get("agents")
+    if agents == 0:
+        warn("SightReport 还没有连上来（连接数 0）：隧道一般几十秒内会自动重连，稍后点「刷新」再看；一直是 0 请检查 SightReport「网络与部署」页")
+    elif agents:
+        ok("SightReport 已连接（连接数 %d）" % agents)
+    return {"url": None, "gateway": gateway_result(r.host, inst["hostnames"], inst["mobile_port"], inst["tunnel_port"],
+                                                   pkg.version, None, h, inst["tunnel_tls"])}
+
+
+def do_gateway_rollback(ctx, r, inst, bfile, snapshot=True):
+    """用升级前备份的旧程序替换当前的；snapshot=True 时先把当前程序另存一份（回滚本身也能撤销）。"""
+    inst_dir = inst["dir"]
+    want = gateway_backup_version(bfile)
+    step("回滚：%s" % bfile.rsplit("/", 1)[-1])
+    staging = staging_dir(r, GATEWAY, inst_dir)
+    if r.is_root:
+        r.run("mkdir -p %s" % shlex.quote(staging), check=True)
+    else:
+        r.mkdirs(staging)
+    cur = gateway_installed_version(r, inst_dir) or inst.get("version") or "unknown"
+    snap_file, snap_meta = "", ""
+    if snapshot:
+        stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        snap_file = posix_join(posixdir(bfile), gateway_backup_name(cur, stamp))
+        snap_meta = json.dumps({"product": GATEWAY, "version": cur, "install_dir": inst_dir, "created": stamp,
+                                "note": "回滚前另存", "tool": "sight-deploy " + TOOL_VERSION}, ensure_ascii=False)
+    status = run_detached(r, staging, "rollback", gateway_rollback_script(inst_dir, bfile, snap_file, snap_meta))
+    if status != "OK":
+        show_logs(r, GATEWAY, inst_dir, True)
+        raise DeployError("回滚失败：%s" % status, "当前程序已另存为 %s" % snap_file if snap_file else None)
+    good, _ = gateway_wait_ready(r, inst_dir, inst["tunnel_port"], inst["tunnel_tls"], min(ctx.settings["health_timeout"], 120))
+    ver = gateway_installed_version(r, inst_dir)
+    if good and (not want or parse_version(ver) == parse_version(want)):
+        ok("已回滚到 %s" % ver)
+        if snap_file:
+            info("回滚前的程序已另存为 %s（需要时可再用「回滚」恢复回来）" % snap_file)
+        if r.alias:
+            ctx.store.set_product(r.alias, GATEWAY, {"version": ver})
+    else:
+        show_logs(r, GATEWAY, inst_dir, True)
+        raise DeployError("回滚后网关未就绪或版本不对（现在是 %s）" % (ver or "读不到"))
+
+
+def gateway_service_action(r, inst, action):
+    """启动 / 停止 / 重启：用程序自己的 start / stop 命令（它调用 systemd）。"""
+    b = shlex.quote(posix_join(inst["dir"], GATEWAY_BIN))
+    body = {"start": "%s start" % b, "stop": "%s stop" % b, "restart": "%s stop; %s start" % (b, b)}[action]
+    name = {"start": "启动", "stop": "停止", "restart": "重启"}[action]
+    step("%s %s" % (name, PRODUCTS[GATEWAY]["name"]))
+    r.run(body, sudo=True, check=True, what=name, timeout=120, on_line=logline)
+
+
+def gateway_status_item(ctx, r, inst):
+    P = PRODUCTS[GATEWAY]
+    h = gateway_healthz(r, inst["tunnel_port"], inst["tunnel_tls"])
+    running = bool(inst["pids"]) or inst["active"] == "active"
+    bdir = backup_dir_for(ctx, r, GATEWAY, inst["dir"])
+    bs = gateway_list_backups(r, bdir)
+    saved = ctx.host_product(r, GATEWAY) or {}
+    item = {"product": GATEWAY, "name": P["name"], "kind": "gateway", "installed": True, "version": inst["version"],
+            "dir": inst["dir"], "owner": inst["owner"], "service": "systemd" if inst["unit"] else "process",
+            "active": inst["active"] or "", "running": running, "healthy": bool(h), "port": inst["mobile_port"],
+            "mobile_port": inst["mobile_port"], "tunnel_port": inst["tunnel_port"], "tunnel_tls": inst["tunnel_tls"],
+            "tunnel_url": gateway_tunnel_url(r.host, inst["hostnames"], inst["tunnel_port"], inst["tunnel_tls"]),
+            "hostnames": inst["hostnames"], "agents": (h or {}).get("agents"), "has_config": inst["has_config"],
+            "disk_free": inst["disk_free_mb"] << 20, "backups": len(bs),
+            "last_backup": "%s（%s）" % (bs[0]["time"], bs[0]["version"]) if bs else "", "url": None,
+            "registered_version": saved.get("version")}
+    return item
+
+
+# 「查看接入信息」：再次查看证书指纹和接入令牌（show 命令）
+def job_gateway_show(ctx, p):
+    r = open_host(ctx.store, p.get("host"))
+    try:
+        inst = locate_gateway(ctx, r, quiet=True, ask_user=False)
+        if not inst:
+            raise DeployError("%s 上没有找到已安装的移动网关" % r.host, "请先点「刷新」确认状态")
+        if not inst["has_config"]:
+            raise DeployError("%s 里没有 gateway.yaml" % inst["dir"])
+        step("读取接入信息")
+        code, o, _ = r.run("cd %s && ./%s show" % (shlex.quote(inst["dir"]), GATEWAY_BIN), sudo=True, timeout=60, secret_out=True)
+        secrets = parse_gateway_secrets(o)
+        if code != 0 or not secrets["token"]:
+            raise DeployError("读取接入信息失败", "登录服务器在 %s 目录执行 ./%s show 查看" % (inst["dir"], GATEWAY_BIN))
+        ok("已读取（令牌是机密，只显示在这个窗口里，不写入本地日志）")
+        if not secrets["fingerprint"]:
+            info("隧道没有启用 TLS（gateway.yaml 里 tunnel.tls: false），所以没有证书指纹")
+        return {"gateway": gateway_result(r.host, inst["hostnames"], inst["mobile_port"], inst["tunnel_port"],
+                                          inst["version"], secrets, None, inst["tunnel_tls"])}
+    finally:
+        r.close()
 
 
 
@@ -3288,7 +4209,7 @@ class Ctx:
 SITE_BASE = (os.environ.get("SIGHT_DEPLOY_SITE") or "https://www.sightdata.top").rstrip("/")
 GH_REPO = "Sight-Data/sight_deploy"
 GH_DL_PREFIX = os.environ.get("GH_DL_PREFIX", "")  # 国内访问 GitHub 慢时的下载加速前缀
-SITE_PRODUCT_IDS = {k: v["site_id"] for k, v in PRODUCTS.items()}  # 官网上线前查不到的条目当作「没有可下载的包」
+SITE_PRODUCT_IDS = {k: v["site_id"] for k, v in PRODUCTS.items() if v.get("site_id")}  # 官网上线前查不到的条目当作「没有可下载的包」
 SITE_TOOL_IDS = {"windows-x64": "dl-deploy-win", "windows7-x64": "dl-deploy-win7",
                  "mac-arm64": "dl-deploy-mac", "mac-x86_64": "dl-deploy-mac"}
 ONLINE_TTL = 600  # 秒：同一次运行里，重复检查直接用缓存
@@ -3378,6 +4299,16 @@ def _online_from_site():
             prods[pid] = {"latest": str(d["version"]), "file_name": d.get("fileName") or "", "size_text": d.get("fileSize") or "",
                           "url": "%s/downloads/file/%s" % (SITE_BASE, did), "updated": d.get("updatedAt") or "",
                           "pan_url": d.get("baiduPanUrl") or "", "pan_code": d.get("baiduPanCode") or ""}
+    variants = {}  # 移动网关：官网按 CPU 架构分三个下载项
+    for arch, spec in GATEWAY_ARCHES.items():
+        d = by.get(spec["site_id"])
+        if d and d.get("localFile") and d.get("version"):
+            variants[arch] = {"latest": str(d["version"]), "file_name": d.get("fileName") or "", "size_text": d.get("fileSize") or "",
+                              "url": "%s/downloads/file/%s" % (SITE_BASE, spec["site_id"]), "updated": d.get("updatedAt") or "",
+                              "pan_url": d.get("baiduPanUrl") or "", "pan_code": d.get("baiduPanCode") or ""}
+    if variants:  # 顶层是版本最高的一个（界面的「可升级」提示用），各架构自己的在 variants 里
+        best = max(variants.values(), key=lambda v: parse_version(v["latest"]))
+        prods[GATEWAY] = dict(best, variants=variants)
     tool, plat = None, tool_platform()
     cands = [by.get(i) for i in ("dl-deploy-win", "dl-deploy-win7", "dl-deploy-mac") if by.get(i) and by[i].get("version")]
     if cands:
@@ -3527,7 +4458,7 @@ def _local_same_file(name, size):
 
 def _check_zip_product(path, product):
     """zip 里必须有该产品的 jar（sight-wall.jar / sight-report.jar / sight-datalink.jar），防止官网条目或本机同名文件拿错包。"""
-    jar = PRODUCTS[product]["jar"]
+    jar = PRODUCTS[product]["jar"] or PRODUCTS[product].get("binary")  # 移动网关没有 jar，认可执行文件
     try:
         with zipfile.ZipFile(path) as zf:
             names = [n.rsplit("/", 1)[-1] for n in zf.namelist()]
@@ -3535,7 +4466,7 @@ def _check_zip_product(path, product):
         raise DeployError("安装包不是有效的 zip（%s）" % e)
     if jar in names:
         return
-    other = [PRODUCTS[k]["name"] for k, v in PRODUCTS.items() if v["jar"] in names]
+    other = [PRODUCTS[k]["name"] for k, v in PRODUCTS.items() if v["jar"] and v["jar"] in names]
     raise DeployError("下载到的安装包不是 %s 的（里面%s）" % (
         PRODUCTS[product]["name"], "是 " + "、".join(other) if other else "没有 " + jar),
         "已丢弃这个文件，没有部署任何东西；请到官网下载中心核对，或手动选择正确的安装包")
@@ -3549,13 +4480,21 @@ def job_download_package(ctx, p):
     if on.get("error") and not on["products"]:
         raise DeployError(on["error"], "请检查这台电脑的网络；也可以手动到 %s/downloads 下载，再把 zip 拖进「选择安装包」窗口" % SITE_BASE)
     it = on["products"].get(product)
+    arch = None
+    if is_gateway(product):  # 移动网关按 CPU 架构分包，必须指明装在什么架构的服务器上
+        arch = str(p.get("arch") or "").lower()
+        if arch not in GATEWAY_ARCHES:
+            raise DeployError("请指明服务器的 CPU 架构（amd64 / arm64 / loong64）")
+        it = ((it or {}).get("variants") or {}).get(arch)
+        pn = "%s（%s）" % (pn, GATEWAY_ARCHES[arch]["label"])
     if not it:
         raise DeployError("官网下载中心里没有找到 %s 的安装包" % pn, "请手动获取安装包后拖进窗口")
     ver = it["latest"]
     ok("%s 最新版 %s%s" % (pn, ver, "（%s）" % it["size_text"] if it.get("size_text") else ""))
-    name = _safe_name(it.get("file_name"), "%s-%s.zip" % (product, ver))
-    if _guess_pkg(name)[0] != product:  # 文件名对不上就改成程序认得的写法，保证之后能被自动发现
-        name = "%s-%s.zip" % (product, ver)
+    fallback = "%s-%s-linux-%s.zip" % (product, ver, arch) if arch else "%s-%s.zip" % (product, ver)
+    name = _safe_name(it.get("file_name"), fallback)
+    if _guess_pkg(name)[0] != product or (arch and not GATEWAY_ZIP_RE.match(name)):  # 文件名对不上就改成程序认得的写法，保证之后能被自动发现
+        name = fallback
     step("下载安装包 %s" % name)
     size = _remote_size(it["url"])
     same = _local_same_file(name, size) if size else None
@@ -3582,8 +4521,11 @@ def job_download_package(ctx, p):
             dest.unlink()
         raise
     ok("确认是 %s 的安装包" % pn)
-    return {"path": str(dest), "name": dest.name, "size": dest.stat().st_size, "product": product, "version": ver,
-            "mtime": int(dest.stat().st_mtime), "dir": str(dest.parent), "reused": bool(same)}
+    res = {"path": str(dest), "name": dest.name, "size": dest.stat().st_size, "product": product, "version": ver,
+           "mtime": int(dest.stat().st_mtime), "dir": str(dest.parent), "reused": bool(same)}
+    if arch:
+        res["arch"] = arch
+    return res
 
 
 def job_download_tool(ctx, p):
@@ -3696,12 +4638,19 @@ def job_status(ctx, p):
     r = open_host(ctx.store, p.get("host"))
     try:
         code, o, _ = r.run("uname -sm; . /etc/os-release 2>/dev/null; echo \"$PRETTY_NAME\"; uptime -p 2>/dev/null")
+        first = (o.strip().splitlines() or [""])[0]
         res = {"host": r.alias, "address": "%s@%s" % (r.user, r.host),
-               "os": " / ".join(x for x in o.strip().splitlines() if x), "products": []}
+               "os": " / ".join(x for x in o.strip().splitlines() if x), "products": [],
+               "arch": gateway_arch_of(first.split()[-1] if first.split() else "")}  # 移动网关选安装包用：amd64 / arm64 / loong64
         for prod, P in PRODUCTS.items():
             inst = locate_install(ctx, r, prod, quiet=True, ask_user=False)
             if not inst:
                 res["products"].append({"product": prod, "name": P["name"], "installed": False})
+                continue
+            if is_gateway(prod):
+                res["products"].append(gateway_status_item(ctx, r, inst))
+                ctx.store.set_product(r.alias, prod, {"install_dir": inst["dir"], "port": inst["mobile_port"],
+                                                      "tunnel_port": inst["tunnel_port"], "version": inst["version"]})
                 continue
             h = r.health(inst["port"])
             running = bool(inst["pids"]) or inst["active"] == "active"
@@ -3771,13 +4720,23 @@ def job_deploy(ctx, p):
                 r = open_host(ctx.store, name)
                 out("检查 %s 是否已安装 …" % pkg.name)
                 inst = locate_install(ctx, r, pkg.product)
-                res = do_upgrade(ctx, r, pkg, inst) if inst else do_install(ctx, r, pkg)
+                if is_gateway(pkg.product):
+                    res = do_gateway_upgrade(ctx, r, pkg, inst) if inst else do_gateway_install(ctx, r, pkg)
+                else:
+                    res = do_upgrade(ctx, r, pkg, inst) if inst else do_install(ctx, r, pkg)
                 if not res and len(hosts) == 1:
                     raise UserAbort()  # 用户在确认框里选了「取消」：整个任务算取消，而不是「完成」
                 item = {"host": name, "status": "完成" if res else "跳过", "url": (res or {}).get("url")}
-                for k in ("mode", "setup_token", "token_hint"):  # Sight DataLink 安装向导：模式与初始化令牌
+                for k in ("mode", "setup_token", "token_hint", "gateway"):  # Sight DataLink 安装向导：模式与初始化令牌；移动网关：接入信息
                     if (res or {}).get(k):
                         item[k] = res[k]
+                if res and pkg.product == "sight-report":
+                    # 升级 / 安装 SightReport 之后：助手里登记的移动网关版本与它不一致，就提醒同步升级
+                    notices = gateway_sync_notices(ctx.store.snapshot().get("hosts"), pkg.version)
+                    for n in notices:
+                        warn(n["text"])
+                    if notices:
+                        item["gateway_notices"] = notices
                 results.append(item)
             except (DeployError, UserAbort) as e:
                 results.append({"host": name, "status": "失败" if isinstance(e, DeployError) else "取消"})
@@ -3813,6 +4772,17 @@ def job_service(ctx, p):
     try:
         inst = _get_install(ctx, r, product)
         ensure_no_remote_task(r, staging_dir(r, product, inst["dir"]))
+        if is_gateway(product):
+            gateway_service_action(r, inst, action)
+            if action == "stop":
+                ok("已停止")
+                return {}
+            good, _ = gateway_wait_ready(r, inst["dir"], inst["tunnel_port"], inst["tunnel_tls"],
+                                         min(ctx.settings["health_timeout"], 120))
+            if not good:
+                show_logs(r, product, inst["dir"], inst["unit"])
+                raise DeployError("网关没能正常启动", "看上方「最近日志」")
+            return {}
         name = {"start": "启动", "stop": "停止", "restart": "重启"}[action]
         s = svc_functions(product, inst["dir"], inst["owner"], inst["unit"], inst["profile"], start_env_of(inst))
         body = {"start": "start_svc", "stop": "stop_svc && say 已停止", "restart": "stop_svc && start_svc"}[action]
@@ -3889,7 +4859,7 @@ def job_list_backups(ctx, p):
         inst = _get_install(ctx, r, product)
         bdir = backup_dir_for(ctx, r, product, inst["dir"])
         res = {"backup_dir": bdir, "current_version": inst["version"], "db_kind": inst["db"]["kind"],
-               "backups": list_backups(r, bdir, product)}
+               "backups": gateway_list_backups(r, bdir) if is_gateway(product) else list_backups(r, bdir, product)}
         if PRODUCTS[product]["schema_versioned"]:
             # 备份时记录的数据库结构版本，与当前的比较：界面据此提示外部库不能只回滚程序（后端回滚时还会再核对）
             res["current_schema_version"] = (r.health(inst["port"]) or {}).get("schemaVersion")
@@ -3908,8 +4878,14 @@ def job_rollback(ctx, p):
         inst = _get_install(ctx, r, product)
         bfile = str(p.get("file") or "")
         bdir = backup_dir_for(ctx, r, product, inst["dir"])
-        if not bfile.startswith(bdir + "/") or not bfile.endswith((".tar.gz", ".dir")) or "/.." in bfile:
+        if not bfile.startswith(bdir + "/") or not bfile.endswith((".tar.gz", ".dir", ".bin")) or "/.." in bfile:
             raise DeployError("备份文件不在备份目录里：%s" % bfile)
+        if is_gateway(product):  # 移动网关只回滚程序文件；gateway.yaml 与 data/ 本来就不会被升级改动
+            if not bfile.endswith(".bin"):
+                raise DeployError("这不是移动网关的程序备份：%s" % bfile)
+            ensure_no_remote_task(r, staging_dir(r, product, inst["dir"]))
+            do_gateway_rollback(ctx, r, inst, bfile)
+            return {}
         full = bool(p.get("full"))
         if full and inst["db"]["kind"] == "external":
             warn("外部数据库不在备份里：这次只恢复程序和 data/ 目录，数据库需要另行恢复")
@@ -3932,11 +4908,12 @@ JOB_HANDLERS = {
     "rollback": job_rollback,
     "download_package": job_download_package,
     "download_tool": job_download_tool,
+    "gateway_show": job_gateway_show,
 }
 JOB_TITLES = {"add_host": "添加服务器", "edit_host": "修改密码", "test_host": "测试连接", "status": "查询状态",
               "deploy": "安装 / 升级", "service": "启停服务", "logs": "查看日志", "follow_logs": "实时日志",
               "list_backups": "读取备份列表", "rollback": "回滚",
-              "download_package": "下载安装包", "download_tool": "下载新版部署助手"}
+              "download_package": "下载安装包", "download_tool": "下载新版部署助手", "gateway_show": "查看移动网关接入信息"}
 
 
 class Job:
@@ -4087,6 +5064,9 @@ PREFERRED_PORT = 17880
 
 
 def _guess_pkg(name):
+    gm = GATEWAY_ZIP_RE.match(name)
+    if gm:  # sight-mobile-gateway-<版本>-linux-<架构>.zip
+        return GATEWAY, gm.group(1)
     prefixes = "|".join(re.escape(v["zip_prefix"]) for v in PRODUCTS.values())
     m = re.match(r"(%s)(?:-(\d[\w.]*?))?\.(?:zip|jar)$" % prefixes, name)
     return (m.group(1), m.group(2)) if m else (None, None)
@@ -4102,6 +5082,9 @@ def api_packages():
     for f in find_packages():
         it = _file_item(f)
         it["product"], it["version"] = _guess_pkg(f.name)
+        gm = GATEWAY_ZIP_RE.match(f.name)
+        if gm:
+            it["arch"] = gm.group(2).lower()
         res.append(it)
     return res
 
@@ -4175,7 +5158,8 @@ def api_state():
     return {"version": TOOL_VERSION, "busy": APP.busy(), "settings": APP.ctx.settings, "hosts": hosts,
             "products": {k: {"name": v["name"], "port": v["port"], "dir": v["dir"], "zip_prefix": v["zip_prefix"],
                              "setup_path": v["setup_path"], "setup_token": v["setup_token"],
-                             "rolling_upgrade": v["rolling_upgrade"], "schema_versioned": v["schema_versioned"]}
+                             "rolling_upgrade": v["rolling_upgrade"], "schema_versioned": v["schema_versioned"],
+                             "kind": v.get("kind", "java"), "tunnel_port": v.get("tunnel_port")}
                          for k, v in PRODUCTS.items()},
             "log_path": str(LOG.path or "")}
 

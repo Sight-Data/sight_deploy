@@ -30,7 +30,10 @@
                                "setup_path": "/setup", "setup_token": false, "rolling_upgrade": true, "schema_versioned": false},
                "sight-wall": {...},
                "sight-datalink": {"name": "Sight DataLink", "port": 18680, "dir": "/opt/sight-datalink", "zip_prefix": "sight-datalink",
-                              "setup_path": "/", "setup_token": true, "rolling_upgrade": false, "schema_versioned": true}},
+                              "setup_path": "/", "setup_token": true, "rolling_upgrade": false, "schema_versioned": true},
+               "sight-mobile-gateway": {"name": "Sight 移动网关", "port": 8080, "tunnel_port": 7443, "dir": "/opt/sight-mobile-gateway",
+                              "zip_prefix": "sight-mobile-gateway", "setup_path": null, "setup_token": false,
+                              "rolling_upgrade": true, "schema_versioned": false, "kind": "gateway"}},
   "log_path": "/Users/x/.sight-deploy/logs/sight-deploy-20261010.log"
 }
 ```
@@ -40,6 +43,7 @@
 - `setup_path`：未初始化时让实施人员打开的地址（SightReport / SightWall 是 `/setup`，Sight DataLink 的安装向导在根路径 `/`）。
 - `setup_token`：初始化要用服务日志里的一次性令牌（Sight DataLink）。
 - `rolling_upgrade=false`：多选服务器时不做自动滚动升级（Sight DataLink 集群共用外部库），要提示先全部停止、再逐台升级。
+- `kind`：`"gateway"` = 非 Java 产品（Sight 移动网关：Go 单文件程序，部署在 DMZ 前置机上；没有 Java / 数据库 / `/api/health`，安装包名是 `sight-mobile-gateway-<版本>-linux-<amd64|arm64|loong64>.zip`）。界面按它换产品卡和安装完成页；其余产品没有这个字段（当作 Java 产品）。`tunnel_port` 是它的默认隧道端口，`port` 是默认手机侧端口。
 - `schema_versioned=true`：健康检查报告数据库结构版本（Flyway `schemaVersion`），升级时记进备份元数据，回滚前核对。
 
 `POST /api/settings` `{"keep_backups": 3, "health_timeout": 300, "auto_check": true}` → `{"ok": true}`（`auto_check` 可省略：是否在启动时自动联网检查更新，默认开）
@@ -65,6 +69,7 @@
 - `tool` 可能为 null（官网和 GitHub 都没连上）；`can_download=false` 表示这个系统没有现成的安装包（如 Linux 源码运行），界面只给「打开下载中心」。
 - Intel Mac 的部署助手只在 GitHub Release 里，下载地址会指向 GitHub（可用环境变量 `GH_DL_PREFIX` 加速）。
 - `products` 里没有的产品，说明官网没有可下载的包。
+- `sight-mobile-gateway` 按 CPU 架构分三个官网条目（`dl-gateway-linux-amd64` / `-arm64` / `-loong64`）：顶层 `latest` 等字段是版本最高的一个，另有 `variants: {"amd64": {"latest", "file_name", "size_text", "url", ...}, "arm64": {...}}`，只含官网上有安装包文件的架构。界面选包时按服务器架构列出对应条目。
 
 `POST /api/reveal` → `{"ok": true}`：在文件管理器里显示刚下载的新版部署助手（只认 `download_tool` 保存的那个文件）。
 
@@ -76,7 +81,7 @@
   "size": 258824866, "mtime": 1791518682, "dir": "/Users/x/Downloads",
   "product": "sight-report", "version": "2.0.71"}]
 ```
-（`product` / `version` 由文件名猜，可能为 null）
+（`product` / `version` 由文件名猜，可能为 null；移动网关的包另有 `"arch": "amd64|arm64|loong64"`）
 
 `GET /api/jdks` → 同上结构（无 product/version），自动发现的 JDK 压缩包。
 
@@ -102,13 +107,14 @@
 | `edit_host` | `name, password` 或 `name, key_passphrase` | `{"name": ...}` |
 | `test_host` | `name` | `{"root": true}` |
 | `status` | `host` | 见下 |
-| `deploy` | `hosts: [名字...], package: 本机路径, product`（可选：从产品卡点的是哪个产品，包不对时直接失败） | `{"results": [{"host": "生产-1", "status": "完成/跳过/失败/取消", "url": "http://..."}]}`；Sight DataLink 升级后持续 60 秒处于 `mode=waiting`（连不上元数据库）按未就绪处理：`fail` 事件「服务已启动但连不上元数据库（等待模式…）」+ `info`「最近一次连接错误：…」（健康检查的 `lastError`，口令打码），随后照常显示日志并 `confirm` 是否回滚；首次安装还可能有 `mode`（`setup` 安装向导 / `waiting` 等元数据库）、`setup_token`（从服务日志取到的初始化令牌）、`token_hint`（没取到令牌时的说明，如「令牌为部署时设置的 FDL_SETUP_TOKEN」） |
+| `deploy` | `hosts: [名字...], package: 本机路径, product`（可选：从产品卡点的是哪个产品，包不对时直接失败） | `{"results": [{"host": "生产-1", "status": "完成/跳过/失败/取消", "url": "http://..."}]}`；Sight DataLink 升级后持续 60 秒处于 `mode=waiting`（连不上元数据库）按未就绪处理：`fail` 事件「服务已启动但连不上元数据库（等待模式…）」+ `info`「最近一次连接错误：…」（健康检查的 `lastError`，口令打码），随后照常显示日志并 `confirm` 是否回滚；首次安装还可能有 `mode`（`setup` 安装向导 / `waiting` 等元数据库）、`setup_token`（从服务日志取到的初始化令牌）、`token_hint`（没取到令牌时的说明，如「令牌为部署时设置的 FDL_SETUP_TOKEN」）；移动网关的结果项另有 `gateway`（见下「Sight 移动网关」），升级 SightReport 后若助手里登记的某台服务器的移动网关版本不同，结果项有 `gateway_notices: [{"host", "gateway", "target", "text"}]`（`text` 形如「移动网关需同步升级到 2.0.96：前置机 上的移动网关现在是 2.0.95 …」），同时时间线上有 `warn` |
 | `service` | `host, product, action("start"/"stop"/"restart")` | `{}` |
 | `logs` | `host, product, lines(默认200)` | `{"text": "日志文本"}` |
 | `follow_logs` | `host, product` | 不会自己结束；通过 `log` 事件推送新行，用户点「停止」→ cancel |
 | `list_backups` | `host, product` | `{"backup_dir": "...", "current_version": "2.0.71", "db_kind": "h2/external/none", "backups": [{"file": "...", "version": "2.0.69", "time": "2026-10-10 01:16", "size": 30000000}]}`；`schema_versioned` 的产品（Sight DataLink）另有 `current_schema_version` 和每份备份的 `schema_version`（备份时记录的数据库结构版本，旧备份为 null） |
 | `rollback` | `host, product, file, full(bool)` | `{}`。Sight DataLink：外部库且备份时记录的结构版本与当前不同 → 直接失败（不论 `full`），提示先用数据库备份恢复；读不到版本时会用 `confirm` 再问一次 |
-| `download_package` | `product`（`sight-report` / `sight-wall` / `sight-datalink`；官网条目 id 分别是 `dl-report` / `dl-wall` / `dl-datalink`） | `{"path", "name", "size", "product", "version", "mtime", "dir", "reused"}`：从官网下载该产品最新版到 `~/.sight-deploy/uploads/`（断点续传、zip 完整性校验）；本机常用位置已有同名同大小的包就直接复用（`reused=true`）。拿到的 `path` 直接用于 `deploy` |
+| `gateway_show` | `host` | `{"gateway": {...}}`：再次查看移动网关的证书指纹和接入令牌（服务器上执行 `show`），字段同下「Sight 移动网关」的 `gateway`；令牌只在结果里，不进本地日志 |
+| `download_package` | `product`（`sight-report` / `sight-wall` / `sight-datalink` / `sight-mobile-gateway`；官网条目 id 分别是 `dl-report` / `dl-wall` / `dl-datalink` / `dl-gateway-linux-<arch>`），移动网关另需 `arch`（`amd64` / `arm64` / `loong64`），结果里也带 `arch` | `{"path", "name", "size", "product", "version", "mtime", "dir", "reused"}`：从官网下载该产品最新版到 `~/.sight-deploy/uploads/`（断点续传、zip 完整性校验）；本机常用位置已有同名同大小的包就直接复用（`reused=true`）。拿到的 `path` 直接用于 `deploy` |
 | `download_tool` | 无 | `{"path", "name", "dir", "version", "howto": [...], "can_apply"}`：下载新版部署助手到「下载」目录；已是最新时失败。下载本身不会替换正在运行的程序；Windows 打包版 `can_apply=true`，可再调 `POST /api/apply_update` 自更新 |
 
 `status` 结果：
@@ -131,6 +137,21 @@
    "db": "尚未配置（还没走安装向导）", "db_kind": "none", ...}
  ]}
 ```
+`status` 结果顶层另有 `arch`（服务器 CPU 对应的安装包架构：`amd64` / `arm64` / `loong64`，不认识为 null），移动网关选安装包用。
+
+Sight 移动网关（`kind: "gateway"`）的 `status` 项没有 Java / 数据库 / 初始化相关字段，而是：
+```json
+{"product": "sight-mobile-gateway", "name": "Sight 移动网关", "kind": "gateway", "installed": true, "version": "2.0.96",
+ "dir": "/opt/sight-mobile-gateway", "service": "systemd", "active": "active", "running": true,
+ "healthy": true,                      // 隧道端口 /healthz 返回了 {"agents":n}
+ "agents": 1,                          // SightReport 连进来的数量；0 = 「SightReport 还没有连上来」；null = 服务器没有 curl / wget 读不到
+ "port": 8080, "mobile_port": 8080, "tunnel_port": 7443, "tunnel_tls": true,
+ "tunnel_url": "wss://gw.example.com:7443/tunnel",   // 证书里登记的第一个域名 / IP（没有就用 SSH 地址）
+ "hostnames": ["gw.example.com"], "has_config": true, "disk_free": 18400000000, "backups": 1, "last_backup": "2026-10-20 14:02（2.0.68）",
+ "registered_version": "2.0.96"}
+```
+`url` 为 null（没有给人打开的页面）。
+
 Sight DataLink 的数据库描述来自 `data/datalink.properties` 的 `DB_URL`（Java properties 转义），部署方在 systemd 环境、进程环境或 `sight-datalink.env` 里给的 `DB_URL` 优先。
 
 ### 任务事件
@@ -177,6 +198,22 @@ Sight DataLink 的数据库描述来自 `data/datalink.properties` 的 `DB_URL`�
 
 `POST /api/jobs/<id>/cancel` → 请求中止。说明：升级的关键步骤在服务器后台执行，取消只是「停止等待」，后端会在时间线里说明。
 
+### Sight 移动网关
+
+非 Java 产品，`deploy` / `service` / `logs` / `follow_logs` / `list_backups` / `rollback` / `status` 都按 `product: "sight-mobile-gateway"` 走同一批接口，差别：
+
+- **安装**（服务器上没有网关）：问一个 `form`（安装目录；`hostnames` = SightReport 访问网关用的域名或 IP，可多个，逗号分隔；`port` = 手机访问端口，默认 8080），再 `confirm` 安装计划。环境检查有阻止安装的项（CPU 架构与包不符、没有 systemd、端口被占用、磁盘不足、目标目录里已有 `gateway.yaml` / 程序）时任务失败，不做任何改动；手机侧端口被占用时会再问一个新端口。之后：上传 → 在服务器上试跑 `version` → `init -hostnames …`（输出里的指纹和令牌**不进本地日志、不进时间线**）→ 需要时把 `listen` 改成所填端口 → `install` → `start` → 等 `/healthz`。结果项：
+  ```json
+  {"host": "前置机", "status": "完成", "url": null,
+   "gateway": {"version": "2.0.96", "mobile_port": 8080, "tunnel_port": 7443, "hostnames": ["gw.example.com"],
+               "tunnel_url": "wss://gw.example.com:7443/tunnel", "agents": 0,
+               "fingerprint": "BA:DE:…（SHA-256，冒号分隔）", "token": "接入令牌（机密）"}}
+  ```
+  `fingerprint` / `token` 只在**首次安装**和 `gateway_show` 的结果里有（只存在内存里，不写本地日志和 `hosts.json`）；升级结果的 `gateway` 没有这两项（令牌和指纹没变）。隧道没启用 TLS（`tunnel.tls: false`）时没有 `fingerprint`。
+- **升级**：`confirm` 升级计划 →（服务仍在运行时）上传 → 试跑新程序 → 后台脚本「停止 → 备份旧程序 → 替换 → 启动」→ 核对 `version` 与 `/healthz`；失败时 `confirm` 是否回滚。**不会**碰 `gateway.yaml` 和 `data/`。降级要输入「降级」确认。
+- **`list_backups`**：备份是 `<备份目录>/sight-mobile-gateway-<版本>-<时间>.bin`（`db_kind` 恒为 `"none"`）；**`rollback`**：`file` 必须是这样的 `.bin` 文件，`full` 被忽略（只换回旧程序；当前程序会先另存一份，回滚也能撤销）。
+- **`service`**：用程序自己的 `start` / `stop`，启动后等 `/healthz`。
+
 ## 页面要做的事（产品需求）
 
 1. **服务器列表**（左栏）：名字、user@host、已知产品徽标；「+ 添加服务器」。选中一台就跑 `status` 任务，结果显示在右侧。
@@ -195,7 +232,12 @@ Sight DataLink 的数据库描述来自 `data/datalink.properties` 的 `DB_URL`�
 7. **添加服务器**：表单（地址、SSH 端口 22、账号 root、登录方式 密码/密钥文件、密码 / 私钥路径（带「浏览…」）+ 私钥密码、名称（默认=地址））→ `add_host` 任务（会做连接测试；任务里可能还会问 sudo 密码）。成功后列表刷新并选中它。
 8. **设置**：升级备份保留份数（Sight DataLink 升级前做的 pg_dump 元数据库备份同样按它清理）、等待服务就绪秒数。页脚显示本地日志路径（可复制）与「退出程序」。
 9. 首次打开且没有服务器时，右侧显示引导：三步说明（添加服务器 → 选择安装包 → 一键安装/升级）+ 大号「添加服务器」按钮。
-10. **在线更新提示**：启动后（设置里没关「启动时自动检查更新」）后台调 `GET /api/online`：
+10. **Sight 移动网关**（`products[id].kind === "gateway"`）：
+    - 产品卡：版本、服务状态、「SightReport 连接数」（0 时黄色提示「SightReport 还没有连上来」并说明去 SightReport「移动 › 设置 › 网络与部署」启用）、网关地址（`tunnel_url`）、手机端口 / 隧道端口（隧道端口提示只放行 SightReport 所在机器）；按钮多一个「查看接入信息」（`gateway_show`）。未安装卡提示要装在手机能访问到的前置机（DMZ）上，不是 SightReport 所在的机器。
+    - 版本配套：助手里知道的 SightReport 版本（所有服务器里最高的）与网关版本不一致时，卡片上提示「移动网关需同步升级到 x.y.z」。
+    - 选安装包：官网条目按架构各一条（`variants`）；已知服务器架构（`status.arch`）时只列匹配的，本机包架构不符的打「与服务器架构不符」标，点「下一步」时直接拦下；`download_package` 要带 `arch`。
+    - 安装完成页：`results[].gateway.token` 存在时醒目显示「网关地址 / 证书指纹 / 接入令牌」三项（各有复制按钮）、下一步三步说明和端口放行提醒；升级完成页只显示版本和「令牌与指纹没变」。回滚对话框没有「恢复范围」，只换回旧程序。
+11. **在线更新提示**：启动后（设置里没关「启动时自动检查更新」）后台调 `GET /api/online`：
     - 部署助手有新版本 → 页面顶部横幅「下载新版本 / 忽略此版本」，侧栏版本号旁出现「有新版本」；点「下载新版本」跑 `download_tool`，成功后提供「在文件夹中显示」；Windows 打包版还提供「立即更新并重启」（`POST /api/apply_update`：写 `~/.sight-deploy/update.ps1`，等本进程退出后用新 exe 覆盖当前 exe 并重新启动，覆盖失败就直接启动下载的 exe）。
     - 产品卡：已安装版本低于官网最新时，版本旁出现「官网有 X」标签和一条提示；点「升级」自动预选版本最高的包（本机包与官网最新版里选高的，同版本优先用本机的）。
     - 侧栏「检查更新」：强制刷新（`?refresh=1`）并弹出汇总（部署助手、两个产品的最新版本、哪些已添加的服务器可升级）；连不上官网时说明原因。

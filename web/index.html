@@ -252,6 +252,18 @@ svg{width:1em;height:1em;flex:none;vertical-align:-.125em}
 .tok .tv{display:flex;align-items:center;gap:8px;margin:8px 0 6px}
 .tok code{flex:1;min-width:0;font-family:var(--mono);font-size:15px;letter-spacing:.02em;padding:7px 10px;background:#fbf7ec;border:1px dashed #e2c06b;border-radius:7px;word-break:break-all;user-select:all;color:var(--ink)}
 .tok .tn{font-size:12.5px;color:var(--ink2);line-height:1.55}
+.gwbox{margin-top:12px;padding:14px 16px;background:#fff;border:2px solid #e2b04a;border-radius:12px;box-shadow:0 2px 6px rgba(30,50,90,.08)}
+.gwbox h5{margin:0 0 4px;font-size:15px;color:#80510a;display:flex;align-items:center;gap:6px}
+.gwbox .gsub{font-size:12.5px;color:var(--ink2);margin-bottom:10px;line-height:1.55}
+.gwbox .gr{margin:8px 0}
+.gwbox .gl{font-size:12.5px;font-weight:600;color:var(--ink2);margin-bottom:3px}
+.gwbox .gv{display:flex;align-items:center;gap:8px}
+.gwbox code{flex:1;min-width:0;font-family:var(--mono);font-size:14px;letter-spacing:.02em;padding:7px 10px;background:#fbf7ec;border:1px dashed #e2c06b;border-radius:7px;word-break:break-all;user-select:all;color:var(--ink)}
+.gwbox ol{margin:10px 0 0;padding-left:20px;font-size:13px;line-height:1.7;color:var(--ink)}
+.gwbox .gw-warn{margin-top:10px;font-size:12.5px;color:#80510a;background:var(--warn-bg);border-radius:8px;padding:8px 10px;line-height:1.6}
+.gwbox.plain{border:1px solid var(--line);box-shadow:none}
+.gwbox .mono,.note .mono{font-family:var(--mono);font-size:12.5px}
+.gwbox.plain h5{color:var(--ink)}
 .chk{display:flex;align-items:flex-start;gap:8px;cursor:pointer;padding:8px 10px;border:1px solid var(--line2);border-radius:8px;background:#fff}
 .chk input{margin-top:4px}
 .chk.on{border-color:var(--accent);background:var(--accent-bg)}
@@ -581,6 +593,7 @@ function buildPicker(opts) {
     var b = h('button', { class: 'pk', type: 'button', 'data-path': p.path, html:
       '<div class="fi">' + ico('box') + '</div><div class="pm"><div class="pn">' + esc(p.name) +
       (prod ? '<span class="tag">' + esc(prod) + (p.version ? ' ' + esc(p.version) : '') + '</span>' : '') +
+      (p.arch ? archTag(p.arch) : '') + (p.arch && opts.arch && p.arch !== opts.arch ? '<span class="tag" style="background:var(--warn-bg);color:var(--warn)">与服务器架构不符</span>' : '') +
       '</div><div class="pd" title="' + esc(p.dir) + '">' + esc(p.dir) + '</div></div><div class="ps">' + fmtSize(p.size) + '<small>' + fmtTime(p.mtime) + '</small></div>' });
     b.addEventListener('click', function () { setSel(p); });
     return b;
@@ -591,6 +604,15 @@ function buildPicker(opts) {
     Object.keys(S.online.products).forEach(function (pid) {
       if (opts.prefer && pid !== opts.prefer) return;
       var o = S.online.products[pid];
+      if (isGw(pid)) { /* 移动网关按 CPU 架构分包：每个架构一个官网条目 */
+        Object.keys(o.variants || {}).forEach(function (ar) {
+          var v = o.variants[ar];
+          if (opts.arch && ar !== opts.arch) return; // 已知服务器架构时只列匹配的
+          if (items.some(function (p) { return p.product === pid && p.arch === ar && p.version && verCmp(p.version, v.latest) === 0; })) return;
+          res.push({ online: true, path: 'online:' + pid + ':' + ar, product: pid, arch: ar, version: v.latest, name: v.file_name || (pid + '-' + v.latest + '-linux-' + ar + '.zip'), size: 0, size_text: v.size_text, mtime: 0, dir: '' });
+        });
+        return;
+      }
       if (items.some(function (p) { return p.product === pid && p.version && verCmp(p.version, o.latest) === 0; })) return; // 本机已有同版本
       res.push({ online: true, path: 'online:' + pid, product: pid, version: o.latest, name: o.file_name || (pid + '-' + o.latest + '.zip'), size: 0, size_text: o.size_text, mtime: 0, dir: '' });
     });
@@ -599,7 +621,7 @@ function buildPicker(opts) {
   function onlineItem(p) {
     var b = h('button', { class: 'pk online', type: 'button', 'data-path': p.path, html:
       '<div class="fi">' + ico('upload') + '</div><div class="pm"><div class="pn">' + esc(productName(p.product) + ' ' + p.version) +
-      '<span class="tag new">官网最新</span></div><div class="pd">从官网下载中心下载，选中后点「下一步」自动下载并校验</div></div><div class="ps">' + esc(p.size_text || '') + '<small>需要联网</small></div>' });
+      '<span class="tag new">官网最新</span>' + archTag(p.arch) + '</div><div class="pd">从官网下载中心下载，选中后点「下一步」自动下载并校验</div></div><div class="ps">' + esc(p.size_text || '') + '<small>需要联网</small></div>' });
     b.addEventListener('click', function () { setSel(p); });
     return b;
   }
@@ -647,7 +669,7 @@ function buildPicker(opts) {
   /* 预选：本机包和官网最新版里版本最高的；同版本优先用本机的（不用下载） */
   function autoPick() {
     if (sel || !opts.autoSelect || !opts.prefer || !localDone || !onlineDone) return;
-    var c = items.filter(function (p) { return p.product === opts.prefer; }).concat(onlineItems());
+    var c = items.filter(function (p) { return p.product === opts.prefer && (!opts.arch || !p.arch || p.arch === opts.arch); }).concat(onlineItems());
     c.sort(function (a, b) { return verCmp(b.version, a.version) || ((a.online ? 1 : 0) - (b.online ? 1 : 0)) || (b.mtime - a.mtime); });
     if (c[0]) setSel(c[0]);
   }
@@ -679,7 +701,7 @@ function buildPicker(opts) {
       if (xhr.status === 403) { fatal('warn', '会话已失效', '请重新打开 Sight 部署助手。', true); return; }
       if (xhr.status >= 300 || !j || !j.path) { toast((j && j.error) || '复制失败，请改用「浏览…」选择文件'); return; }
       var g = guessPkg(file.name);
-      var p = { path: j.path, name: file.name, size: file.size, mtime: Math.floor(Date.now() / 1000), dir: j.path.replace(/[\\\/][^\\\/]*$/, ''), product: g.product, version: g.version };
+      var p = { path: j.path, name: file.name, size: file.size, mtime: Math.floor(Date.now() / 1000), dir: j.path.replace(/[\\\/][^\\\/]*$/, ''), product: g.product, version: g.version, arch: g.arch };
       items.unshift(p); if (kind !== 'key') renderList(); setSel(p);
     };
     xhr.onerror = function () { uploading = false; resetDrop(); toast('复制失败：与本地程序的连接中断'); };
@@ -778,6 +800,10 @@ function refreshState() {
 }
 function productName(id) { return S.state && S.state.products[id] ? S.state.products[id].name : id; }
 function productInfo(id) { return (S.state && S.state.products && S.state.products[id]) || {}; }
+function isGw(id) { return productInfo(id).kind === 'gateway'; }
+var ARCH_LABEL = { amd64: 'x86_64', arm64: 'ARM64', loong64: '龙芯' };
+function archTag(a) { return a ? '<span class="tag gray">' + esc(ARCH_LABEL[a] || a) + '</span>' : ''; }
+function hostArch(name) { var r = name && S.status[name]; return r && r.arch ? r.arch : null; }
 function allProductNames() { return S.state && S.state.products ? Object.keys(S.state.products).map(productName).join(' / ') : 'SightReport / SightWall'; }
 /* 安装包文件名 → 产品：<zip_prefix>-<版本>.zip（如 sight-report-2.0.71.zip、sight-datalink-0.2.0.zip） */
 function guessPkg(name) {
@@ -787,9 +813,10 @@ function guessPkg(name) {
     var pre = (productInfo(ids[i]).zip_prefix || ids[i]).toLowerCase(), low = String(name || '').toLowerCase();
     if (low.indexOf(pre) !== 0) continue;
     var m = /^[-_]v?(\d+(?:\.\d+)+)/.exec(low.slice(pre.length));
-    if (m) return { product: ids[i], version: m[1] };
+    var am = /-linux-(amd64|arm64|loong64)\.zip$/.exec(low);
+    if (m) return { product: ids[i], version: m[1], arch: am ? am[1] : null };
   }
-  return { product: null, version: null };
+  return { product: null, version: null, arch: null };
 }
 
 /* ---------- job runner ---------- */
@@ -1093,12 +1120,36 @@ function resultSummary(j) {
     });
     wrap.appendChild(box);
     r.results.forEach(function (x) { var t = tokenBox(x, r.results.length > 1); if (t) wrap.appendChild(t); });
+    r.results.forEach(function (x) { var g = gatewayBox(x.gateway, x.status === '完成', r.results.length > 1 ? x.host : null); if (g) wrap.appendChild(g); });
+    r.results.forEach(function (x) { (x.gateway_notices || []).forEach(function (n) { wrap.appendChild(h('div', { class: 'tok' }, [h('div', { class: 'tt', html: ico('bang') + '<span>' + esc(n.text) + '</span>' }), h('div', { class: 'tn' }, ['到该服务器的「Sight 移动网关」卡片点「升级」，选择 ' + n.target + ' 的网关安装包。'])])); }); });
   }
+  if (j.kind === 'gateway_show' && r.gateway) { var g0 = gatewayBox(r.gateway, true, null, true); if (g0) wrap.appendChild(g0); }
   if (j.kind === 'download_tool' && r.path) {
     wrap.appendChild(h('div', { class: 'small', style: 'color:var(--ink2);font-size:13px;margin-top:4px;word-break:break-all' }, ['已保存到：' + r.path]));
     wrap.appendChild(h('ol', { style: 'margin:6px 0 0;padding-left:20px;color:var(--ink2);font-size:13px' }, (r.howto || []).map(function (x) { return h('li', null, [x]); })));
   }
   return wrap;
+}
+/* Sight 移动网关：安装完成页 / 查看接入信息。证书指纹和接入令牌只在这里显示（日志和本机配置里都没有），可复制 */
+function gatewayBox(g, okState, hostLabel, viewOnly) {
+  if (!g || !okState) return null;
+  var pre = hostLabel ? hostLabel + '：' : '';
+  if (!g.token) { /* 升级结果：令牌与指纹没变，不用重新填 */
+    var warn0 = g.agents === 0 ? '<div class="gw-warn">SightReport 还没有连上来（连接数 0）：隧道一般几十秒内会自动重连，稍后在服务器详情里点「刷新」再看；一直是 0 请检查 SightReport「移动 › 设置 › 网络与部署」。</div>' : '';
+    return h('div', { class: 'gwbox plain', html: '<h5>' + ico('check') + '<span>' + esc(pre + '移动网关已升级到 ' + (g.version || '')) + '</span></h5>' +
+      '<div class="gsub">gateway.yaml 和 data/ 没有改动，<b>接入令牌与证书指纹保持不变</b>，SightReport 里不用重新填写。' + (g.agents ? ' SightReport 已连接（连接数 ' + esc(g.agents) + '）。' : '') + '</div>' + warn0 });
+  }
+  function row(label, val, cp) { return '<div class="gr"><div class="gl">' + label + '</div><div class="gv"><code>' + esc(val) + '</code>' + copyBtn(val, cp) + '</div></div>'; }
+  var rows = row('网关地址（填到 SightReport）', g.tunnel_url || '', '复制地址') +
+    (g.fingerprint ? row('证书指纹 SHA-256', g.fingerprint, '复制指纹') : '<div class="gr"><div class="gl">证书指纹</div><div class="gsub">隧道没有启用 TLS，没有指纹。</div></div>') +
+    row('接入令牌（机密）', g.token, '复制令牌');
+  var steps = '<ol><li>打开 SightReport 管理端「<b>移动 › 设置 › 网络与部署</b>」，找到「移动网关」，选择<b>启用</b>。</li>' +
+    '<li>「网关地址」填 <span class="mono">' + esc(g.tunnel_url || '') + '</span>，粘贴上面的「接入令牌」和「证书指纹」，保存。</li>' +
+    '<li>回到本助手，点服务器详情里的「刷新」：「SightReport」一行显示「已连接」就成功了；再用页面上的二维码让手机扫一下做连通自检。</li></ol>';
+  var warn1 = '<div class="gw-warn">隧道端口 <b>' + esc(g.tunnel_port) + '</b> 只放行给 SightReport 所在机器，<b>不要对公网开放</b>；手机端口 <b>' + esc(g.mobile_port) + '</b> 需要对公网开放。' +
+    '接入令牌是机密，请只转交给负责 SightReport 的同事，不要发到群里或工单里。' + (viewOnly ? '' : '关闭这个窗口后，可以随时在服务器详情的「Sight 移动网关」卡片点「查看接入信息」再次查看。') + '</div>';
+  return h('div', { class: 'gwbox', html: '<h5>' + ico('bang') + '<span>' + esc(pre + (viewOnly ? '移动网关接入信息' : '下一步：把这三项填到 SightReport')) + '</span></h5>' +
+    '<div class="gsub">' + (viewOnly ? '来自服务器上的 <span class="mono">show</span> 命令，与安装时一致。' : '网关已安装并启动，但 SightReport 还没有连上来，需要在 SightReport 里启用。') + '</div>' + rows + steps + warn1 });
 }
 /* Sight DataLink 安装向导：初始化令牌（一次性凭据，只在本次操作的结果里显示） */
 function tokenBox(x, multi) {
@@ -1123,7 +1174,10 @@ function tokenBox(x, multi) {
 function bannerText(j) {
   var r = j.result || {};
   switch (j.kind) {
-    case 'deploy': return (r.results || []).some(function (x) { return x.mode === 'setup'; }) ? '安装已完成，请继续完成安装向导' : '安装 / 升级已完成';
+    case 'deploy':
+      if ((r.results || []).some(function (x) { return x.gateway && x.gateway.token; })) return '移动网关安装完成，请把接入信息填到 SightReport';
+      return (r.results || []).some(function (x) { return x.mode === 'setup'; }) ? '安装已完成，请继续完成安装向导' : '安装 / 升级已完成';
+    case 'gateway_show': return '接入信息已读取';
     case 'rollback': return '回滚已完成';
     case 'service': return '操作已完成';
     case 'download_package': return (r.reused ? '本机已有这个版本的安装包' : '安装包已下载并校验') + (r.version ? '：' + r.version : '');
@@ -1242,8 +1296,64 @@ function dbLine(p) {
   if (p.installed && p.running && p.db_reachable === false) t += '（无法连接）';
   return t;
 }
+/* 助手里知道的 SightReport 版本（所有服务器里最高的一个）：移动网关版本必须与它一致 */
+function knownReportVersion() {
+  var best = null;
+  (S.state.hosts || []).forEach(function (hs) {
+    var res = S.status[hs.name], pr = res ? res.products.filter(function (x) { return x.product === 'sight-report' && x.installed; })[0] : (hs.products || {})['sight-report'];
+    if (pr && pr.version && pr.version !== '未知' && (!best || verCmp(pr.version, best) > 0)) best = pr.version;
+  });
+  return best;
+}
+function copyBtn(text, label) {
+  return '<button class="btn sm" type="button" data-copy="' + esc(text) + '">' + ico('copy') + (label || '复制') + '</button>';
+}
+function gatewayCard(p) {
+  var id = p.product, pn = p.name || productName(id), info = productInfo(id);
+  if (!p.installed) {
+    return '<div class="card off"><div class="ch"><div class="pico">' + ico('box') + '</div><div><h2>' + esc(pn) + '</h2></div><div class="sp"></div><span class="badge gray">未安装</span></div>' +
+      '<div class="offbody">SightReport 配套的手机访问入口，要装在<b>手机能访问到的前置机（DMZ）</b>上，不是 SightReport 所在的机器。默认手机端口 ' + esc(info.port || 8080) + '、隧道端口 ' + esc(info.tunnel_port || 7443) + '。' +
+      '<div><button class="btn primary" type="button" data-job="1" data-act="deploy" data-p="' + esc(id) + '">安装 ' + esc(pn) + '</button></div></div></div>';
+  }
+  var badge = p.running && p.healthy ? '<span class="badge ok"><i class="dot"></i>运行中</span>' : p.running ? '<span class="badge warn"><i class="dot"></i>启动中 / 无响应</span>' : '<span class="badge bad"><i class="dot"></i>未运行</span>';
+  var svc = p.service === 'systemd' ? 'systemd 系统服务' + (p.active ? '（' + esc(p.active) + '）' : '') : '后台进程（未注册为系统服务）';
+  var notes = '';
+  function note(cls, ic, html) { notes += '<div class="note ' + cls + '">' + ico(ic) + '<div>' + html + '</div></div>'; }
+  var conn;
+  if (!p.running) { note('info', 'help', '服务当前没有运行，点「启动」即可。'); conn = '-'; }
+  else if (!p.healthy) { note('warn', 'bang', '服务进程在运行，但隧道端口 ' + esc(p.tunnel_port) + ' 上的 /healthz 没有响应。可能仍在启动，请稍后点「刷新」；一直如此请打开「日志」查看原因。'); conn = '-'; }
+  else if (p.agents == null) conn = '无法读取（服务器上没有 curl / wget）';
+  else if (p.agents === 0) {
+    conn = '<span style="color:var(--warn);font-weight:600">0 个</span>';
+    note('warn', 'bang', '<b>SightReport 还没有连上来。</b>到 SightReport 管理端「移动 › 设置 › 网络与部署」启用移动网关，网关地址填 <span class="mono">' + esc(p.tunnel_url || '') + '</span>，令牌和证书指纹点下面的「查看接入信息」获取。若已经填过，请检查 SightReport 所在机器能否访问本机 ' + esc(p.tunnel_port) + ' 端口（防火墙 / 安全组）。');
+  } else conn = '<span style="color:var(--ok);font-weight:600">' + esc(p.agents) + ' 个已连接</span>';
+  var rv = knownReportVersion();
+  if (rv && p.version && p.version !== '未知' && verCmp(rv, p.version) > 0) note('warn', 'bang', '<b>移动网关需同步升级到 ' + esc(rv) + '</b>：网关版本必须与 SightReport 一致（现在是 ' + esc(p.version) + '）。点「升级」选择 ' + esc(rv) + ' 的网关安装包。');
+  else if (rv && p.version && p.version !== '未知' && verCmp(rv, p.version) < 0) note('warn', 'bang', '移动网关版本（' + esc(p.version) + '）比助手里记录的 SightReport（' + esc(rv) + '）新，请核对两者是否配套。');
+  var nw = onlineNewer(id, p.version);
+  if (nw) note('info', 'up', '官网有新版本 <b>' + esc(nw.latest) + '</b>（当前 ' + esc(p.version) + '）。点「升级」会自动选中最新版，下载后再部署；SightReport 也要同步升级到同一版本。');
+  var isOn = p.running || p.active === 'active';
+  return '<div class="card"><div class="ch"><div class="pico">' + ico('box') + '</div><div><h2>' + esc(pn) + '</h2><div class="ver">版本 ' + esc(p.version || '未知') + (nw ? ' <span class="tag new">官网有 ' + esc(nw.latest) + '</span>' : '') + '</div></div><div class="sp"></div>' + badge + '</div>' +
+    '<dl class="kvs">' +
+    '<dt>SightReport</dt><dd>' + conn + '</dd>' +
+    '<dt>网关地址</dt><dd><span class="mono">' + esc(p.tunnel_url || '-') + '</span>　<span style="color:var(--muted)">（SightReport 里填这个）</span></dd>' +
+    '<dt>手机端口</dt><dd>' + esc(p.mobile_port || p.port || '-') + '（对公网开放）</dd>' +
+    '<dt>隧道端口</dt><dd>' + esc(p.tunnel_port || '-') + '（只放行 SightReport 所在机器）</dd>' +
+    '<dt>安装目录</dt><dd><span class="mono">' + esc(p.dir || '-') + '</span></dd>' +
+    '<dt>服务方式</dt><dd>' + svc + '</dd>' +
+    '<dt>磁盘剩余</dt><dd>' + (p.disk_free != null ? fmtSize(p.disk_free) : '-') + '</dd>' +
+    '<dt>备份</dt><dd>' + (p.backups ? p.backups + ' 份旧程序备份' + (p.last_backup ? '，最近一份 ' + esc(p.last_backup) : '') : '还没有备份') + '</dd></dl>' +
+    notes +
+    '<div class="ca"><button class="btn primary" type="button" data-job="1" data-act="deploy" data-p="' + esc(id) + '">升级</button>' +
+    '<button class="btn" type="button" data-job="1" data-act="svc" data-a="restart" data-p="' + esc(id) + '">重启</button>' +
+    (isOn ? '<button class="btn" type="button" data-job="1" data-act="svc" data-a="stop" data-p="' + esc(id) + '">停止</button>' : '<button class="btn" type="button" data-job="1" data-act="svc" data-a="start" data-p="' + esc(id) + '">启动</button>') +
+    '<button class="btn" type="button" data-job="1" data-act="gwshow" data-p="' + esc(id) + '">查看接入信息</button>' +
+    '<span class="grow"></span><button class="btn" type="button" data-job="1" data-act="logs" data-p="' + esc(id) + '">日志</button>' +
+    '<button class="btn" type="button" data-job="1" data-act="rollback" data-p="' + esc(id) + '">回滚</button></div></div>';
+}
 function productCard(p, hostRec) {
   var id = p.product, pn = p.name || productName(id);
+  if (isGw(id)) return gatewayCard(p);
   var port = (S.state.products[id] || {}).port;
   if (!p.installed) {
     return '<div class="card off"><div class="ch"><div class="pico">' + ico('box') + '</div><div><h2>' + esc(pn) + '</h2></div><div class="sp"></div><span class="badge gray">未安装</span></div>' +
@@ -1363,7 +1473,7 @@ function selectHost(name) {
 
 /* install / upgrade: step 1 choose package, step 2 choose servers */
 function deployFlow(hostName, productId) {
-  var pk = buildPicker({ kind: 'package', prefer: productId || null, autoSelect: !!productId, onChange: function (s) { syncNext(); } });
+  var pk = buildPicker({ kind: 'package', prefer: productId || null, autoSelect: !!productId, arch: productId && isGw(productId) ? hostArch(hostName) : null, onChange: function (s) { syncNext(); } });
   var M1;
   function syncNext() { if (M1 && M1.btn.next) M1.btn.next.disabled = !pk.get() || pk.isUploading(); }
   function step1() {
@@ -1371,13 +1481,13 @@ function deployFlow(hostName, productId) {
     M1 = openModal({
       title: productId ? '选择 ' + productName(productId) + ' 安装包' : '选择安装包', sub: '第 1 步，共 2 步', cls: 'w760', body: body, dismiss: true, enter: 'next',
       actions: [{ label: '取消', onClick: function (M) { M.close(); } },
-        { label: '下一步', key: 'next', kind: 'primary', disabled: !pk.get(), onClick: function (M) { var s0 = pk.get(); if (productId && s0.product && s0.product !== productId) { toast('这是 ' + productName(s0.product) + ' 的安装包，不能用来升级 ' + productName(productId) + '，请重新选择'); return; } if (s0.online && isBusy()) { toast('正在读取服务器状态，请等几秒再点「下一步」'); return; } M.close(); if (s0.online) fetchThenStep2(s0); else step2(s0); } }]
+        { label: '下一步', key: 'next', kind: 'primary', disabled: !pk.get(), onClick: function (M) { var s0 = pk.get(); if (productId && s0.product && s0.product !== productId) { toast('这是 ' + productName(s0.product) + ' 的安装包，不能用来升级 ' + productName(productId) + '，请重新选择'); return; } var ha = hostArch(hostName); if (s0.arch && ha && s0.arch !== ha) { toast('这个安装包是 ' + (ARCH_LABEL[s0.arch] || s0.arch) + ' 的，' + hostName + ' 是 ' + (ARCH_LABEL[ha] || ha) + ' 服务器，请换成 ' + (ARCH_LABEL[ha] || ha) + ' 的安装包'); return; } if (s0.online && isBusy()) { toast('正在读取服务器状态，请等几秒再点「下一步」'); return; } M.close(); if (s0.online) fetchThenStep2(s0); else step2(s0); } }]
     });
     $('.mb', M1.md).style.minHeight = '320px';
   }
   function fetchThenStep2(s0) {
     var pn0 = productName(s0.product);
-    startJob('download_package', { product: s0.product }, {
+    startJob('download_package', { product: s0.product, arch: s0.arch || undefined }, {
       title: '下载 ' + pn0 + ' ' + s0.version, closeLabel: '下一步：选择服务器', failTitle: '下载没有完成', noRefresh: true,
       onClose: function (j) { if (j.ok && j.result) step2(j.result); else step1(); }
     }).then(function (j) { if (!j) step1(); });
@@ -1396,6 +1506,7 @@ function deployFlow(hostName, productId) {
     var clusterNote = noRolling ? h('div', { class: 'note warn', style: 'margin:12px 0 0;display:none', html: ico('bang') + '<div><b>' + esc(prod) + ' 不做自动滚动升级。</b>如果这几台是集群（共用一个外部元数据库）：请先把所有服务器上的 ' + esc(prod) + ' 全部停止，再升级第一台、等它启动完成（数据库结构迁移完成）后再升级其余。开始后还会再确认一次。</div>' }) : null;
     var body = h('div', null, [
       h('div', { class: 'note info', style: 'margin:0 0 14px', html: ico('box') + '<div>安装包：<b>' + esc(pkg.name) + '</b>' + (prod ? '（' + esc(prod) + (pkg.version ? ' ' + esc(pkg.version) : '') + '）' : '') + '，' + fmtSize(pkg.size) + '</div>' }),
+      isGw(pkg.product) ? h('div', { class: 'note warn', style: 'margin:0 0 14px', html: ico('bang') + '<div><b>移动网关部署在手机能访问到的前置机（DMZ）上，不是 SightReport 所在的机器。</b>请选对服务器。</div>' }) : null,
       h('div', { style: 'font-weight:600;margin-bottom:8px' }, ['部署到哪些服务器？']), list,
       n > 1 ? h('div', { class: 'help', style: 'color:var(--muted);font-size:12.5px;margin-top:10px' }, [noRolling ? '选择多台时会按列表顺序依次处理；某台失败时，程序会询问是否继续处理后面的服务器。' : '选择多台时会依次处理（滚动升级）；某台失败时，程序会询问是否继续处理后面的服务器。']) : null,
       clusterNote
@@ -1430,7 +1541,8 @@ function serviceAction(host, pid, action) {
   if (action === 'start') { run(); return; }
   uiConfirm({
     title: label + ' ' + pn + '？', danger: action === 'stop', yes: label,
-    lines: action === 'stop' ? ['停止后，正在使用 ' + pn + ' 的用户会立即断开，直到再次启动。'] : ['重启期间服务会中断约 1 分钟，正在使用的用户会被断开。']
+    lines: isGw(pid) ? (action === 'stop' ? ['停止后，手机端无法访问 SightReport，SightReport 与网关的隧道也会断开，直到再次启动。'] : ['重启期间手机端会中断几秒到几十秒；SightReport 的隧道会自动重连。'])
+      : action === 'stop' ? ['停止后，正在使用 ' + pn + ' 的用户会立即断开，直到再次启动。'] : ['重启期间服务会中断约 1 分钟，正在使用的用户会被断开。']
   }).then(function (y) { if (y) run(); });
 }
 
@@ -1533,7 +1645,7 @@ function openRollback(host, pid) {
       body.appendChild(h('div', { class: 'side-empty', style: 'padding:24px 0;text-align:center' }, ['这台服务器上还没有可用的备份。每次升级前程序会自动备份，之后就能在这里回滚。']));
       M.setActions([{ label: '关闭', kind: 'primary', onClick: function () { M.close(); } }]); return;
     }
-    var selI = 0, full = true, schemaOn = !!productInfo(pid).schema_versioned, rbBlocked = false;
+    var selI = 0, full = true, schemaOn = !!productInfo(pid).schema_versioned, rbBlocked = false, gw = isGw(pid);
     body.appendChild(h('div', { style: 'color:var(--ink2);margin-bottom:12px', html: '当前版本 <b>' + esc(r.current_version || '未知') + '</b>' + (schemaOn ? '，数据库结构版本 <b>' + esc(r.current_schema_version || '读不到') + '</b>' : '') + '，备份目录 <span style="font-family:var(--mono);font-size:12.5px">' + esc(r.backup_dir || '') + '</span>' }));
     body.appendChild(h('div', { style: 'font-weight:600;margin-bottom:6px' }, ['1. 选择要恢复到的备份']));
     var l1 = h('div', { class: 'opts' });
@@ -1546,7 +1658,11 @@ function openRollback(host, pid) {
       l1.appendChild(row);
     });
     body.appendChild(l1);
-    body.appendChild(h('div', { style: 'font-weight:600;margin:16px 0 6px' }, ['2. 选择恢复范围']));
+    if (gw) { /* 移动网关：只换回旧程序，gateway.yaml 和 data/ 本来就不会被升级改动 */
+      full = false;
+      body.appendChild(h('div', { class: 'note info', style: 'margin:14px 0 0', html: ico('help') + '<div>只换回旧版本的程序文件。<b>gateway.yaml 和 data/ 不会动</b>，接入令牌与证书指纹保持不变。注意：网关版本要与 SightReport 一致。</div>' }));
+    }
+    if (!gw) body.appendChild(h('div', { style: 'font-weight:600;margin:16px 0 6px' }, ['2. 选择恢复范围']));
     var l2 = h('div', { class: 'opts' });
     var dbk = r.db_kind;
     [[true, '程序 + 数据（推荐）', dbk === 'h2' ? '同时恢复内置数据库。数据会回到备份时的状态，备份之后新增的报表、数据都会丢失。' : '恢复程序和安装目录里的数据文件（配置、附件等）。'],
@@ -1556,8 +1672,9 @@ function openRollback(host, pid) {
       rd.addEventListener('change', function () { full = o[0]; Array.prototype.forEach.call(l2.children, function (c, k) { c.classList.toggle('on', k === i); }); schemaCheck(); });
       l2.appendChild(row);
     });
-    body.appendChild(l2);
-    if (dbk === 'external') body.appendChild(h('div', { class: 'note warn', style: 'margin:12px 0 0', html: ico('bang') + '<div>这台服务器使用外部数据库，数据库不在备份里，回滚不会改动它。如果新版本改过数据库结构，请先联系负责人确认。</div>' }));
+    if (!gw) body.appendChild(l2);
+    if (gw) { /* 没有数据库 */ }
+    else if (dbk === 'external') body.appendChild(h('div', { class: 'note warn', style: 'margin:12px 0 0', html: ico('bang') + '<div>这台服务器使用外部数据库，数据库不在备份里，回滚不会改动它。如果新版本改过数据库结构，请先联系负责人确认。</div>' }));
     else if (dbk === 'none') body.appendChild(h('div', { class: 'note info', style: 'margin:12px 0 0', html: ico('help') + '<div>这个备份里没有数据库。</div>' }));
     /* 数据库结构版本（Sight DataLink / Flyway）：外部库的结构变了就不能只回滚程序，后端回滚前还会再核对一次 */
     var sNote = h('div', { class: 'note', style: 'margin:12px 0 0;display:none' });
@@ -1577,7 +1694,7 @@ function openRollback(host, pid) {
       uiConfirm({
         title: '确定回滚到 ' + (b.version || b.time) + '？', danger: true, yes: '确定回滚',
         lines: ['服务会先停止，再恢复备份 ' + b.time + '（版本 ' + (b.version || '未知') + '），期间无法使用。',
-          full ? '数据也会回到备份时的状态，之后新增的数据会丢失。' : '只恢复程序文件，现有数据保持不变。']
+          gw ? '只换回旧程序，gateway.yaml 和 data/ 保持不变；当前的程序会先另存一份，回滚也能撤销。' : full ? '数据也会回到备份时的状态，之后新增的数据会丢失。' : '只恢复程序文件，现有数据保持不变。']
       }).then(function (y) {
         if (!y) return; M.close();
         startJob('rollback', { host: host, product: pid, file: b.file, full: full }, { title: '回滚 ' + pn + ' · ' + host, failTitle: '回滚没有成功' });
@@ -1695,6 +1812,8 @@ function quitApp() {
 
 /* ---------- wiring ---------- */
 document.addEventListener('click', function (e) {
+  var cpb = e.target.closest ? e.target.closest('[data-copy]') : null;
+  if (cpb) { copyText(cpb.getAttribute('data-copy')); return; }
   var t = e.target.closest ? e.target.closest('[data-act]') : null;
   if (!t || t.disabled) return;
   var a = t.getAttribute('data-act'), p = t.getAttribute('data-p'), hs = getHost(S.sel);
@@ -1715,6 +1834,7 @@ document.addEventListener('click', function (e) {
     case 'svc': serviceAction(S.sel, p, t.getAttribute('data-a')); break;
     case 'logs': openLogs(S.sel, p); break;
     case 'rollback': openRollback(S.sel, p); break;
+    case 'gwshow': startJob('gateway_show', { host: S.sel }, { title: '移动网关接入信息 · ' + S.sel, closeLabel: '关闭', failTitle: '没能读取接入信息', noRefresh: true }); break;
   }
 });
 

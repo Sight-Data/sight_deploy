@@ -29,17 +29,26 @@ STATE = {
         {"name": "数据-3", "host": "10.0.0.7", "port": 22, "user": "root", "auth": "password",
          "last_used": "2026-10-12 15:20",
          "products": {"sight-datalink": {"install_dir": "/opt/sight-datalink", "port": 18680, "version": "0.2.0"}}},
+        {"name": "前置机-DMZ", "host": "10.8.0.9", "port": 22, "user": "root", "auth": "password",
+         "last_used": "2026-10-30 18:05",
+         "products": {"sight-mobile-gateway": {"install_dir": "/opt/sight-mobile-gateway", "port": 8080, "tunnel_port": 7443, "version": "2.0.70"}}},
+        {"name": "前置机-新", "host": "10.8.0.10", "port": 22, "user": "root", "auth": "password",
+         "last_used": "2026-10-31 09:30", "products": {}},
     ],
     "products": {"sight-report": {"name": "SightReport", "port": 9091, "dir": "/opt/sight-report", "zip_prefix": "sight-report",
                                   "setup_path": "/setup", "setup_token": False, "rolling_upgrade": True, "schema_versioned": False},
                  "sight-wall": {"name": "SightWall", "port": 9090, "dir": "/opt/sight-wall", "zip_prefix": "sight-wall",
                                 "setup_path": "/setup", "setup_token": False, "rolling_upgrade": True, "schema_versioned": False},
                  "sight-datalink": {"name": "Sight DataLink", "port": 18680, "dir": "/opt/sight-datalink", "zip_prefix": "sight-datalink",
-                                "setup_path": "/", "setup_token": True, "rolling_upgrade": False, "schema_versioned": True}},
+                                "setup_path": "/", "setup_token": True, "rolling_upgrade": False, "schema_versioned": True},
+                 "sight-mobile-gateway": {"name": "Sight 移动网关", "port": 8080, "tunnel_port": 7443, "dir": "/opt/sight-mobile-gateway",
+                                          "zip_prefix": "sight-mobile-gateway", "setup_path": None, "setup_token": False,
+                                          "rolling_upgrade": True, "schema_versioned": False, "kind": "gateway"}},
     "log_path": "/Users/demo/.sight-deploy/logs/sight-deploy-20261010.log",
 }
 BUSY = {"id": None}
 JOBS = {}
+GW = {"version": "2.0.70", "agents": 1, "backups": 1}  # 前置机-DMZ 上的移动网关（升级后会变）
 
 
 class Cancelled(Exception):
@@ -165,7 +174,18 @@ def s_status(job):
     job.step("读取产品状态")
     job.sleep(0.6)
     prods = []
-    if h["host"] == "10.0.0.5":
+    GW_OFF = {"product": "sight-mobile-gateway", "name": "Sight 移动网关", "kind": "gateway", "installed": False}
+    if h["host"] == "10.8.0.9":
+        prods = [{"product": "sight-report", "name": "SightReport", "installed": False},
+                 {"product": "sight-wall", "name": "SightWall", "installed": False},
+                 {"product": "sight-datalink", "name": "Sight DataLink", "installed": False},
+                 {"product": "sight-mobile-gateway", "name": "Sight 移动网关", "kind": "gateway", "installed": True, "version": GW["version"],
+                  "dir": "/opt/sight-mobile-gateway", "owner": "root", "service": "systemd", "active": "active", "running": True,
+                  "healthy": True, "port": 8080, "mobile_port": 8080, "tunnel_port": 7443, "tunnel_tls": True,
+                  "tunnel_url": "wss://gw.example-hospital.cn:7443/tunnel", "hostnames": ["gw.example-hospital.cn", "203.0.113.10"],
+                  "agents": GW["agents"], "has_config": True, "disk_free": 18_400_000_000, "backups": GW["backups"],
+                  "last_backup": "2026-10-20 14:02（2.0.68）" if GW["backups"] else "", "url": None}]
+    elif h["host"] == "10.0.0.5":
         prods.append({"product": "sight-report", "name": "SightReport", "installed": True,
                       "version": "2.0.71", "dir": "/opt/sight-report", "owner": "root",
                       "service": "systemd", "active": "active", "running": True, "healthy": True,
@@ -176,6 +196,7 @@ def s_status(job):
                       "disk_free": 31876000000, "backups": 2, "last_backup": "2026-10-10 01:16（2.0.69）"})
         prods.append({"product": "sight-wall", "name": "SightWall", "installed": False})
         prods.append({"product": "sight-datalink", "name": "Sight DataLink", "installed": False})
+        prods.append(GW_OFF)
     elif h["host"] == "10.0.0.7":
         prods = [{"product": "sight-report", "name": "SightReport", "installed": False},
                  {"product": "sight-wall", "name": "SightWall", "installed": False},
@@ -184,7 +205,7 @@ def s_status(job):
                   "running": True, "healthy": True, "bootstrapped": False, "db_reachable": None, "mode": "setup",
                   "port": 18680, "url": "http://10.0.0.7:18680/", "setup_url": "http://10.0.0.7:18680/", "reachable": True,
                   "java": "21.0.4（/usr/lib/jvm/java-21-openjdk/bin/java）", "db": "尚未配置（还没走安装向导）", "db_kind": "none",
-                  "disk_free": 52000000000, "backups": 0, "last_backup": ""}]
+                  "disk_free": 52000000000, "backups": 0, "last_backup": ""}, GW_OFF]
     elif h["host"] == "10.0.0.6":
         prods.append({"product": "sight-report", "name": "SightReport", "installed": True,
                       "version": "2.0.69", "dir": "/data/sight/report", "owner": "sight",
@@ -206,12 +227,13 @@ def s_status(job):
                       "port": 18680, "url": "http://10.0.0.6:18680/", "setup_url": "http://10.0.0.6:18680/", "reachable": True,
                       "java": "21.0.4（/opt/sight-jdk/jdk-21.0.4+7/bin/java）", "db": "外部数据库 postgresql @ 192.168.1.30",
                       "db_kind": "external", "disk_free": 4200000000, "backups": 2, "last_backup": "2026-10-01 09:10（0.1.8）"})
+        prods.append(GW_OFF)
     else:
         prods = [{"product": "sight-report", "name": "SightReport", "installed": False},
                  {"product": "sight-wall", "name": "SightWall", "installed": False},
-                 {"product": "sight-datalink", "name": "Sight DataLink", "installed": False}]
+                 {"product": "sight-datalink", "name": "Sight DataLink", "installed": False}, GW_OFF]
     job.ok_("状态已更新")
-    return {"host": name, "address": "%s@%s" % (h["user"], h["host"]),
+    return {"host": name, "address": "%s@%s" % (h["user"], h["host"]), "arch": "amd64",
             "os": "Linux x86_64 / CentOS 7.9 / up 3 days", "products": prods}
 
 
@@ -272,9 +294,123 @@ def s_deploy_datalink(job, hosts, pkg):
     return {"results": results}
 
 
+MOCK_GW_FP = "BA:DE:71:83:A3:59:EF:D4:8F:19:1B:9A:F0:B6:D3:7E:ED:E7:F3:8A:77:22:A2:64:AE:09:37:39:29:4D:B5:D2"
+MOCK_GW_TOKEN = "dPGMGLJ7eO9wI5f5dPx3lsf6YZ51T-EuvmaDdtkU6-E"  # 演示用，不是真实令牌
+
+
+def s_deploy_gateway(job, hosts, pkg):
+    """Sight 移动网关：首次安装（接入信息页）/ 升级（令牌指纹不变）。"""
+    results = []
+    ver = "2.0.96"
+    for hn in hosts:
+        h = find_host(hn) or {"host": "?", "user": "root", "products": {}}
+        job.step("读取安装包 %s" % os.path.basename(pkg))
+        job.ok_("Sight 移动网关 %s（3.5 MB，2 个文件）" % ver)
+        job.info("检查 Sight 移动网关是否已安装 …")
+        installed = "sight-mobile-gateway" in (h.get("products") or {})
+        if not installed:
+            job.step("首次安装 Sight 移动网关 %s → root@%s" % (ver, h["host"]))
+            err = None
+            while True:
+                vals = job.ask({"kind": "form", "title": "安装 Sight 移动网关 %s 到 root@%s" % (ver, h["host"]), "error": err, "fields": [
+                    {"key": "dir", "label": "安装目录", "default": "/opt/sight-mobile-gateway"},
+                    {"key": "hostnames", "label": "SightReport 访问网关用的域名或 IP", "default": h["host"],
+                     "placeholder": "如 gw.example.com,203.0.113.10（多个用英文逗号分隔）",
+                     "help": "会写进网关的证书里，SightReport 将用这里填的地址连接网关。填错了以后改地址要重新生成证书（接入令牌和证书指纹会跟着变）。"},
+                    {"key": "port", "label": "手机访问端口", "default": "8080", "type": "number",
+                     "help": "手机访问网关用的端口，需要对公网开放。SightReport 连接网关用的隧道端口固定为 7443，不对公网开放。"}]})
+                if str(vals.get("hostnames", "")).strip():
+                    break
+                err = "请填写 SightReport 访问网关用的域名或 IP（至少一个）"
+            port = int(vals.get("port") or 8080)
+            hostnames = [x for x in str(vals.get("hostnames")).replace("，", ",").replace(" ", ",").split(",") if x]
+            job.step("环境检查")
+            for t in ("系统      Rocky Linux 9.4  x86_64", "CPU 架构  x86_64，与安装包（amd64）一致", "systemd   可用（网关将注册为开机自启服务）",
+                      "磁盘      / 剩余 18.4 GB", "手机侧端口 %d 空闲" % port, "隧道端口 7443 空闲"):
+                job.ok_(t)
+            job.warn("防火墙    firewalld 未放行手机侧端口 %d" % port)
+            job.step("确认安装计划")
+            plan = [["产品", "Sight 移动网关 %s（amd64）" % ver], ["服务器", "root@%s" % h["host"]], ["安装目录", vals.get("dir") or "/opt/sight-mobile-gateway"],
+                    ["证书里的域名 / IP", "、".join(hostnames)], ["手机侧端口", "%d（对公网开放）" % port],
+                    ["隧道端口", "7443（只允许 SightReport 所在机器访问）"], ["运行方式", "系统服务 sight-mobile-gateway（开机自启、崩溃自动拉起）"]]
+            job.emit(t="kv", title="安装计划", items=plan)
+            if not job.ask({"kind": "confirm", "title": "开始安装？", "default": True, "detail": ["%s：%s" % tuple(x) for x in plan]}):
+                raise Cancelled()
+            job.step("上传安装包（3.5 MB）")
+            for i in range(1, 6):
+                job.sleep(0.12)
+                job.emit(t="progress", id="up", label="上传 sight-mobile-gateway", done=8_872_120 * i // 5, total=8_872_120, speed=20_000_000, eta=0)
+            job.ok_("上传完成，sha256 校验一致")
+            job.ok_("新程序在服务器上试跑正常（版本 %s）" % ver)
+            job.step("安装")
+            job.ok_("已生成配置文件 gateway.yaml 和隧道证书（证书指纹、接入令牌见安装完成页）")
+            job.log("已完成: install")
+            job.log("已完成: start")
+            job.step("等待网关启动")
+            job.emit(t="live", id="wait", text="等待网关启动 … 0:02")
+            job.sleep(0.5)
+            job.emit(t="live", id="wait", text="")
+            job.ok_("网关已就绪（用时 0:03）")
+            job.step("安装完成")
+            job.ok_("Sight 移动网关 %s 已安装并启动" % ver)
+            wss = "wss://%s:7443/tunnel" % hostnames[0]
+            job.info("下一步：到 SightReport「移动 › 设置 › 网络与部署」启用移动网关，网关地址填 %s，再粘贴安装完成页上的接入令牌和证书指纹" % wss)
+            job.info("SightReport 还没有连上来（连接数 0），按上面的步骤在 SightReport 里启用后，这里会变成 1")
+            results.append({"host": hn, "status": "完成", "url": None, "gateway": {
+                "version": ver, "mobile_port": port, "tunnel_port": 7443, "hostnames": hostnames, "tunnel_url": wss, "agents": 0,
+                "fingerprint": MOCK_GW_FP, "token": MOCK_GW_TOKEN}})
+            with LOCK:
+                h.setdefault("products", {})["sight-mobile-gateway"] = {"install_dir": vals.get("dir"), "port": port, "tunnel_port": 7443, "version": ver}
+        else:
+            old = GW["version"]
+            job.step("升级 Sight 移动网关：%s → %s" % (old, ver))
+            plan = [["产品", "Sight 移动网关"], ["版本", "%s → %s" % (old, ver)], ["服务器", "root@%s" % h["host"]], ["安装目录", "/opt/sight-mobile-gateway"],
+                    ["服务", "systemd 服务 sight-mobile-gateway，运行中"], ["手机侧 / 隧道端口", "8080 / 7443"],
+                    ["升级前备份", "/opt/sight-backups/sight-mobile-gateway/sight-mobile-gateway-%s-20261031-101500.bin（旧程序，约 10 MB）" % old],
+                    ["不会改动", "gateway.yaml 和 data/（接入令牌、证书指纹保持不变）"]]
+            job.emit(t="kv", title="升级计划", items=plan)
+            if not job.ask({"kind": "confirm", "title": "开始升级？", "default": True,
+                            "detail": ["%s：%s" % tuple(x) for x in plan] + ["", "升级过程中网关会停止几秒到几十秒，期间手机访问不了；失败时可一键回滚。"]}):
+                raise Cancelled()
+            job.step("上传安装包（3.5 MB）")
+            for i in range(1, 6):
+                job.sleep(0.12)
+                job.emit(t="progress", id="up", label="上传 sight-mobile-gateway", done=8_872_120 * i // 5, total=8_872_120, speed=20_000_000, eta=0)
+            job.ok_("上传完成，sha256 校验一致")
+            job.ok_("新程序在服务器上试跑正常（版本 %s）" % ver)
+            job.step("执行升级（在服务器后台运行，网络中断也会继续）")
+            for t in ("停止服务 …", "备份旧版本程序 …", "替换程序 …", "启动新版本 …"):
+                job.info(t)
+                job.sleep(0.3)
+            job.step("核对新版本")
+            job.ok_("网关已就绪（用时 0:02）")
+            job.ok_("版本确认：%s" % ver)
+            job.step("升级完成")
+            job.ok_("Sight 移动网关 %s → %s" % (old, ver))
+            job.info("gateway.yaml 和 data/ 没有改动，接入令牌与证书指纹保持不变，SightReport 不用重新填写")
+            job.ok_("SightReport 已连接（连接数 1）")
+            with LOCK:
+                GW["version"], GW["backups"] = ver, 2
+                (h.setdefault("products", {}).setdefault("sight-mobile-gateway", {}))["version"] = ver
+            results.append({"host": hn, "status": "完成", "url": None, "gateway": {
+                "version": ver, "mobile_port": 8080, "tunnel_port": 7443, "hostnames": [], "tunnel_url": "wss://gw.example-hospital.cn:7443/tunnel", "agents": 1}})
+    return {"results": results}
+
+
+def s_gateway_show(job):
+    job.step("读取接入信息")
+    job.sleep(0.5)
+    job.ok_("已读取（令牌是机密，只显示在这个窗口里，不写入本地日志）")
+    return {"gateway": {"version": GW["version"], "mobile_port": 8080, "tunnel_port": 7443, "hostnames": ["gw.example-hospital.cn"],
+                        "tunnel_url": "wss://gw.example-hospital.cn:7443/tunnel", "agents": GW["agents"],
+                        "fingerprint": MOCK_GW_FP, "token": MOCK_GW_TOKEN}}
+
+
 def s_deploy(job):
     hosts = job.params.get("hosts") or []
     pkg = job.params.get("package", "")
+    if "sight-mobile-gateway" in os.path.basename(pkg):
+        return s_deploy_gateway(job, hosts, pkg)
     if "sight-datalink" in os.path.basename(pkg):
         return s_deploy_datalink(job, hosts, pkg)
     broken = "broken" in pkg
@@ -408,6 +544,11 @@ def s_follow_logs(job):
 
 def s_list_backups(job):
     job.sleep(0.6)
+    if job.params.get("product") == "sight-mobile-gateway":
+        d = "/opt/sight-backups/sight-mobile-gateway"
+        bs = [{"file": d + "/sight-mobile-gateway-2.0.70-20261031-101500.bin", "version": "2.0.70", "time": "2026-10-31 10:15", "size": 8_700_000}] if GW["backups"] > 1 else []
+        bs.append({"file": d + "/sight-mobile-gateway-2.0.68-20261020-140200.bin", "version": "2.0.68", "time": "2026-10-20 14:02", "size": 8_600_000})
+        return {"backup_dir": d, "current_version": GW["version"], "db_kind": "none", "backups": bs}
     if job.params.get("product") == "sight-datalink":
         ext = (find_host(job.params.get("host")) or {}).get("host") == "10.0.0.6"
         return {"backup_dir": "/data/sight-backups/sight-datalink", "current_version": "0.1.9", "db_kind": "external" if ext else "h2",
@@ -491,13 +632,18 @@ ONLINE = {
              "page": "https://www.sightdata.top/downloads"},
     "products": {"sight-report": {"latest": "2.0.73", "file_name": "sight-report-2.0.73.zip", "size_text": "258M", "url": "x"},
                  "sight-wall": {"latest": "2.0.70", "file_name": "sight-wall-2.0.70.zip", "size_text": "293M", "url": "x"},
-                 "sight-datalink": {"latest": "0.2.0", "file_name": "sight-datalink-0.2.0.zip", "size_text": "203M", "url": "x"}},
+                 "sight-datalink": {"latest": "0.2.0", "file_name": "sight-datalink-0.2.0.zip", "size_text": "203M", "url": "x"},
+                 "sight-mobile-gateway": {"latest": "2.0.96", "file_name": "sight-mobile-gateway-2.0.96-linux-amd64.zip", "size_text": "3.5M", "url": "x",
+                                          "variants": {a: {"latest": "2.0.96", "file_name": "sight-mobile-gateway-2.0.96-linux-%s.zip" % a, "size_text": sz, "url": "x"}
+                                                       for a, sz in (("amd64", "3.5M"), ("arm64", "3.2M"), ("loong64", "3.3M"))}}},
 }
 
 
 def s_download_package(job):
     pid = job.params.get("product")
     o = ONLINE["products"][pid]
+    if pid == "sight-mobile-gateway":
+        o = o["variants"][job.params.get("arch") or "amd64"]
     job.step("查询官网上 %s 的最新版本" % pid)
     job.sleep(0.5)
     job.ok_("最新版 %s（%s）" % (o["latest"], o["size_text"]))
@@ -509,8 +655,11 @@ def s_download_package(job):
     job.step("校验安装包完整性")
     job.sleep(0.4)
     job.ok_("安装包完整（38.1 MB）")
-    return {"path": UPLOAD_DIR + "/" + o["file_name"], "name": o["file_name"], "size": total, "product": pid,
-            "version": o["latest"], "mtime": int(time.time()), "dir": UPLOAD_DIR, "reused": False}
+    res = {"path": UPLOAD_DIR + "/" + o["file_name"], "name": o["file_name"], "size": total, "product": pid,
+           "version": o["latest"], "mtime": int(time.time()), "dir": UPLOAD_DIR, "reused": False}
+    if pid == "sight-mobile-gateway":
+        res["arch"] = job.params.get("arch") or "amd64"
+    return res
 
 
 def s_download_tool(job):
@@ -525,7 +674,7 @@ def s_download_tool(job):
 
 SCRIPTS = {"download_package": s_download_package, "download_tool": s_download_tool, "status": s_status, "deploy": s_deploy, "service": s_service, "logs": s_logs,
            "follow_logs": s_follow_logs, "list_backups": s_list_backups, "rollback": s_rollback,
-           "add_host": s_add_host, "edit_host": s_edit_host, "test_host": s_test_host}
+           "add_host": s_add_host, "edit_host": s_edit_host, "test_host": s_test_host, "gateway_show": s_gateway_show}
 
 
 # ---------------------------------------------------------------- files
@@ -537,6 +686,9 @@ FAKE_PACKAGES = [
     ("/Users/demo/Downloads", "sight-datalink-0.2.0.zip", 212_400_000, "sight-datalink", "0.2.0", 1800),
     ("/Users/demo/Desktop", "sight-report-2.0.71.zip", 258_824_866, "sight-report", "2.0.71", 5 * 86400),
     ("/Users/demo/Desktop", "sight-deploy-2.0.0-extra.zip", 1_900_000_000, None, None, 12 * 86400),
+    ("/Users/demo/Downloads", "sight-mobile-gateway-2.0.96-linux-amd64.zip", 3_643_657, "sight-mobile-gateway", "2.0.96", 600),
+    ("/Users/demo/Downloads", "sight-mobile-gateway-2.0.96-linux-arm64.zip", 3_314_830, "sight-mobile-gateway", "2.0.96", 650),
+    ("/Users/demo/Downloads", "sight-mobile-gateway-2.0.96-linux-loong64.zip", 3_414_923, "sight-mobile-gateway", "2.0.96", 700),
 ]
 
 
@@ -544,6 +696,9 @@ def packages():
     now = int(time.time())
     out = [{"path": d + "/" + n, "name": n, "size": s, "mtime": now - ago, "dir": d, "product": p, "version": v}
            for d, n, s, p, v, ago in FAKE_PACKAGES]
+    for it in out:
+        if it["product"] == "sight-mobile-gateway":
+            it["arch"] = it["name"].rsplit("-", 1)[-1][:-4]
     return out
 
 
