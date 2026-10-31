@@ -50,7 +50,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-TOOL_VERSION = "2.3.0"
+TOOL_VERSION = "2.3.1"
 CONF_DIR = Path(os.environ.get("SIGHT_DEPLOY_HOME") or (Path.home() / ".sight-deploy"))
 FROZEN = getattr(sys, "frozen", False)
 # 程序所在目录：打包后是 exe/.app 所在目录（用来找同目录下的安装包），源码运行是本文件目录
@@ -4015,6 +4015,8 @@ def do_gateway_upgrade(ctx, r, pkg, inst):
             ("安装目录", inst_dir),
             ("服务", "systemd 服务 %s，%s" % (GATEWAY, "运行中" if inst["active"] == "active" else "未运行" if inst["unit"] else "还没有注册")),
             ("手机侧 / 隧道端口", "%d / %d" % (inst["mobile_port"], inst["tunnel_port"])),
+            ("当前连接", "无法读取（服务没在运行）" if not h_before else "无法读取（服务器上没有 curl / wget）"
+                        if h_before.get("no_tool") else "%s 个 SightReport 连接，升级期间会短暂断开后自动重连" % h_before.get("agents")),
             ("升级前备份", "%s（旧程序，约 10 MB）" % bfile),
             ("不会改动", "gateway.yaml 和 data/（接入令牌、证书指纹保持不变）")]
     kv("升级计划", plan)

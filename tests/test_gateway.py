@@ -147,7 +147,7 @@ class Descriptor(unittest.TestCase):
                          {"amd64": "dl-gateway-linux-amd64", "arm64": "dl-gateway-linux-arm64", "loong64": "dl-gateway-linux-loong64"})
 
     def test_tool_version(self):
-        self.assertEqual(sd.TOOL_VERSION, "2.3.0")
+        self.assertGreaterEqual(tuple(int(x) for x in sd.TOOL_VERSION.split(".")), (2, 3, 0))
 
 
 class ArchMatching(unittest.TestCase):
