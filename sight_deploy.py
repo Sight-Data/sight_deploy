@@ -3570,10 +3570,10 @@ true
 
 
 def gateway_healthz_cmd(port, tls=True):
-    """在服务器本机访问隧道端口的 /healthz（自签证书所以用 -k）。没有 curl / wget 时退出码 127。"""
+    """在服务器本机访问隧道端口的 /healthz（自签证书所以用 -k；必须绕过服务器上的全局代理：老 curl 不认 no_proxy 里的 CIDR，127.0.0.1 会被送去代理）。没有 curl / wget 时退出码 127。"""
     scheme = "https" if tls else "http"
-    return ('if command -v curl >/dev/null 2>&1; then curl -sk -m 5 %(u)s; '
-            'elif command -v wget >/dev/null 2>&1; then wget -q --no-check-certificate -T 5 -O - %(u)s; '
+    return ('if command -v curl >/dev/null 2>&1; then curl -sk --noproxy "*" -m 5 %(u)s; '
+            'elif command -v wget >/dev/null 2>&1; then wget -q --no-proxy --no-check-certificate -T 5 -O - %(u)s; '
             'else exit 127; fi' % {"u": shlex.quote("%s://127.0.0.1:%d/healthz" % (scheme, port))})
 
 

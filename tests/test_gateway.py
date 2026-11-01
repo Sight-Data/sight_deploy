@@ -202,6 +202,8 @@ class Parsing(unittest.TestCase):
     def test_healthz_command(self):
         c = sd.gateway_healthz_cmd(7443, True)
         self.assertIn("curl -sk", c)
+        self.assertIn("--noproxy", c)  # 服务器有全局代理时老 curl 不认 no_proxy 的 CIDR，必须显式绕过
+        self.assertIn("--no-proxy", c)  # wget 分支同理
         self.assertIn("https://127.0.0.1:7443/healthz", c)
         self.assertIn("http://127.0.0.1:7000/healthz", sd.gateway_healthz_cmd(7000, False))
 
