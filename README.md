@@ -7,7 +7,7 @@
 
 [**Sight Data**](https://www.sightdata.top) 旗下 **SightReport（报表）/ SightWall（数据大屏）/ Sight DataLink（数据集成）/ Sight 移动网关** 的远程安装与升级工具。
 
-双击打开，操作界面在浏览器里。通过 SSH 连到 Linux 服务器，三步完成部署：添加服务器 → 选择安装包 → 一键安装 / 升级。
+双击打开，界面在一个独立窗口里（像桌面客户端，没有地址栏和标签页）。通过 SSH 连到 Linux 服务器，三步完成部署：添加服务器 → 选择安装包 → 一键安装 / 升级。
 不用敲命令，客户电脑上也不用装 Python。
 
 <table>
@@ -33,16 +33,18 @@
 | 系统 | 文件 | 说明 |
 |---|---|---|
 | Windows 10 / 11 | `sight-deploy-<版本>-windows-x64.exe` | 单文件，双击运行 |
-| Windows 7 / 8 | `sight-deploy-<版本>-windows7-x64.exe` | Win7 兼容版（Python 3.8 构建）。系统自带的 IE 打不开操作界面，需要装 Chrome 109 或 Firefox ESR 115；程序会优先用它们打开 |
+| Windows 7 / 8 | `sight-deploy-<版本>-windows7-x64.exe` | Win7 兼容版（Python 3.8 构建）。系统自带的 IE 打不开操作界面，需要装 Chrome 109 或 Firefox ESR 115；程序会优先用它们打开（Chrome 为应用窗口，Firefox 为普通浏览器标签页） |
 | macOS（Apple 芯片） | `sight-deploy-<版本>-mac-arm64.zip` | 解压后打开「Sight部署助手.app」 |
 | macOS（Intel） | `sight-deploy-<版本>-mac-x86_64.zip` | 同上 |
 
 - **GitHub**：[Releases](https://github.com/Sight-Data/sight_deploy/releases)
 - **国内下载**：[Sight Data 官网下载中心](https://www.sightdata.top/downloads)
 
-程序本身没有窗口，操作界面在浏览器里：
+操作界面用电脑上的 **Edge / Chrome 的「应用窗口」** 打开：独立窗口、没有地址栏，不用额外安装任何东西（Windows 10/11 自带 Edge）。没有这两个浏览器（如只装了 Safari / Firefox）时，退回用默认浏览器打开。想一直用普通浏览器，启动时加 `--browser`，或设环境变量 `SIGHT_DEPLOY_BROWSER=1`。
+应用窗口用独立的浏览器配置（保存在 `~/.sight-deploy/app-window/`），不受平时浏览器的设置、登录状态影响。程序本身常驻在后台：
 - **Windows**：运行后任务栏右下角通知区会出现它的图标（可能收在「^」里）。双击图标重新打开界面，右键「退出」关闭程序。
-- 界面左下角也有「退出程序」按钮；关掉浏览器 10 分钟后，程序在没有任务进行时会自动退出。
+- **macOS**：菜单栏右上角有图标，菜单里可以重新打开界面或退出。
+- 界面左下角也有「退出程序」按钮；关掉窗口 10 分钟后，程序在没有任务进行时会自动退出。
 
 程序没有做代码签名：
 - **Mac**：第一次打开会提示「无法验证开发者」，右键 →「打开」即可。macOS 15 起要到「系统设置 › 隐私与安全性」点「仍要打开」。
@@ -117,7 +119,7 @@ SightReport / SightWall / Sight DataLink / Sight 移动网关的产品安装包�
 
 ```bash
 pip install paramiko
-python3 sight_deploy.py                                 # 起服务并自动打开浏览器
+python3 sight_deploy.py                                 # 起服务并打开应用窗口（没有 Edge / Chrome 时用默认浏览器；--browser 强制用浏览器）
 python3 sight_deploy.py --no-browser --port 17880       # 只起服务，地址打印在控制台
 ```
 
