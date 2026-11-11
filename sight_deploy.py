@@ -6,7 +6,8 @@ Sight 部署助手 —— SightReport / SightWall / Sight DataLink / Sight 移�
 开源地址：https://github.com/Sight-Data/sight_deploy    产品官网：https://www.sightdata.top
 
 双击运行（打包后的 Sight部署助手.exe / .app），或 `python3 sight_deploy.py`：
-程序在本机 127.0.0.1 起一个小服务并自动打开浏览器，所有操作都在网页里完成。
+程序在本机 127.0.0.1 起一个小服务，并用 Edge / Chrome 的「应用窗口」打开界面（独立窗口、没有地址栏，像桌面客户端；
+没有这两个浏览器时用默认浏览器；加 --browser 或设 SIGHT_DEPLOY_BROWSER=1 强制用普通浏览器），所有操作都在网页里完成。
 界面文件：同目录 web/index.html（打包时内嵌）。前后端接口见 docs/API.md。
 
   能做的事：添加服务器（密码加密保存）、查看状态、首次安装（环境检查 / 上传 JDK / 注册系统服务）、
@@ -50,7 +51,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-TOOL_VERSION = "2.3.2"
+TOOL_VERSION = "2.4.0"
 CONF_DIR = Path(os.environ.get("SIGHT_DEPLOY_HOME") or (Path.home() / ".sight-deploy"))
 FROZEN = getattr(sys, "frozen", False)
 # 程序所在目录：打包后是 exe/.app 所在目录（用来找同目录下的安装包），源码运行是本文件目录
@@ -5489,7 +5490,90 @@ def _fatal(msg):
     sys.exit(1)
 
 
+def _app_browser_candidates():
+    """可以用「应用窗口」模式（--app）打开界面的 Chromium 系浏览器，按优先级排列。
+    Windows 10/11 自带 Edge，所以绝大多数客户电脑上都能得到独立窗口；Firefox / Safari 没有这个模式，不在其列。"""
+    out = []
+    if os.name == "nt":
+        pf, pf86, local = os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"), os.environ.get("LOCALAPPDATA")
+        for base, rel in ((pf86, r"Microsoft\Edge\Application\msedge.exe"), (pf, r"Microsoft\Edge\Application\msedge.exe"),
+                          (pf, r"Google\Chrome\Application\chrome.exe"), (pf86, r"Google\Chrome\Application\chrome.exe"),
+                          (local, r"Google\Chrome\Application\chrome.exe"), (local, r"Microsoft\Edge\Application\msedge.exe"),
+                          (pf, r"BraveSoftware\Brave-Browser\Application\brave.exe"),
+                          (local, r"BraveSoftware\Brave-Browser\Application\brave.exe")):
+            if base:
+                out.append(os.path.join(base, rel))
+        try:  # 装在非默认位置的 Chrome / Edge：查注册表「App Paths」
+            import winreg
+            for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                for exe in ("msedge.exe", "chrome.exe"):
+                    try:
+                        with winreg.OpenKey(root, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths" + "\\" + exe) as k:
+                            out.append(winreg.QueryValueEx(k, "")[0])
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+    elif sys.platform == "darwin":
+        for app, name in (("Google Chrome", "Google Chrome"), ("Microsoft Edge", "Microsoft Edge"),
+                          ("Brave Browser", "Brave Browser"), ("Chromium", "Chromium")):
+            for base in ("/Applications", os.path.expanduser("~/Applications")):
+                out.append("%s/%s.app/Contents/MacOS/%s" % (base, app, name))
+    else:
+        for name in ("google-chrome", "google-chrome-stable", "microsoft-edge", "microsoft-edge-stable",
+                     "chromium", "chromium-browser", "brave-browser"):
+            exe = shutil.which(name)
+            if exe:
+                out.append(exe)
+    return out
+
+
+def _app_window_cmd(url, exe=None):
+    """生成「应用窗口」启动命令；没有可用的 Chromium 系浏览器时返回 None。
+    用单独的用户数据目录：不带标签页 / 地址栏 / 扩展，不受用户平时浏览器的设置、登录状态影响，窗口大小也会被记住。"""
+    if exe is None:
+        exe = next((c for c in _app_browser_candidates() if c and os.path.isfile(c)), None)
+    if not exe:
+        return None
+    return [exe, "--app=" + url, "--user-data-dir=" + str(CONF_DIR / "app-window"), "--window-size=1280,860",
+            "--no-first-run", "--no-default-browser-check", "--disable-features=Translate"]
+
+
+def _open_app_window(url):
+    """像桌面客户端一样在独立窗口里打开界面（没有地址栏和标签页）。成功启动返回 True。
+    浏览器启动很快就失败的话（返回非 0 退出码），后台线程会降级成用默认浏览器打开。"""
+    if os.environ.get("SIGHT_DEPLOY_BROWSER") or "--browser" in sys.argv:
+        return False  # 用户明确要求用浏览器
+    cmd = _app_window_cmd(url)
+    if not cmd:
+        return False
+    try:
+        (CONF_DIR / "app-window").mkdir(parents=True, exist_ok=True)
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as e:
+        LOG.write("  [应用窗口] 启动失败，改用默认浏览器：%s" % e)
+        return False
+
+    def watch():
+        try:
+            rc = p.wait(timeout=5)  # 窗口开着时进程不会退出；用户数据目录已被占用时会转交给已在运行的实例，也是 0
+        except Exception:
+            return
+        if rc != 0:
+            LOG.write("  [应用窗口] 浏览器异常退出（%s），改用默认浏览器" % rc)
+            _open_in_browser(url)
+
+    threading.Thread(target=watch, daemon=True).start()
+    return True
+
+
 def _open_browser(url):
+    """打开操作界面：优先用 Edge / Chrome 的「应用窗口」（像桌面客户端），没有就用默认浏览器。"""
+    if not _open_app_window(url):
+        _open_in_browser(url)
+
+
+def _open_in_browser(url):
     import webbrowser
     opened = False
     if legacy_windows():  # Win7 默认浏览器多半是打不开本页面的 IE：优先用装了的 Chrome / Firefox
@@ -5829,7 +5913,7 @@ def main():
         pass
     LOG.write("网页地址：http://127.0.0.1:%d/" % APP.port)
     _say("Sight 部署助手 %s 已启动：%s" % (TOOL_VERSION, url))
-    _say("（浏览器没自动打开的话，把上面的地址复制到浏览器；关闭浏览器 10 分钟后程序自动退出）")
+    _say("（窗口没自动打开的话，把上面的地址复制到浏览器；关闭窗口 10 分钟后程序自动退出）")
     threading.Thread(target=_watchdog, daemon=True).start()
     _start_tray(url)
     if not no_browser:
