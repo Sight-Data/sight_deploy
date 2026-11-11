@@ -752,7 +752,9 @@ function applyUpdate(j) {
   api('POST', '/api/apply_update', {}).then(function () {
     closePanel(j);
     openModal({ title: '正在更新', icon: 'check', body: h('div', null, [h('p', null, ['部署助手正在退出并替换为新版本，几秒后会自动重新打开浏览器；这个页面可以关闭。']),
-      h('p', { style: 'color:var(--ink2);font-size:13px' }, ['如果一直没有重新打开，请到「下载」文件夹手动打开新版本（Windows 双击新下载的 exe；Mac 解压新下载的 zip）。'])]), actions: [] });
+      h('p', { style: 'color:var(--ink2);font-size:13px' }, ['如果一直没有重新打开，请看 ~/.sight-deploy/update.log（Windows 是 %USERPROFILE%\\.sight-deploy\\update.log）里的记录，或到官网下载中心手动下载新版本。'])]), actions: [] });
+    // 应用窗口里（只有一条历史记录）脚本可以自己关掉；普通浏览器标签页会拒绝，没有副作用
+    setTimeout(function () { try { window.close(); } catch (e) { /* ignore */ } }, 8000);
   }).catch(function (e) { toast(e.message); });
 }
 function downloadTool() {

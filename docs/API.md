@@ -115,7 +115,7 @@
 | `rollback` | `host, product, file, full(bool)` | `{}`。Sight DataLink：外部库且备份时记录的结构版本与当前不同 → 直接失败（不论 `full`），提示先用数据库备份恢复；读不到版本时会用 `confirm` 再问一次 |
 | `gateway_show` | `host` | `{"gateway": {...}}`：再次查看移动网关的证书指纹和接入令牌（服务器上执行 `show`），字段同下「Sight 移动网关」的 `gateway`；令牌只在结果里，不进本地日志 |
 | `download_package` | `product`（`sight-report` / `sight-wall` / `sight-datalink` / `sight-mobile-gateway`；官网条目 id 分别是 `dl-report` / `dl-wall` / `dl-datalink` / `dl-gateway-linux-<arch>`），移动网关另需 `arch`（`amd64` / `arm64` / `loong64`），结果里也带 `arch` | `{"path", "name", "size", "product", "version", "mtime", "dir", "reused"}`：从官网下载该产品最新版到 `~/.sight-deploy/uploads/`（断点续传、zip 完整性校验）；本机常用位置已有同名同大小的包就直接复用（`reused=true`）。拿到的 `path` 直接用于 `deploy` |
-| `download_tool` | 无 | `{"path", "name", "dir", "version", "howto": [...], "can_apply"}`：下载新版部署助手到「下载」目录；已是最新时失败。下载本身不会替换正在运行的程序；Windows 打包版、macOS 上从 .app 里运行的打包版 `can_apply=true`，可再调 `POST /api/apply_update` 自更新（Mac 在「下载」里直接打开、被系统放进只读沙盒的 .app 不行，要先拖到「应用程序」） |
+| `download_tool` | 无 | `{"path", "name", "dir", "version", "howto": [...], "can_apply"}`：下载新版部署助手到「下载」目录；已是最新时失败。下载本身不会替换正在运行的程序；Windows 打包版、macOS 上从 .app 里运行的打包版 `can_apply=true`，可再调 `POST /api/apply_update` 自更新（文件放在 `~/.sight-deploy/updates/`，不是「下载」；Mac 在「下载」里直接打开、被系统放进只读沙盒的 .app 不行，要先拖到「应用程序」） |
 
 `status` 结果：
 ```json
@@ -238,7 +238,7 @@ Sight DataLink 的数据库描述来自 `data/datalink.properties` 的 `DB_URL`�
     - 选安装包：官网条目按架构各一条（`variants`）；已知服务器架构（`status.arch`）时只列匹配的，本机包架构不符的打「与服务器架构不符」标，点「下一步」时直接拦下；`download_package` 要带 `arch`。
     - 安装完成页：`results[].gateway.token` 存在时醒目显示「网关地址 / 证书指纹 / 接入令牌」三项（各有复制按钮）、下一步三步说明和端口放行提醒；升级完成页只显示版本和「令牌与指纹没变」。回滚对话框没有「恢复范围」，只换回旧程序。
 11. **在线更新提示**：启动后（设置里没关「启动时自动检查更新」）后台调 `GET /api/online`：
-    - 部署助手有新版本 → 页面顶部横幅「下载新版本 / 忽略此版本」，侧栏版本号旁出现「有新版本」；点「下载新版本」跑 `download_tool`，成功后提供「在文件夹中显示」；Windows 打包版和 Mac 的 .app 还提供「立即更新并重启」（`POST /api/apply_update`）：Windows 写 `~/.sight-deploy/update.ps1`，等本进程退出后用新 exe 覆盖当前 exe 并重新启动，覆盖失败就直接启动下载的 exe；Mac 写 `~/.sight-deploy/update.sh`，等本进程退出后解压新 zip，把旧 .app 挪开、换上新 .app 并打开，换不上就放回旧 .app，把新 .app 放在 zip 旁边打开。
+    - 部署助手有新版本 → 页面顶部横幅「下载新版本 / 忽略此版本」，侧栏版本号旁出现「有新版本」；点「下载新版本」跑 `download_tool`，成功后提供「在文件夹中显示」；Windows 打包版和 Mac 的 .app 还提供「立即更新并重启」（`POST /api/apply_update`）：Windows 把当前 exe 改名为 `.exe.old`、换上新 exe，再带 `--after-update <旧进程号>` 拉起它（新进程等旧进程退出才开始，并删掉 `.old`），复制失败会改回原样，换不上就直接运行下载的 exe；Mac 写 `~/.sight-deploy/update.sh`，等本进程退出后解压新 zip，把旧 .app 挪开、换上新 .app 并打开，换不上就放回旧 .app，把新 .app 放进「下载」打开。每一步记在 `~/.sight-deploy/update.log`。覆盖前会校验下载的文件（exe 要有 `MZ` 头，zip 里要有 .app），能自更新的平台把新版下载到 `~/.sight-deploy/updates/`。
     - 产品卡：已安装版本低于官网最新时，版本旁出现「官网有 X」标签和一条提示；点「升级」自动预选版本最高的包（本机包与官网最新版里选高的，同版本优先用本机的）。
     - 侧栏「检查更新」：强制刷新（`?refresh=1`）并弹出汇总（部署助手、两个产品的最新版本、哪些已添加的服务器可升级）；连不上官网时说明原因。
     - 联网失败一律不打断使用：自动检查失败时静默，选包对话框里提示「只能使用本机上的安装包」。

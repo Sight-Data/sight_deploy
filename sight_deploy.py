@@ -51,7 +51,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-TOOL_VERSION = "2.5.0"
+TOOL_VERSION = "2.5.1"
 CONF_DIR = Path(os.environ.get("SIGHT_DEPLOY_HOME") or (Path.home() / ".sight-deploy"))
 FROZEN = getattr(sys, "frozen", False)
 # 程序所在目录：打包后是 exe/.app 所在目录（用来找同目录下的安装包），源码运行是本文件目录
@@ -4543,12 +4543,31 @@ def job_download_tool(ctx, p):
         raise DeployError("这个系统暂时没有可下载的安装包", "请到 %s/downloads 查看" % SITE_BASE)
     ok("最新版 %s（当前 %s）" % (t["latest"], TOOL_VERSION))
     name = _safe_name(t.get("file_name"), "Sight部署助手-%s%s" % (t["latest"], ".exe" if os.name == "nt" else ".zip"))
+    can_apply = can_self_update()
     home = Path.home()
-    d = home / "Downloads" if (home / "Downloads").is_dir() else home
+    if can_apply:  # 能自动替换的：下载到程序自己的目录，不放「下载」文件夹（免得和正在运行的 exe 同名、也不留垃圾）
+        d = CONF_DIR / "updates"
+        d.mkdir(parents=True, exist_ok=True)
+        for f in d.iterdir():  # 以前没替换成的残留；.part 留着，可以接着下
+            if f.is_file() and f.name != name and not f.name.endswith(".part"):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+    else:
+        d = home / "Downloads" if (home / "Downloads").is_dir() else home
     step("下载 %s" % name)
     dest = download_file(t["url"], d / name, "下载 Sight 部署助手 %s" % t["latest"], _remote_size(t["url"]))
+    try:
+        _check_update_file(dest)
+    except DeployError:
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+        raise
+    ok("文件校验通过（%.1f MB）" % (dest.stat().st_size / 1048576.0))
     APP.tool_download = str(dest)
-    can_apply = can_self_update()
     if can_apply:
         mac = os.name != "nt"
         howto = ["点下面的「立即更新并重启」：程序会退出，用新版本替换当前的 %s，然后自动重新打开" % (Path(_mac_app_bundle()).name if mac else Path(sys.executable).name),
@@ -4580,33 +4599,210 @@ def can_self_update():
     return sys.platform == "darwin" and bool(_mac_app_bundle())
 
 
-def _ps_quote(s):
-    return "'" + str(s).replace("'", "''") + "'"
+def _ulog(msg):
+    """自更新的每一步都记一行到 ~/.sight-deploy/update.log（同时写进运行日志）：更新没成功时，靠它看卡在哪一步。"""
+    LOG.write("  [自更新] " + msg)
+    try:
+        CONF_DIR.mkdir(parents=True, exist_ok=True)
+        f = CONF_DIR / "update.log"
+        if f.exists() and f.stat().st_size > 200 * 1024:
+            f.write_text("", encoding="utf-8")
+        with open(f, "a", encoding="utf-8") as fh:
+            fh.write("%s  %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except OSError:
+        pass
 
 
-def _mac_update_script(pid, zip_path, app, work):
+def _check_update_file(path):
+    """覆盖正在运行的程序之前先确认下载的东西靠谱：exe 要有 MZ 文件头且不能太小，zip 要能打开且里面有 .app。
+    官网或代理返回错误页（HTTP 200）时大小核对是过得去的，不查的话会把好好的程序换成一个网页。"""
+    path = Path(path)
+    size = path.stat().st_size
+    ext = path.suffix.lower()
+    hint = "可能是网络或代理返回了错误页面。请重试，或到 %s/downloads 手动下载" % SITE_BASE
+    if ext == ".exe":
+        with open(path, "rb") as f:
+            head = f.read(2)
+        if head != b"MZ" or size < (1 << 20):
+            raise DeployError("下载的文件不是有效的程序（%d 字节）" % size, hint)
+    elif ext == ".zip":
+        try:
+            with zipfile.ZipFile(path) as zf:
+                good = any(n.split("/")[0].endswith(".app") for n in zf.namelist())
+        except (zipfile.BadZipFile, OSError):
+            good = False
+        if not good:
+            raise DeployError("下载的 zip 无效，或里面没有 .app（%d 字节）" % size, hint)
+
+
+def _wait_pid_exit(pid, timeout=30.0):
+    """等指定进程退出，最多 timeout 秒：进程已经不在就立刻返回 True，超时返回 False。"""
+    pid = int(pid)
+    if os.name == "nt":
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        h = k32.OpenProcess(0x00100000, 0, pid)  # SYNCHRONIZE；打不开 = 进程已经不在了
+        if not h:
+            return True
+        try:
+            return k32.WaitForSingleObject(h, int(timeout * 1000)) == 0
+        finally:
+            k32.CloseHandle(h)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass
+        time.sleep(0.1)
+    return False
+
+
+def _swap_exe(target, new):
+    """Windows 不让覆盖 / 删除正在运行的 exe，但允许改名：把当前 exe 改名成 .old，再把新 exe 复制到原路径。
+    复制失败（磁盘满、被杀毒拦截……）就把旧的改回来，保证原来的程序不丢。返回 .old 的路径。"""
+    target, new = Path(target), Path(new)
+    old = target.with_name(target.name + ".old")
+    try:
+        if old.exists():
+            old.unlink()  # 上一次更新留下的
+    except OSError:
+        pass
+    os.replace(target, old)
+    try:
+        shutil.copyfile(new, target)
+        if target.stat().st_size != new.stat().st_size:
+            raise OSError("复制后文件大小不一致")
+    except Exception:
+        _unswap_exe(target, old)
+        raise
+    return old
+
+
+def _unswap_exe(target, old):
+    try:
+        if Path(target).exists():
+            Path(target).unlink()
+    except OSError:
+        pass
+    os.replace(old, target)
+
+
+def _clean_env():
+    """打包版 exe 是「解压到临时目录再运行」：必须清掉 PyInstaller 留在环境里的变量，否则新进程会误用旧进程已被删除的临时目录。"""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("_PYI") and k != "_MEIPASS2"}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
+
+
+def _apply_tool_update_win(new):
+    """Windows：自己把当前 exe 改名为 .old、换上新 exe，再带 --after-update 拉起新版本（它会等本进程退出后才开始）。
+    不再用 PowerShell 脚本：少一层会被组策略 / 杀毒拦截的环节，出错也能在这里直接捕获并回滚。
+    换不上（目录没有写权限等）就直接运行下载的新 exe，保证用户总能跑上新版本。"""
+    target = Path(sys.executable).resolve()
+    same = os.path.normcase(str(new.resolve())) == os.path.normcase(str(target))
+    run, old = target, None
+    if same:
+        _ulog("下载的就是当前程序本身，直接重新启动")
+    else:
+        _ulog("开始替换：%s → %s" % (new, target))
+        try:
+            old = _swap_exe(target, new)
+            _ulog("已替换，旧版本改名为 %s" % old.name)
+        except OSError as e:
+            _ulog("替换失败（%s），改为直接运行下载的新版本" % e)
+            run = new
+    try:
+        subprocess.Popen([str(run), "--after-update", str(os.getpid())], env=_clean_env(), cwd=str(Path.home()),
+                         creationflags=0x00000008 | 0x00000200,  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+                         close_fds=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as e:
+        _ulog("启动新版本失败：%s" % e)
+        if old:
+            try:
+                _unswap_exe(target, old)
+                _ulog("已恢复旧版本")
+            except OSError as e2:
+                _ulog("恢复旧版本也失败了：%s" % e2)
+        raise DeployError("无法启动新版本：%s" % e, "请手动退出程序后运行新下载的版本：%s" % new)
+    _ulog("已启动新版本（%s），等本进程退出后它才会开始工作" % run)
+    if old:
+        try:
+            new.unlink()
+        except OSError:
+            pass
+
+
+def _after_update():
+    """被「立即更新并重启」拉起时：等旧进程退出再往下走，否则会把还没退干净的旧实例当成「已在运行」。"""
+    if "--after-update" not in sys.argv:
+        return
+    i = sys.argv.index("--after-update")
+    pid = _int(sys.argv[i + 1]) if i + 1 < len(sys.argv) else 0
+    if pid <= 0:
+        return
+    done = _wait_pid_exit(pid, 30)
+    _ulog("新版本 %s 已启动（旧进程%s）" % (TOOL_VERSION, "已退出" if done else "30 秒内没有退出，继续启动"))
+
+
+def _cleanup_old_exe():
+    """上一次更新留下的 xxx.exe.old：旧进程退出后才删得掉，后台重试一会儿。"""
+    if not (FROZEN and os.name == "nt"):
+        return
+    old = Path(sys.executable + ".old")
+    if not old.exists():
+        return
+
+    def run():
+        for _ in range(60):
+            try:
+                old.unlink()
+                _ulog("已删除旧版本文件 %s" % old.name)
+                return
+            except FileNotFoundError:
+                return
+            except OSError:
+                time.sleep(1)
+        _ulog("旧版本文件 %s 没删掉（可以手动删除）" % old)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _mac_update_script(pid, zip_path, app, work, log, fallback_dir):
     """macOS 自更新脚本：等旧进程退出 → 解压新版 zip → 把旧 .app 挪开、换上新 .app → 打开。
-    任何一步失败都不丢旧版：换不上就放回旧版，再把新版放在 zip 旁边打开，保证用户总能跑上新版本。"""
+    任何一步失败都不丢旧版：换不上就放回旧版，再把新版放进 fallback_dir（「下载」）打开，保证用户总能跑上新版本。
+    每一步写进 log（update.log）。"""
     q = shlex.quote
     return "\n".join([
         "#!/bin/bash",
-        "OLD=%d; ZIP=%s; APP=%s; WORK=%s" % (pid, q(str(zip_path)), q(str(app)), q(str(work))),
+        "OLD=%d; ZIP=%s; APP=%s; WORK=%s; LOGF=%s; FB=%s" % (
+            pid, q(str(zip_path)), q(str(app)), q(str(work)), q(str(log)), q(str(fallback_dir))),
+        'say() { echo "$(date "+%Y-%m-%d %H:%M:%S")  $*" >> "$LOGF"; }',
+        'say "[脚本] 等旧进程 $OLD 退出"',
         'for i in $(seq 1 120); do kill -0 "$OLD" 2>/dev/null || break; sleep 0.5; done',
         'rm -rf "$WORK"; mkdir -p "$WORK"',
         'if ditto -x -k "$ZIP" "$WORK" 2>/dev/null; then',
         '  NEW=$(ls -d "$WORK"/*.app 2>/dev/null | head -1)',
         'fi',
-        'if [ -z "$NEW" ] || [ ! -d "$NEW" ]; then open -R "$ZIP"; rm -rf "$WORK"; exit 1; fi',
+        'if [ -z "$NEW" ] || [ ! -d "$NEW" ]; then say "[脚本] 解压失败或 zip 里没有 .app，保留旧版"; open -R "$ZIP"; rm -rf "$WORK"; exit 1; fi',
         'xattr -cr "$NEW" 2>/dev/null',
         'BAK="$APP.old-$$"',
         'if mv "$APP" "$BAK" 2>/dev/null; then',
         '  if mv "$NEW" "$APP" 2>/dev/null; then',
-        '    rm -rf "$BAK" "$ZIP" "$WORK"; open "$APP"; exit 0',
+        '    say "[脚本] 已替换 $APP，正在打开"; rm -rf "$BAK" "$ZIP" "$WORK"; open "$APP"; exit 0',
         '  fi',
-        '  rm -rf "$APP"; mv "$BAK" "$APP"',
+        '  say "[脚本] 换上新版失败，放回旧版"; rm -rf "$APP"; mv "$BAK" "$APP"',
+        'else',
+        '  say "[脚本] 无法移动旧 .app（可能没有写权限）：$APP"',
         'fi',
-        'DEST="$(dirname "$ZIP")/$(basename "$NEW")"',
-        'rm -rf "$DEST"; mv "$NEW" "$DEST" && open "$DEST" || open -R "$ZIP"',
+        'mkdir -p "$FB"; DEST="$FB/$(basename "$NEW")"',
+        'rm -rf "$DEST"; if mv "$NEW" "$DEST"; then say "[脚本] 新版放在 $DEST 并打开"; open "$DEST"; else say "[脚本] 放到 $FB 也失败"; open -R "$ZIP"; fi',
         'rm -rf "$WORK"',
         "",
     ])
@@ -4616,58 +4812,34 @@ def _apply_tool_update_mac(new):
     app = _mac_app_bundle()
     work = CONF_DIR / "update-work"
     script = CONF_DIR / "update.sh"
+    home = Path.home()
+    fb = home / "Downloads" if (home / "Downloads").is_dir() else home
     CONF_DIR.mkdir(parents=True, exist_ok=True)
-    script.write_text(_mac_update_script(os.getpid(), new, app, work), encoding="utf-8")
-    env = {k: v for k, v in os.environ.items() if not k.startswith("_PYI") and k != "_MEIPASS2"}
-    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    script.write_text(_mac_update_script(os.getpid(), new, app, work, CONF_DIR / "update.log", fb), encoding="utf-8")
     try:
-        subprocess.Popen(["/bin/bash", str(script)], env=env, start_new_session=True, close_fds=True,
+        subprocess.Popen(["/bin/bash", str(script)], env=_clean_env(), start_new_session=True, close_fds=True,
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as e:
+        _ulog("无法启动更新脚本：%s" % e)
         raise DeployError("无法启动更新脚本：%s" % e, "请手动退出程序后解压新下载的 zip，替换旧的 .app：%s" % new)
-    LOG.write("  [自更新] 已启动更新脚本 %s：%s → %s" % (script, new, app))
+    _ulog("已启动更新脚本 %s：%s → %s" % (script, new, app))
 
 
 def apply_tool_update():
-    """Windows：写一个 PowerShell 脚本，等当前进程退出后用新下载的 exe 覆盖当前 exe，再启动它。
-    覆盖失败（目录没有写权限等）就直接启动下载的那个 exe，保证用户总能跑上新版本。
-    macOS：见 _mac_update_script。"""
+    """Windows：见 _apply_tool_update_win（改名 + 复制 + 拉起新版本）。macOS：见 _mac_update_script。"""
     if not can_self_update():
         raise DeployError("当前系统不支持自动更新", "请手动退出程序后运行新下载的版本")
     new = Path(APP.tool_download or "")
     if not APP.tool_download or not new.is_file():
         raise DeployError("找不到刚下载的新版本", "请重新点「下载新版本」")
-    if os.name != "nt":
-        return _apply_tool_update_mac(new)
-    target = Path(sys.executable).resolve()
-    same = os.path.normcase(str(new.resolve())) == os.path.normcase(str(target))
-    script = CONF_DIR / "update.ps1"
-    lines = [
-        "$ErrorActionPreference = 'Continue'",
-        "$old = %d; $new = %s; $target = %s" % (os.getpid(), _ps_quote(new), _ps_quote(target)),
-        "for ($i = 0; $i -lt 120; $i++) { if (-not (Get-Process -Id $old -ErrorAction SilentlyContinue)) { break }; Start-Sleep -Milliseconds 500 }",
-        "$ok = $false",
-        "if ($new -ieq $target) { $ok = $true } else {",
-        "  for ($i = 0; $i -lt 30 -and -not $ok; $i++) {",
-        "    try { Copy-Item -LiteralPath $new -Destination $target -Force -ErrorAction Stop; $ok = $true } catch { Start-Sleep -Milliseconds 500 }",
-        "  }",
-        "}",
-        "if ($ok) { if ($new -ine $target) { Remove-Item -LiteralPath $new -Force -ErrorAction SilentlyContinue }; Start-Process -FilePath $target }",
-        "else { Start-Process -FilePath $new }",
-    ]
-    CONF_DIR.mkdir(parents=True, exist_ok=True)
-    script.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8-sig")  # 带 BOM，PowerShell 才会按 UTF-8 读中文路径
-    # 打包版 exe 是「解压到临时目录再运行」：必须清掉 PyInstaller 留在环境里的变量，否则新进程会误用旧进程已被删除的临时目录
-    env = {k: v for k, v in os.environ.items() if not k.startswith("_PYI") and k != "_MEIPASS2"}
-    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
-    flags = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
     try:
-        subprocess.Popen(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script)],
-                         env=env, creationflags=flags, close_fds=True,
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except OSError as e:
-        raise DeployError("无法启动更新脚本：%s" % e, "请手动退出程序后运行新下载的版本：%s" % new)
-    LOG.write("  [自更新] 已启动更新脚本 %s：%s → %s%s" % (script, new, target, "（同一个文件）" if same else ""))
+        _check_update_file(new)
+    except DeployError:
+        _ulog("校验未通过，不替换：%s" % new)
+        raise
+    if os.name == "nt":
+        return _apply_tool_update_win(new)
+    return _apply_tool_update_mac(new)
 
 
 def reveal_file(path):
@@ -5943,6 +6115,7 @@ def main():
         port_arg = _int(sys.argv[sys.argv.index("--port") + 1])
     _mac_untranslocate()
     CONF_DIR.mkdir(parents=True, exist_ok=True)
+    _after_update()
     url = _existing_instance()
     if url:
         _say("Sight 部署助手已在运行：%s" % url)
@@ -5976,6 +6149,7 @@ def main():
     _say("Sight 部署助手 %s 已启动：%s" % (TOOL_VERSION, url))
     _say("（窗口没自动打开的话，把上面的地址复制到浏览器；关闭窗口 10 分钟后程序自动退出）")
     threading.Thread(target=_watchdog, daemon=True).start()
+    _cleanup_old_exe()
     _start_tray(url)
     if not no_browser:
         threading.Timer(0.5, _open_browser, args=(url,)).start()
