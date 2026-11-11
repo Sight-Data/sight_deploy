@@ -51,7 +51,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-TOOL_VERSION = "2.4.0"
+TOOL_VERSION = "2.5.0"
 CONF_DIR = Path(os.environ.get("SIGHT_DEPLOY_HOME") or (Path.home() / ".sight-deploy"))
 FROZEN = getattr(sys, "frozen", False)
 # 程序所在目录：打包后是 exe/.app 所在目录（用来找同目录下的安装包），源码运行是本文件目录
@@ -4550,8 +4550,9 @@ def job_download_tool(ctx, p):
     APP.tool_download = str(dest)
     can_apply = can_self_update()
     if can_apply:
-        howto = ["点下面的「立即更新并重启」：程序会退出，用新版本替换当前的 %s，然后自动重新打开" % Path(sys.executable).name,
-                 "服务器信息会保留；新版本下载的 exe 在替换成功后会自动删除"]
+        mac = os.name != "nt"
+        howto = ["点下面的「立即更新并重启」：程序会退出，用新版本替换当前的 %s，然后自动重新打开" % (Path(_mac_app_bundle()).name if mac else Path(sys.executable).name),
+                 "服务器信息会保留；新下载的 %s 在替换成功后会自动删除" % ("zip" if mac else "exe")]
     elif (tool_platform() or "").startswith("windows"):
         howto = ["先退出当前的部署助手（界面左下角「退出程序」，或右下角通知区图标右键 → 退出）", "再双击新下载的 exe 运行；旧版本的 exe 可以删除"]
     else:
@@ -4561,23 +4562,83 @@ def job_download_tool(ctx, p):
     return {"path": str(dest), "name": dest.name, "dir": str(d), "version": t["latest"], "howto": howto, "can_apply": can_apply}
 
 
+def _mac_app_bundle(exe=None):
+    """macOS：当前程序所在的 .app 路径（不是从 .app 里运行的、或在 AppTranslocation 只读沙盒里运行的，返回 None）。"""
+    exe = exe or sys.executable
+    if "/AppTranslocation/" in exe or ".app/Contents/MacOS/" not in exe:
+        return None
+    return exe.split(".app/Contents/MacOS/")[0] + ".app"
+
+
 def can_self_update():
-    """只有 Windows 打包版的 exe 能自己替换自己（运行中的 exe 不能覆盖，要等进程退出后由一个脚本来做）。"""
-    return bool(FROZEN and os.name == "nt")
+    """Windows 打包版的 exe、macOS 的 .app 能自己替换自己（运行中的程序不能覆盖，要等进程退出后由一个脚本来做）。
+    macOS 上从「下载」里直接打开（被系统放进只读沙盒）的 .app 不能换：要先拖到「应用程序」里。"""
+    if not FROZEN:
+        return False
+    if os.name == "nt":
+        return True
+    return sys.platform == "darwin" and bool(_mac_app_bundle())
 
 
 def _ps_quote(s):
     return "'" + str(s).replace("'", "''") + "'"
 
 
+def _mac_update_script(pid, zip_path, app, work):
+    """macOS 自更新脚本：等旧进程退出 → 解压新版 zip → 把旧 .app 挪开、换上新 .app → 打开。
+    任何一步失败都不丢旧版：换不上就放回旧版，再把新版放在 zip 旁边打开，保证用户总能跑上新版本。"""
+    q = shlex.quote
+    return "\n".join([
+        "#!/bin/bash",
+        "OLD=%d; ZIP=%s; APP=%s; WORK=%s" % (pid, q(str(zip_path)), q(str(app)), q(str(work))),
+        'for i in $(seq 1 120); do kill -0 "$OLD" 2>/dev/null || break; sleep 0.5; done',
+        'rm -rf "$WORK"; mkdir -p "$WORK"',
+        'if ditto -x -k "$ZIP" "$WORK" 2>/dev/null; then',
+        '  NEW=$(ls -d "$WORK"/*.app 2>/dev/null | head -1)',
+        'fi',
+        'if [ -z "$NEW" ] || [ ! -d "$NEW" ]; then open -R "$ZIP"; rm -rf "$WORK"; exit 1; fi',
+        'xattr -cr "$NEW" 2>/dev/null',
+        'BAK="$APP.old-$$"',
+        'if mv "$APP" "$BAK" 2>/dev/null; then',
+        '  if mv "$NEW" "$APP" 2>/dev/null; then',
+        '    rm -rf "$BAK" "$ZIP" "$WORK"; open "$APP"; exit 0',
+        '  fi',
+        '  rm -rf "$APP"; mv "$BAK" "$APP"',
+        'fi',
+        'DEST="$(dirname "$ZIP")/$(basename "$NEW")"',
+        'rm -rf "$DEST"; mv "$NEW" "$DEST" && open "$DEST" || open -R "$ZIP"',
+        'rm -rf "$WORK"',
+        "",
+    ])
+
+
+def _apply_tool_update_mac(new):
+    app = _mac_app_bundle()
+    work = CONF_DIR / "update-work"
+    script = CONF_DIR / "update.sh"
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    script.write_text(_mac_update_script(os.getpid(), new, app, work), encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("_PYI") and k != "_MEIPASS2"}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    try:
+        subprocess.Popen(["/bin/bash", str(script)], env=env, start_new_session=True, close_fds=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as e:
+        raise DeployError("无法启动更新脚本：%s" % e, "请手动退出程序后解压新下载的 zip，替换旧的 .app：%s" % new)
+    LOG.write("  [自更新] 已启动更新脚本 %s：%s → %s" % (script, new, app))
+
+
 def apply_tool_update():
     """Windows：写一个 PowerShell 脚本，等当前进程退出后用新下载的 exe 覆盖当前 exe，再启动它。
-    覆盖失败（目录没有写权限等）就直接启动下载的那个 exe，保证用户总能跑上新版本。"""
+    覆盖失败（目录没有写权限等）就直接启动下载的那个 exe，保证用户总能跑上新版本。
+    macOS：见 _mac_update_script。"""
     if not can_self_update():
         raise DeployError("当前系统不支持自动更新", "请手动退出程序后运行新下载的版本")
     new = Path(APP.tool_download or "")
     if not APP.tool_download or not new.is_file():
         raise DeployError("找不到刚下载的新版本", "请重新点「下载新版本」")
+    if os.name != "nt":
+        return _apply_tool_update_mac(new)
     target = Path(sys.executable).resolve()
     same = os.path.normcase(str(new.resolve())) == os.path.normcase(str(target))
     script = CONF_DIR / "update.ps1"
