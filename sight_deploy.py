@@ -5350,7 +5350,8 @@ def job_rollback(ctx, p):
 #       "db_fp": "库地址指纹（识别归组用，可空）",
 #       "entry": {"host": "入口服务器名", "port": 80, "server_name": "report.example.com", "public_url": ""},
 #       "instances": [{"host": "node-01", "product": "sight-report", "port": 9091, "install_dir": "...", "down": false}],
-#       "shared_dir": "/mnt/sight-shared", "gateway": "dmz-01"}}
+#       "shared_dir": "/mnt/sight-shared", "gateway": "dmz-01",
+#       "redis": {"host": "10.0.0.20", "port": 6379, "tls": false}}}   # 只存地址，不存密码
 # 实例用「服务器名 + 产品键」标识（产品键带实例名，如 sight-report@b）。nginx 上游 = instances；
 # 升级中 / 失败没放回的实例 down=true，生成配置时写成 `server … down;`，而不是删掉。
 
@@ -5823,6 +5824,321 @@ def _entry_probe(r, port, server_name):
     return o.strip()[-3:]
 
 
+# ----------------------------------------------------------------------------- Redis
+# 集群的会话、选主、分布式锁、跨节点广播都靠 Redis（nginx 只分流量，替代不了）。
+# 集群记录里的 redis = {"host", "port", "tls"}（只存地址，不存密码；密码每次用到时现问，经 SSH 标准输入传给检查脚本）。
+REDIS_DEFAULT_PORT = 6379
+REDIS_LOCAL = "127.0.0.1"
+REDIS_BLOCK_BEGIN = "# >>> sight-managed redis (do not edit) >>>"
+REDIS_BLOCK_END = "# <<< sight-managed redis <<<"
+
+# 从「节点所在的服务器」上用 bash 的 /dev/tcp 连 Redis（不依赖 redis-cli）：AUTH（有密码时）→ PING → INFO server → QUIT。
+# 密码从标准输入第一行读，不出现在命令行。输出 SIGHT_REDIS=<状态> 与 VERSION=<版本>。
+REDIS_CHECK_SH = r"""
+H=@HOST@; P=@PORT@; TLS=@TLS@
+IFS= read -r PW
+export LC_ALL=C
+exec 3<>"/dev/tcp/$H/$P" 2>/dev/null || { echo SIGHT_REDIS=NOCONN; exit 0; }
+if [ "$TLS" = 1 ]; then echo SIGHT_REDIS=TCPONLY; exit 0; fi
+{
+  if [ -n "$PW" ]; then printf '*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n' "${#PW}" "$PW"; fi
+  printf '*1\r\n$4\r\nPING\r\n'
+  printf '*2\r\n$4\r\nINFO\r\n$6\r\nserver\r\n'
+  printf '*1\r\n$4\r\nQUIT\r\n'
+} >&3
+R=$(timeout 8 cat <&3 2>/dev/null | tr -d '\r')
+case "$R" in
+  *WRONGPASS*|*"invalid password"*|*"invalid username-password"*) echo SIGHT_REDIS=WRONGPASS ;;
+  *NOAUTH*|*"Authentication required"*) echo SIGHT_REDIS=NOAUTH ;;
+  *"protected mode"*) echo SIGHT_REDIS=PROTECTED ;;
+  *+PONG*) echo SIGHT_REDIS=OK ;;
+  *) echo SIGHT_REDIS=BADREPLY; printf '%s\n' "$R" | head -c 200 | head -2 ;;
+esac
+case "$R" in *"without any password"*) echo NOPASS=1 ;; esac
+v=$(printf '%s\n' "$R" | sed -n 's/^redis_version:\(.*\)/\1/p' | head -1); [ -n "$v" ] && echo "VERSION=$v"
+exit 0
+"""
+
+REDIS_ADDR_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,253}[A-Za-z0-9])?$")
+
+
+def parse_redis_addr(text):
+    """「主机」或「主机:端口」→ (主机, 端口)；不合法抛 DeployError。"""
+    t = (text or "").strip()
+    host, _, port = t.partition(":")
+    if not host or not REDIS_ADDR_RE.match(host):
+        raise DeployError("Redis 地址请填「主机」或「主机:端口」，如 10.0.0.20:6379")
+    pn = REDIS_DEFAULT_PORT if not port else _int(port)
+    if not pn or not 0 < pn < 65536:
+        raise DeployError("Redis 端口请填 1~65535")
+    return host, pn
+
+
+def redis_check_script(host, port, tls=False):
+    if not REDIS_ADDR_RE.match(host or "") or not (isinstance(port, int) and 0 < port < 65536):
+        raise DeployError("Redis 地址不合法")
+    return (REDIS_CHECK_SH.replace("@HOST@", shlex.quote(host)).replace("@PORT@", str(port))
+            .replace("@TLS@", "1" if tls else "0"))
+
+
+def parse_redis_check(code, out):
+    d = {}
+    for line in (out or "").splitlines():
+        k, _, v = line.partition("=")
+        if k in ("SIGHT_REDIS", "VERSION", "NOPASS"):
+            d[k] = v.strip()
+    state = d.get("SIGHT_REDIS") or ("NOCONN" if code == 124 else "ERROR")
+    return {"state": state, "version": d.get("VERSION") or None, "nopass": d.get("NOPASS") == "1"}
+
+
+# 状态 → (是否可用, 说明, 建议)
+REDIS_STATES = {
+    "OK": (True, "连接正常", None),
+    "TCPONLY": (True, "端口可达（启用了 TLS，没有校验认证与响应）", None),
+    "NOCONN": (False, "连不上", "检查地址与端口、Redis 的 bind 是否监听了这个地址、防火墙 / 安全组是否放行"),
+    "NOAUTH": (False, "Redis 需要密码，没有提供", "重新检查并输入密码"),
+    "WRONGPASS": (False, "密码不对", "重新检查并输入正确的密码"),
+    "PROTECTED": (False, "Redis 处于保护模式，拒绝了来自其他机器的连接",
+                  "给 Redis 设置密码，并把 bind 改成包含这台服务器可达的地址"),
+    "BADREPLY": (False, "端口有响应，但不像 Redis", "确认地址与端口指向的是 Redis（常见端口 6379；哨兵 26379）"),
+    "ERROR": (False, "检查没有得到结果", "在这台服务器上手工执行 redis-cli -h 地址 -p 端口 ping 看看"),
+}
+
+
+def redis_check(r, host, port, password="", tls=False):
+    """在服务器 r 上检查能否连上 Redis。返回 {state, ok, text, hint, version, nopass}。"""
+    script = redis_check_script(host, port, tls)
+    code, o, _ = r.run_raw("timeout 25 bash -c %s" % shlex.quote(script), stdin=(password or "") + "\n",
+                           timeout=60, secret_out=True)
+    res = parse_redis_check(code, o)
+    ok_, text, hint = REDIS_STATES.get(res["state"], REDIS_STATES["ERROR"])
+    res.update({"ok": ok_, "text": text, "hint": hint})
+    return res
+
+
+def ask_secret_optional(prompt, detail=None):
+    """可以留空的密码输入（Redis 没设密码时直接确定）。"""
+    cancelled, v = _question({"kind": "secret", "title": prompt, "label": prompt, "detail": detail, "optional": True})
+    if cancelled:
+        raise UserAbort()
+    return v or ""
+
+
+def redis_target(ctx, name, rec, ask_missing=True):
+    """集群记录里的 Redis 地址：{host, port, tls}；没记过就问一次（可留空跳过），问到的存进集群记录。"""
+    cur = rec.get("redis") or {}
+    if cur.get("host"):
+        return {"host": cur["host"], "port": _int(cur.get("port")) or REDIS_DEFAULT_PORT, "tls": bool(cur.get("tls"))}
+    if not ask_missing:
+        return None
+    t = ask("集群使用的 Redis 地址（主机:端口，留空则跳过检查）", allow_empty=True, placeholder="如 10.0.0.20:6379",
+            detail=["集群的会话、选主、分布式锁、跨节点广播都用 Redis，nginx 替代不了。",
+                    "地址要写各节点服务器能访问到的，不是这台电脑能访问的。"],
+            validator=lambda v: _addr_error(v) if v else None)
+    if not t:
+        return None
+    host, port = parse_redis_addr(t)
+    with ctx.store.lock:
+        c = ctx.store.data["clusters"].get(name)
+        if c is not None:
+            c["redis"] = {"host": host, "port": port, "tls": False}
+            ctx.store.save()
+    return {"host": host, "port": port, "tls": False}
+
+
+def _addr_error(v):
+    try:
+        parse_redis_addr(v)
+        return None
+    except DeployError as e:
+        return str(e)
+
+
+def redis_preflight(ctx, name, rec, host_names, password=None):
+    """从每台服务器上检查 Redis：返回 [{host, state, ok, text, hint, version}]；没有地址（用户跳过）返回 None。"""
+    tg = redis_target(ctx, name, rec)
+    if not tg:
+        return None, None
+    pw = password if password is not None else ask_secret_optional(
+        "Redis 密码（没设密码就留空）", detail=["只用于这次检查，不会保存。"])
+    out_ = []
+    for hn in host_names:
+        step("从 %s 连接 Redis %s:%d" % (hn, tg["host"], tg["port"]))
+        r = open_host(ctx.store, hn)
+        try:
+            res = redis_check(r, tg["host"], tg["port"], pw, tg["tls"])
+        finally:
+            r.close()
+        res["host"] = hn
+        out_.append(res)
+        if res["ok"]:
+            ok("%s：%s%s" % (hn, res["text"], ("（Redis %s）" % res["version"]) if res.get("version") else ""))
+            if res.get("nopass") and pw:
+                warn("这个 Redis 没有设置密码：同网段的任何机器都能读写集群的会话，建议设置密码")
+            elif res["state"] == "OK" and not pw:
+                warn("这个 Redis 没有要求密码：建议设置密码，并只对节点服务器开放端口")
+        else:
+            warn("%s：%s" % (hn, res["text"]))
+            if res.get("hint"):
+                info("   " + res["hint"])
+    return tg, out_
+
+
+def job_cluster_redis_check(ctx, p):
+    """检查集群里每台服务器能否连上 Redis（设计文档 §8.3 第 2 步）。"""
+    name = p.get("cluster")
+    rec = _cluster(ctx, name)
+    hosts = []
+    for m in rec.get("instances") or []:
+        if m["host"] not in hosts:
+            hosts.append(m["host"])
+    if not hosts:
+        raise DeployError("集群里还没有实例")
+    tg, res = redis_preflight(ctx, name, rec, hosts)
+    if not tg:
+        raise DeployError("没有填写 Redis 地址，没有检查")
+    bad = [x for x in res if not x["ok"]]
+    if bad:
+        raise DeployError("%d 台服务器连不上 Redis（%s:%d）：%s" % (len(bad), tg["host"], tg["port"],
+                          "；".join("%s %s" % (x["host"], x["text"]) for x in bad)),
+                          bad[0].get("hint") or "")
+    ok("所有节点服务器都能连上 Redis %s:%d" % (tg["host"], tg["port"]))
+    return {"redis": tg, "results": res}
+
+
+# ---- 同机多实例：在这台服务器上装一个本机 Redis（只监听 127.0.0.1，设密码）
+# 多台服务器的集群不提供：Redis 要被多台访问，放在哪台都是新的单点，由现场自己准备（已有的 Redis 或专用机器）。
+REDIS_PROBE_SH = r"""
+echo "bin=$(command -v redis-server 2>/dev/null || true)"
+echo "listen=$( (ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null) | grep -cE '[:.]@PORT@[[:space:]]' )"
+for u in redis-server redis redis6; do
+  if systemctl list-unit-files "$u.service" 2>/dev/null | grep -q "^$u.service"; then echo "unit=$u"; break; fi
+done
+for c in /etc/redis/redis.conf /etc/redis.conf /etc/redis/6379.conf; do [ -f "$c" ] && { echo "conf=$c"; break; }; done
+for m in dnf yum apt-get zypper; do command -v $m >/dev/null 2>&1 && { echo "pkg=$m"; break; }; done
+command -v systemctl >/dev/null 2>&1 && echo "systemd=1"
+"""
+
+REDIS_INSTALL_CMDS = {
+    "dnf": "dnf -y install redis", "yum": "yum -y install redis",
+    "apt-get": "DEBIAN_FRONTEND=noninteractive apt-get install -y redis-server",
+    "zypper": "zypper -n install redis",
+}
+
+# 往 Redis 配置末尾追加（先删掉自己上一次写的）一段：只监听本机、设密码、开 AOF。同名指令以后出现的为准，不动原来的内容。
+# 密码从种子文件读（push_seed 写的 0600 临时文件），不进命令行。
+REDIS_APPLY_SH = r"""
+set -e
+CONF=@CONF@; SEED=@SEED@; PORT=@PORT@
+PW=$(cat "$SEED"); rm -f "$SEED"
+[ -f "$CONF.sight.bak" ] || cp -p "$CONF" "$CONF.sight.bak"
+sed -i '\|@BEGIN@|,\|@END@|d' "$CONF"
+{
+  echo '@BEGIN@'
+  echo 'bind @LOCAL@'
+  echo 'protected-mode yes'
+  echo "port $PORT"
+  echo "requirepass $PW"
+  echo 'appendonly yes'
+  echo '@END@'
+} >> "$CONF"
+"""
+
+
+def redis_apply_script(conf, seed, port=REDIS_DEFAULT_PORT):
+    return (REDIS_APPLY_SH.replace("@CONF@", shlex.quote(conf)).replace("@SEED@", shlex.quote(seed))
+            .replace("@PORT@", str(int(port))).replace("@BEGIN@", REDIS_BLOCK_BEGIN)
+            .replace("@END@", REDIS_BLOCK_END).replace("@LOCAL@", REDIS_LOCAL))
+
+
+def parse_kv_lines(o):
+    d = {}
+    for line in (o or "").splitlines():
+        k, _, v = line.partition("=")
+        if k and _:
+            d[k.strip()] = v.strip()
+    return d
+
+
+def job_cluster_redis_install(ctx, p):
+    """同机多实例的集群：在这台服务器上装一个本机 Redis（系统软件源），只监听 127.0.0.1 并设密码。"""
+    name = p.get("cluster")
+    rec = _cluster(ctx, name)
+    hosts = sorted({m["host"] for m in rec.get("instances") or []})
+    if len(hosts) != 1:
+        raise DeployError("部署助手只给「同一台服务器上的多个实例」装本机 Redis",
+                          "多台服务器的集群，Redis 放在哪一台都会成为新的单点：请用现场已有的 Redis（或专门一台），"
+                          "在「编辑集群」里填它的地址，再点「检查 Redis」")
+    hn = hosts[0]
+    r = open_host(ctx.store, hn)
+    try:
+        step("检查 %s 上的 Redis" % hn)
+        code, o, _ = r.run(REDIS_PROBE_SH.replace("@PORT@", str(REDIS_DEFAULT_PORT)), sudo=True, timeout=60)
+        d = parse_kv_lines(o)
+        listening = _int(d.get("listen")) or 0
+        if listening and not d.get("bin"):
+            raise DeployError("本机 %d 端口已经被占用，但没有找到 redis-server" % REDIS_DEFAULT_PORT,
+                              "确认占用的是什么；如果是别处的 Redis，用「编辑集群」填它的地址")
+        if listening and d.get("bin"):
+            warn("本机已经有 Redis 在运行：部署助手不改它的配置，只检查能不能用")
+            pw = ask_secret_optional("这个 Redis 的密码（没设密码就留空）", detail=["只用于这次检查，不会保存。"])
+            res = redis_check(r, REDIS_LOCAL, REDIS_DEFAULT_PORT, pw)
+            if not res["ok"]:
+                raise DeployError("本机的 Redis 用不了：%s" % res["text"], res.get("hint") or "")
+            ok("本机 Redis 可用%s" % (("（%s）" % res["version"]) if res.get("version") else ""))
+            _save_redis(ctx, name, REDIS_LOCAL, REDIS_DEFAULT_PORT)
+            return {"host": hn, "address": "%s:%d" % (REDIS_LOCAL, REDIS_DEFAULT_PORT), "installed": False, "password": None}
+        if not d.get("systemd"):
+            raise DeployError("这台服务器没有 systemd，部署助手不安装 Redis", "请手工安装并启动 Redis，再用「编辑集群」填地址")
+        if not d.get("bin"):
+            pm = d.get("pkg")
+            if not pm:
+                raise DeployError("没有找到包管理器，没法安装 Redis", "请手工安装 Redis，再用「编辑集群」填地址")
+            if not confirm("在 %s 上用 %s 安装 Redis？" % (hn, pm), True,
+                           detail=["只监听 127.0.0.1（本机的几个实例访问，外面连不上），自动生成密码，开启 AOF 持久化。",
+                                   "需要服务器能访问软件源。Redis 是这个集群的会话与协调中心，本机停了所有实例一起受影响。"]):
+                raise UserAbort()
+            step("从软件源安装 Redis")
+            r.run(REDIS_INSTALL_CMDS[pm], sudo=True, timeout=900, on_line=logline)
+            code, o, _ = r.run(REDIS_PROBE_SH.replace("@PORT@", str(REDIS_DEFAULT_PORT)), sudo=True, timeout=60)
+            d = parse_kv_lines(o)
+            if not d.get("bin"):
+                raise DeployError("从软件源没有装上 Redis", "服务器可能访问不了软件源：请手工安装 Redis，再用「编辑集群」填地址")
+        conf, unit = d.get("conf"), d.get("unit")
+        if not conf or not unit:
+            raise DeployError("找不到 Redis 的配置文件或系统服务", "请手工配置 Redis（监听 127.0.0.1、设密码），再用「编辑集群」填地址")
+        pw = _secrets.token_hex(16)
+        step("配置 Redis（只监听本机、设密码、开启 AOF）")
+        seed = push_seed(r, pw + "\n")
+        r.run(redis_apply_script(conf, seed), sudo=True, check=True, what="写入 Redis 配置", timeout=60)
+        step("启动 Redis")
+        r.run("systemctl enable %s >/dev/null 2>&1 || true; systemctl restart %s" % (shlex.quote(unit), shlex.quote(unit)),
+              sudo=True, check=True, what="启动 Redis", timeout=120)
+        res = None
+        for _i in range(10):
+            res = redis_check(r, REDIS_LOCAL, REDIS_DEFAULT_PORT, pw)
+            if res["ok"]:
+                break
+            time.sleep(1.5)
+        if not res or not res["ok"]:
+            raise DeployError("Redis 装好了但连不上：%s" % (res or {}).get("text", ""),
+                              "在服务器上查看 systemctl status %s 与 %s" % (unit, conf))
+        ok("Redis 已就绪%s，只监听 %s:%d" % ((" " + res["version"]) if res.get("version") else "", REDIS_LOCAL, REDIS_DEFAULT_PORT))
+        _save_redis(ctx, name, REDIS_LOCAL, REDIS_DEFAULT_PORT)
+    finally:
+        r.close()
+    info("把下面的地址和密码填到 SightReport 管理台「系统管理 › 集群」的 Redis 拓扑配置里（密码只在这里显示一次，请复制保存）")
+    return {"host": hn, "address": "%s:%d" % (REDIS_LOCAL, REDIS_DEFAULT_PORT), "installed": True, "password": pw}
+
+
+def _save_redis(ctx, name, host, port):
+    with ctx.store.lock:
+        c = ctx.store.data["clusters"].get(name)
+        if c is not None:
+            c["redis"] = {"host": host, "port": port, "tls": bool((c.get("redis") or {}).get("tls"))}
+            ctx.store.save()
+
+
 def _cluster(ctx, name):
     rec = (ctx.store.snapshot().get("clusters") or {}).get(name or "")
     if not rec:
@@ -6064,7 +6380,7 @@ def _member_status(ctx, m):
 def job_cluster_status(ctx, p):
     name = p.get("cluster")
     rec = _cluster(ctx, name)
-    res = {"cluster": name, "instances": [], "entry": None}
+    res = {"cluster": name, "instances": [], "entry": None, "redis": rec.get("redis")}
     for i, m in enumerate(rec.get("instances") or [], 1):
         out("读取实例 %d/%d：%s %s …" % (i, len(rec["instances"]), m["host"], productName_(m["product"])))
         res["instances"].append(_member_status(ctx, m))
@@ -6183,6 +6499,15 @@ def job_cluster_expand(ctx, p):
     env = dict(sec["env"])
     if rec.get("shared_dir"):
         env["MR_SHARED_DIR"] = rec["shared_dir"]
+
+    step("检查新服务器能否连上 Redis")
+    tg, rres = redis_preflight(ctx, name, rec, [host])
+    if tg is None:
+        warn("没有填写 Redis 地址，跳过检查：新实例连不上 Redis 时会因为「依赖异常」一直不就绪")
+    elif not all(x["ok"] for x in rres):
+        if not confirm("新服务器 %s 连不上 Redis（%s:%d）。仍要继续安装？" % (host, tg["host"], tg["port"]), False,
+                       detail=[x["text"] + ("：" + x["hint"] if x.get("hint") else "") for x in rres if not x["ok"]]):
+            raise UserAbort()
 
     r = open_host(ctx.store, host)
     try:
@@ -6468,11 +6793,20 @@ def save_cluster(store, body):
         gw = (body.get("gateway") or "").strip() or None
         if gw and gw not in hosts:
             raise DeployError("移动网关服务器「%s」不存在" % gw)
+        if "redis" in body:
+            ra = (body.get("redis") or "").strip()
+            if ra:
+                rh, rp = parse_redis_addr(ra)
+                redis_rec = {"host": rh, "port": rp, "tls": bool((prev.get("redis") or {}).get("tls"))}
+            else:
+                redis_rec = None
+        else:
+            redis_rec = prev.get("redis")
         fps = sorted({((hosts[m["host"]].get("products") or {}).get(m["product"]) or {}).get("db_fp") for m in ms} - {None})
         if len(fps) > 1:
             raise DeployError("这几个实例连的不是同一个数据库，不能组成一个集群")
         rec = {"product": product, "db_fp": (fps[0] if fps else prev.get("db_fp")), "entry": entry,
-               "instances": ms, "shared_dir": sd or None, "gateway": gw,
+               "instances": ms, "shared_dir": sd or None, "gateway": gw, "redis": redis_rec,
                "created": prev.get("created") or _dt.datetime.now().strftime("%Y-%m-%d %H:%M")}
         if old and old != name:
             clusters.pop(old, None)
@@ -6499,13 +6833,15 @@ JOB_HANDLERS = {
     "cluster_entry": job_cluster_entry,
     "cluster_expand": job_cluster_expand,
     "cluster_upgrade": job_cluster_upgrade,
+    "cluster_redis_check": job_cluster_redis_check,
+    "cluster_redis_install": job_cluster_redis_install,
 }
 JOB_TITLES = {"add_host": "添加服务器", "edit_host": "修改密码", "test_host": "测试连接", "status": "查询状态",
               "deploy": "安装 / 升级", "service": "启停服务", "logs": "查看日志", "follow_logs": "实时日志",
               "list_backups": "读取备份列表", "rollback": "回滚",
               "download_package": "下载安装包", "download_tool": "下载新版部署助手", "gateway_show": "查看移动网关接入信息",
               "cluster_status": "读取集群状态", "cluster_entry": "配置集群入口", "cluster_expand": "集群扩容",
-              "cluster_upgrade": "集群升级"}
+              "cluster_upgrade": "集群升级", "cluster_redis_check": "检查 Redis", "cluster_redis_install": "安装本机 Redis"}
 
 
 class Job:
