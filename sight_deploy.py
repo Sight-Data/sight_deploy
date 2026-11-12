@@ -104,6 +104,8 @@ def _sight_product(key, name, port, start_class, site_id):
         "site_id": site_id,                 # 官网下载中心条目 id
         "rolling_upgrade": True,            # 多台服务器可以依次滚动升级
         "instances": True,                  # 支持同机多实例（产品包 2.0.117 起的 install.sh --instance）
+        # 能否组集群（nginx 入口、不要粘性会话）。SightWall 的大屏实时流仍依赖粘性会话，另行处理
+        "cluster": key == "sight-report",
         "schema_versioned": False,          # 健康检查报告 schemaVersion，升级 / 回滚时核对
         "waiting_mode": False,              # 健康检查有 mode=waiting（服务已启动但连不上元数据库，自动重试）
         "db_backup_hint": "升级前请先备份数据库，或在 SightReport / SightWall 管理台「系统管理 › 备份」创建一次完整备份。",
@@ -139,6 +141,7 @@ PRODUCTS = {
         "site_id": "dl-datalink",
         "rolling_upgrade": False,           # 多台共用一个外部库（集群）时不能自动滚动升级
         "instances": False,
+        "cluster": False,
         "schema_versioned": True,           # Flyway：外部库的表结构升级不可逆
         "waiting_mode": True,               # 连不上元数据库时 mode=waiting：安装时照常提示，升级时持续一段时间算失败
         "db_backup_hint": "Sight DataLink 用 Flyway 升级元数据库结构，外部库升级后不能只靠回滚程序恢复。",
@@ -169,7 +172,7 @@ PRODUCTS[GATEWAY] = {
     "health": "/healthz",                   # 隧道端口上的 GET /healthz（无需鉴权），返回 {"agents":n}
     "setup_path": None, "setup_token": False, "setup_hint": "", "db_none_desc": "", "db_reader": None,
     "version_api": None, "needs_fonts": False, "owned_dirs": None, "waiting_mode": False,
-    "rolling_upgrade": True, "schema_versioned": False, "instances": False,
+    "rolling_upgrade": True, "schema_versioned": False, "instances": False, "cluster": False,
     "log_files": ("logs/gateway.log",), "follow_log": "logs/gateway.log", "follow_journal": True,
     "site_id": None,                        # 官网按架构分三个下载项，见 GATEWAY_ARCHES[...]["site_id"]
     # 下面几项是 Java 产品才用的，留空值只为让通用代码按字段读取时不出错
@@ -5397,7 +5400,7 @@ def cluster_suggestions(snapshot):
     for hn, h in sorted(hosts.items()):
         for pk, info_ in sorted((h.get("products") or {}).items()):
             fp = info_.get("db_fp")
-            if not fp or pk not in PRODUCTS or is_gateway(pk) or cluster_of(clusters, hn, pk)[0]:
+            if not fp or pk not in PRODUCTS or not PRODUCTS[pk].get("cluster") or cluster_of(clusters, hn, pk)[0]:
                 continue
             groups.setdefault((split_instance(pk)[0], fp), []).append(
                 {"host": hn, "product": pk, "port": info_.get("port"), "version": info_.get("version"),
@@ -6201,8 +6204,9 @@ def save_cluster(store, body):
     if not CLUSTER_RE.match(name):
         raise DeployError("集群名请用小写字母、数字与 -，以字母或数字开头，不超过 32 个字符（会用在 nginx 配置文件名里）")
     product = body.get("product") or "sight-report"
-    if product not in PRODUCTS or not supports_instances(product) or split_instance(product)[1]:
-        raise DeployError("这个产品不支持集群：%s" % product)
+    if product not in PRODUCTS or split_instance(product)[1] or not PRODUCTS[product].get("cluster"):
+        raise DeployError("%s 暂不支持由部署助手组集群" % productName_(product),
+                          "目前只支持 SightReport；SightWall 的大屏实时流还依赖粘性会话，集群另行处理")
     with store.lock:
         clusters = store.data.setdefault("clusters", {})
         if name != old and name in clusters:
@@ -6541,7 +6545,8 @@ def api_state():
                              "setup_path": v["setup_path"], "setup_token": v["setup_token"],
                              "rolling_upgrade": v["rolling_upgrade"], "schema_versioned": v["schema_versioned"],
                              "kind": v.get("kind", "java"), "tunnel_port": v.get("tunnel_port"),
-                             "instances": bool(v.get("instances")), "service": v.get("service")}
+                             "instances": bool(v.get("instances")), "cluster": bool(v.get("cluster")),
+                             "service": v.get("service")}
                          for k, v in PRODUCTS.items()},
             "clusters": snap_clusters(),
             "cluster_suggestions": cluster_suggestions(APP.store.snapshot()),

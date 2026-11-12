@@ -1696,7 +1696,7 @@ function openClusterEdit(name, preset) {
   var product = (c && c.product) || preset.product || 'sight-report';
   var picked = {}; ((c && c.instances) || preset.instances || []).forEach(function (m) { picked[m.host + '|' + m.product] = true; });
   var nameI = h('input', { type: 'text', class: 'inp mono', value: name || preset.name || '', maxlength: '32', placeholder: '如 report-prod' });
-  var prodS = h('select', { class: 'inp' }, Object.keys(S.state.products).filter(function (k) { return productInfo(k).instances; }).map(function (k) { var o = h('option', { value: k }, [productName(k)]); if (k === product) o.selected = true; return o; }));
+  var prodS = h('select', { class: 'inp' }, Object.keys(S.state.products).filter(function (k) { return productInfo(k).cluster; }).map(function (k) { var o = h('option', { value: k }, [productName(k)]); if (k === product) o.selected = true; return o; }));
   if (c) prodS.disabled = true;
   var list = h('div', { class: 'hostpick' });
   function drawList() {

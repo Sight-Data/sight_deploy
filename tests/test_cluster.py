@@ -236,7 +236,8 @@ class SaveCluster(unittest.TestCase):
                 (self.body(instances=[{"host": "zz", "product": "sight-report"}]), "不存在"),
                 (self.body(entry={"host": "a", "port": 9091}), "端口"),
                 (self.body(entry={"host": "a", "public_url": "bi.corp.cn"}), "http"),
-                (self.body(product="sight-datalink"), "不支持集群"),
+                (self.body(product="sight-datalink"), "暂不支持"),
+                (self.body(product="sight-wall", instances=[{"host": "b", "product": "sight-wall"}]), "暂不支持"),
                 (self.body(shared_dir="mnt/x"), "绝对路径")]:
             with self.assertRaises(sd.DeployError, msg=msg) as cm:
                 sd.save_cluster(st, body)

@@ -28,7 +28,7 @@
   ],
   "products": {"sight-report": {"name": "SightReport", "port": 9091, "dir": "/opt/sight-report", "zip_prefix": "sight-report",
                                "setup_path": "/setup", "setup_token": false, "rolling_upgrade": true, "schema_versioned": false,
-                               "kind": "java", "instances": true, "service": "sight-report"},
+                               "kind": "java", "instances": true, "cluster": true, "service": "sight-report"},
                "sight-wall": {...},
                "sight-datalink": {"name": "Sight DataLink", "port": 18680, "dir": "/opt/sight-datalink", "zip_prefix": "sight-datalink",
                               "setup_path": "/", "setup_token": true, "rolling_upgrade": false, "schema_versioned": true},
@@ -211,7 +211,7 @@ Sight DataLink 的数据库描述来自 `data/datalink.properties` 的 `DB_URL`�
 
 ### 集群
 
-几个实例连同一个外部数据库、前面一个 nginx 入口。见 sight-data 仓库 `docs/集群部署与集群入口-设计.md` §4、§6、§8。
+几个实例连同一个外部数据库、前面一个 nginx 入口。只有 `/api/state` 里 `cluster=true` 的产品能组集群（目前只有 SightReport：SightWall 的大屏实时流还依赖粘性会话）。见 sight-data 仓库 `docs/集群部署与集群入口-设计.md` §4、§6、§8。
 
 `GET /api/state` 另有：
 ```json
