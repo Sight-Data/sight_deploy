@@ -55,6 +55,13 @@ svg{width:1em;height:1em;flex:none;vertical-align:-.125em}
 .host .nm{font-weight:600;display:flex;align-items:center;gap:8px}
 .host .ad{color:var(--muted);font-size:12px;font-family:var(--mono);margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
+.clist{padding:0 10px}
+.clsug{display:flex;gap:8px;margin:4px 2px 8px;padding:10px 12px;border-radius:10px;background:var(--accent-bg);color:#244e96;font-size:12.5px;line-height:1.5}
+.clsug>div{display:flex;flex-direction:column;gap:4px;min-width:0}.clsug span{color:var(--ink2);overflow-wrap:anywhere}.clsug .btn{align-self:flex-start;margin-top:2px}
+.itab{width:100%;border-collapse:collapse;font-size:13.5px}
+.itab th{text-align:left;font-weight:600;color:var(--muted);font-size:12.5px;padding:6px 8px;border-bottom:1px solid var(--line)}
+.itab td{padding:9px 8px;border-bottom:1px solid var(--line);vertical-align:middle}
+.itab tr:last-child td{border-bottom:0}.itab .small{font-size:12px;color:var(--muted)}
 .chip{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;line-height:18px;padding:0 7px;border-radius:9px;background:#e4eaf3;color:var(--ink2)}
 .dot{width:7px;height:7px;border-radius:50%;background:#aab4c3;display:inline-block;flex:none}
 .dot.ok{background:var(--ok)}.dot.warn{background:#e9a30f}.dot.bad{background:var(--bad)}
@@ -716,7 +723,7 @@ function buildPicker(opts) {
   return { el: el, get: function () { return sel; }, isUploading: function () { return uploading; } };
 }
 /* ---------- global state ---------- */
-var S = { state: null, sel: null, status: {}, statusErr: {}, statusAt: {}, loading: null };
+var S = { state: null, sel: null, status: {}, statusErr: {}, statusAt: {}, loading: null, cl: null, clStatus: {}, clErr: {}, clLoading: null };
 var J = null; // current local job
 S.online = null; S.onlineP = null;
 
@@ -1131,6 +1138,8 @@ function resultSummary(j) {
     r.results.forEach(function (x) { var g = gatewayBox(x.gateway, x.status === '完成', r.results.length > 1 ? x.host : null); if (g) wrap.appendChild(g); });
     r.results.forEach(function (x) { (x.gateway_notices || []).forEach(function (n) { wrap.appendChild(h('div', { class: 'tok' }, [h('div', { class: 'tt', html: ico('bang') + '<span>' + esc(n.text) + '</span>' }), h('div', { class: 'tn' }, ['到该服务器的「Sight 移动网关」卡片点「升级」，选择 ' + n.target + ' 的网关安装包。'])])); }); });
   }
+  if (j.kind === 'cluster_expand') { var ib = identityBox(r); if (ib) wrap.appendChild(ib); }
+  if (j.kind === 'cluster_entry' && r.url) wrap.appendChild(h('div', { class: 'res' }, [h('div', null, [h('b', null, ['入口地址']), h('a', { href: r.url, target: '_blank', rel: 'noopener' }, [r.url])])]));
   if (j.kind === 'gateway_show' && r.gateway) { var g0 = gatewayBox(r.gateway, true, null, true); if (g0) wrap.appendChild(g0); }
   if (j.kind === 'download_tool' && r.path) {
     wrap.appendChild(h('div', { class: 'small', style: 'color:var(--ink2);font-size:13px;margin-top:4px;word-break:break-all' }, ['已保存到：' + r.path]));
@@ -1186,6 +1195,9 @@ function bannerText(j) {
       if ((r.results || []).some(function (x) { return x.gateway && x.gateway.token; })) return '移动网关安装完成，请把接入信息填到 SightReport';
       return (r.results || []).some(function (x) { return x.mode === 'setup'; }) ? '安装已完成，请继续完成安装向导' : '安装 / 升级已完成';
     case 'gateway_show': return '接入信息已读取';
+    case 'cluster_upgrade': return r.upgraded && r.upgraded.length ? '集群已升级（' + (r.rolling ? '滚动' : '整体停机') + '）' : '所有实例已经是这个版本';
+    case 'cluster_expand': return '扩容完成：新实例已入群' + (r.identity ? '，请重签授权' : '');
+    case 'cluster_entry': return '入口已生效';
     case 'rollback': return '回滚已完成';
     case 'service': return '操作已完成';
     case 'download_package': return (r.reused ? '本机已有这个版本的安装包' : '安装包已下载并校验') + (r.version ? '：' + r.version : '');
@@ -1262,13 +1274,14 @@ function renderSide() {
         return '<span class="chip"><i class="dot"></i>' + esc(productName(id)) + (p.version ? ' ' + esc(p.version) : '') + '</span>';
       }).join('');
     }
-    return '<button class="host' + (hs.name === S.sel ? ' sel' : '') + '" data-act="select" data-n="' + esc(hs.name) + '" type="button">' +
+    return '<button class="host' + (hs.name === S.sel && !S.cl ? ' sel' : '') + '" data-act="select" data-n="' + esc(hs.name) + '" type="button">' +
       '<div class="nm">' + ico('server') + '<span>' + esc(hs.name) + '</span></div>' +
       '<div class="ad">' + esc(hs.user + '@' + hs.host + (hs.port && hs.port != 22 ? ':' + hs.port : '')) + '</div>' +
       (chips ? '<div class="chips">' + chips + '</div>' : '') + '</button>';
   }).join('');
   side.innerHTML =
     '<div class="brand"><div class="logo">' + ico('logo') + '</div><div><b>Sight 部署助手</b><small>版本 ' + esc(st.version || '') + (S.online && S.online.tool && S.online.tool.update ? ' · <a href="#" data-act="updtool" style="color:var(--ok);font-weight:600">有新版本</a>' : '') + '</small></div></div>' +
+    clusterSideHtml() +
     '<div class="side-h"><span>服务器（' + st.hosts.length + '）</span></div>' +
     '<div id="hostlist">' + (hosts || '<div class="side-empty">还没有服务器。<br>先添加一台，才能安装或升级。</div>') + '</div>' +
     '<div class="side-add"><button class="btn" type="button" data-act="addhost">' + ico('plus') + '添加服务器</button></div>' +
@@ -1411,6 +1424,7 @@ function productCard(p, hostRec) {
 function renderMain() {
   var main = $('#main'), st = S.state;
   if (!st.hosts.length) { main.innerHTML = renderEmpty(); applyBusy(); return; }
+  if (S.cl && clusters()[S.cl]) { renderCluster(S.cl); return; }
   var hs = getHost(S.sel);
   if (!hs) { main.innerHTML = ''; return; }
   var res = S.status[hs.name], err = S.statusErr[hs.name], loading = S.loading === hs.name;
@@ -1445,10 +1459,12 @@ function renderMain() {
 function renderAll() {
   if (!S.state) return;
   if (S.sel && !getHost(S.sel)) S.sel = null;
+  if (S.cl && !clusters()[S.cl]) S.cl = null;
   if (!S.sel && S.state.hosts.length) {
-    var last = lsGet('sd_host');
+    var last = lsGet('sd_host'), lastCl = lsGet('sd_cl');
     S.sel = getHost(last) ? last : S.state.hosts[0].name;
-    if (!S.status[S.sel] && !S.loading) setTimeout(function () { startStatus(S.sel); }, 0);
+    if (lastCl && clusters()[lastCl] && S.cl === null) { S.cl = lastCl; setTimeout(function () { if (!isBusy()) loadClusterStatus(lastCl); }, 0); }
+    else if (!S.status[S.sel] && !S.loading) setTimeout(function () { startStatus(S.sel); }, 0);
   }
   renderSide(); renderMain();
 }
@@ -1476,6 +1492,7 @@ function startStatus(name) {
   });
 }
 function selectHost(name) {
+  if (S.cl) { S.cl = null; lsSet('sd_cl', ''); if (name === S.sel) { renderSide(); renderMain(); } }
   if (name === S.sel && (S.status[name] || S.loading === name)) return;
   S.sel = name; lsSet('sd_host', name);
   if (S.loading && S.loading !== name && !(J && J.kind === 'status')) S.loading = null;
@@ -1546,6 +1563,271 @@ function deployFlow(hostName, productId, opts) {
     sync();
   }
   step1();
+}
+
+/* ---------- 集群（docs/集群部署与集群入口-设计.md §8）---------- */
+function clusters() { return (S.state && S.state.clusters) || {}; }
+function clusterNames() { return Object.keys(clusters()).sort(); }
+function memberLabel(m) { return m.host + ' · ' + productName(m.product); }
+function clusterSideHtml() {
+  var names = clusterNames(), sug = (S.state && S.state.cluster_suggestions) || [];
+  if (!names.length && !sug.length) return '';
+  var items = names.map(function (n) {
+    var c = clusters()[n], ms = c.instances || [], down = ms.filter(function (m) { return m.down; }).length;
+    return '<button class="host' + (S.cl === n ? ' sel' : '') + '" data-act="selcl" data-n="' + esc(n) + '" type="button">' +
+      '<div class="nm">' + ico('box') + '<span>' + esc(n) + '</span></div>' +
+      '<div class="ad">' + esc(productName(c.product)) + ' · ' + ms.length + ' 个实例' + (c.entry && c.entry.host ? ' · 入口 ' + esc(c.entry.host) : ' · 未设入口') + '</div>' +
+      (down ? '<div class="chips"><span class="chip"><i class="dot warn"></i>' + down + ' 个已摘下</span></div>' : '') + '</button>';
+  }).join('');
+  var sugs = sug.map(function (g, i) {
+    return '<div class="clsug">' + ico('help') + '<div><b>' + g.instances.length + ' 个 ' + esc(productName(g.product)) + ' 实例连着同一个数据库</b>' +
+      '<span>' + esc(g.instances.map(memberLabel).join('、')) + '</span>' +
+      '<button class="btn sm" type="button" data-act="clsug" data-i="' + i + '">归为一个集群</button></div></div>';
+  }).join('');
+  return '<div class="side-h"><span>集群（' + names.length + '）</span><button class="btn sm ghost" type="button" data-act="newcl" title="新建集群">' + ico('plus') + '</button></div>' +
+    '<div class="clist">' + items + sugs + '</div>';
+}
+function selectCluster(name) {
+  S.cl = name; lsSet('sd_cl', name || '');
+  renderSide(); renderMain();
+  if (name && !S.clStatus[name] && !isBusy()) loadClusterStatus(name);
+}
+function loadClusterStatus(name) {
+  S.clLoading = name; delete S.clErr[name]; renderMain();
+  startJob('cluster_status', { cluster: name }, {
+    panel: false, noRefresh: true,
+    onFail: function () { S.clLoading = null; renderMain(); },
+    onDone: function (j) {
+      S.clLoading = null;
+      if (j.ok && j.result) S.clStatus[name] = j.result; else S.clErr[name] = { error: j.error, hint: j.hint };
+      refreshState().then(function () { renderSide(); renderMain(); });
+    }
+  });
+}
+function stateBadge(x) {
+  if (x.error) return '<span class="badge bad" title="' + esc(x.error) + '">读取失败</span>';
+  if (!x.running) return '<span class="badge bad"><i class="dot"></i>未运行</span>';
+  if (x.ready) return '<span class="badge ok"><i class="dot"></i>就绪</span>';
+  var st = x.state || '';
+  var label = { draining: '正在下线', starting: '启动中', blocked: '版本不兼容', misconfigured: '配置异常', restricted: '依赖异常' }[st] || (x.healthy ? '未就绪' : '无响应');
+  return '<span class="badge warn" title="' + esc((x.reasons || []).join('；')) + '"><i class="dot"></i>' + esc(label) + '</span>';
+}
+function renderCluster(name) {
+  var c = clusters()[name];
+  if (!c) { S.cl = null; renderMain(); return; }
+  var st = S.clStatus[name], err = S.clErr[name], loading = S.clLoading === name, e = c.entry || {};
+  var hsE = e.host && getHost(e.host);
+  var entryUrl = e.public_url || (hsE ? 'http://' + hsE.host + (e.port && e.port != 80 ? ':' + e.port : '') + '/' : '');
+  var head = '<div class="hh"><div class="t"><h1>' + esc(name) + '</h1>' +
+    '<div class="sub">' + esc(productName(c.product)) + ' 集群 · ' + (c.instances || []).length + ' 个实例' + (c.shared_dir ? ' · 共享目录 <span class="mono">' + esc(c.shared_dir) + '</span>' : '') + '</div>' +
+    '<div class="osl">' + (loading ? '<span class="refreshing"><span class="spin"></span>正在读取各实例与入口…</span>' : (entryUrl ? '入口 <a href="' + esc(entryUrl) + '" target="_blank" rel="noopener">' + esc(entryUrl) + '</a>' : '还没有设置入口（nginx）')) + '</div>' +
+    '<div class="acts"><button class="btn" type="button" data-job="1" data-act="clrefresh">' + ico('refresh') + '刷新</button>' +
+    '<button class="btn" type="button" data-job="1" data-act="cledit">编辑</button>' +
+    '<button class="btn" type="button" data-job="1" data-act="clentry">配置入口</button>' +
+    '<button class="btn" type="button" data-job="1" data-act="clexpand">' + ico('plus') + '扩容</button>' +
+    '<button class="btn text-danger" type="button" data-act="cldel">删除</button></div></div>' +
+    '<div class="main-act"><button class="btn primary lg" type="button" data-job="1" data-act="clupgrade">' + ico('upload') + '集群升级</button>' +
+    '<div class="hint">能滚动就逐个升级（不停服），否则整体停机升级</div></div></div>';
+  var notes = '';
+  function note(cls, ic, html) { notes += '<div class="note ' + cls + '" style="margin:0 0 12px">' + ico(ic) + '<div>' + html + '</div></div>'; }
+  var rows = (st ? st.instances : (c.instances || [])).map(function (x) {
+    var m = (c.instances || []).filter(function (y) { return y.host === x.host && y.product === x.product; })[0] || x;
+    var mid = m.host + '|' + m.product, inst = String(m.product).split('@')[1];
+    var fp = !st ? '' : x.crypto_fp ? (x.crypto_ok === false ? '<span class="badge bad" title="加密配置与多数实例不同">不一致</span>' : '<span class="badge ok">一致</span>') : '<span class="badge gray">-</span>';
+    return '<tr><td><b>' + esc(m.host) + '</b>' + (inst ? ' <span class="tag gray">实例 ' + esc(inst) + '</span>' : '') + '<div class="mono small">' + esc((getHost(m.host) || {}).host || '') + ':' + esc(String(x.port || m.port || '')) + '</div></td>' +
+      '<td>' + (st ? esc(x.version || '-') : '<span class="muted">-</span>') + '</td>' +
+      '<td>' + (st ? stateBadge(x) : '<span class="badge gray">未读取</span>') + (x.leader ? ' <span class="tag">leader</span>' : '') + '</td>' +
+      '<td>' + fp + '</td>' +
+      '<td>' + (m.down ? '<span class="badge warn">已摘下</span>' : (e.host ? '<span class="badge ok">在入口</span>' : '<span class="badge gray">-</span>')) + '</td>' +
+      '<td style="text-align:right">' + (e.host ? (m.down ? '<button class="btn sm" type="button" data-job="1" data-act="clup" data-m="' + esc(mid) + '">放回入口</button>'
+        : '<button class="btn sm" type="button" data-job="1" data-act="cldown" data-m="' + esc(mid) + '">摘下</button>') : '') + '</td></tr>';
+  }).join('');
+  if (st) {
+    if (st.crypto_consistent === false) note('bad', 'x', '各实例的<b>加密配置</b>（SIGHTDATA_*_KEY、SIGHTDATA_CRYPTO_AES_GCM）不一致：数据源密码、令牌等在不同实例上解不开。请以多数实例为准修正标为「不一致」的实例（sight.env），再重启它。');
+    if ((st.versions || []).length > 1) note('warn', 'bang', '实例版本不一致（' + esc(st.versions.join('、')) + '）：滚动升级中途是正常的；否则请点「集群升级」统一到同一版本。');
+    st.instances.forEach(function (x) { if (x.error) note('bad', 'x', esc(x.host) + '：' + esc(x.error)); });
+  }
+  if ((c.instances || []).some(function (m) { return m.down; })) note('warn', 'bang', '有实例被摘下（升级失败或手工摘下）：入口不会把请求分给它。处理好之后点「放回入口」。');
+  if (!e.host) note('info', 'help', '还没有设置入口：点「编辑」选一台服务器做入口（装 nginx），再点「配置入口」。入口放在某个实例所在的服务器上时，那台宕机 = 整体不可用。');
+  var ent = '';
+  if (e.host) {
+    var d = st && st.entry;
+    var stLine = !st ? '<span class="badge gray">未读取</span>' : !d ? '-' : d.error ? '<span class="badge bad">' + esc(d.error) + '</span>'
+      : !d.nginx ? '<span class="badge warn">没有安装 nginx</span>'
+      : d.conf !== '1' ? '<span class="badge warn">还没有生成配置</span>'
+      : d.running !== '1' ? '<span class="badge bad">nginx 没有运行</span>'
+      : d.test === 'fail' ? '<span class="badge bad">nginx -t 不通过</span>'
+      : d.probe === '200' ? '<span class="badge ok"><i class="dot"></i>正常</span>' : '<span class="badge warn">经入口访问返回 ' + esc(d.probe || '无响应') + '</span>';
+    ent = '<div class="card" style="margin-bottom:18px"><div class="ch"><div class="pico">' + ico('server') + '</div><div><h2>入口（nginx）</h2><div class="ver">' + esc(e.host) + ' · 端口 ' + esc(String(e.port || 80)) + (d && d.version ? ' · nginx ' + esc(d.version) : '') + '</div></div><div class="sp"></div>' + stLine + '</div>' +
+      '<dl class="kvs"><dt>访问地址</dt><dd>' + (entryUrl ? '<a href="' + esc(entryUrl) + '" target="_blank" rel="noopener">' + esc(entryUrl) + '</a>' : '-') + '</dd>' +
+      '<dt>配置文件</dt><dd class="mono small">/etc/nginx/conf.d/sight-' + esc(name) + '.conf</dd>' +
+      (d && d.test === 'fail' ? '<dt>nginx -t</dt><dd class="mono small">' + esc(d.test_out || '') + '</dd>' : '') + '</dl>' +
+      (d && d.wst === '0' ? '<div class="note info" style="margin:0 20px 14px">' + ico('help') + '<div>建议在 nginx.conf 顶层加 <span class="mono">worker_shutdown_timeout 30s;</span>：每次重载（升级时每个实例两次）老连接最多再保留 30 秒。</div></div>' : '') + '</div>';
+  }
+  var body = (err ? '<div class="errcard" style="margin-bottom:18px"><div class="ic">' + ico('x') + '</div><div style="flex:1;min-width:0"><h3>没能读取集群状态</h3><div>' + esc(err.error || '') + '</div>' + (err.hint ? '<div class="hint">建议：' + esc(err.hint) + '</div>' : '') + '</div></div>' : '') +
+    notes + ent +
+    '<div class="card" style="' + (loading ? 'opacity:.6' : '') + '"><div class="ch"><div class="pico">' + ico('box') + '</div><div><h2>实例</h2><div class="ver">都连同一个外部数据库；nginx 上游就是这张表</div></div></div>' +
+    '<div style="padding:0 20px 16px;overflow-x:auto"><table class="itab"><thead><tr><th>服务器</th><th>版本</th><th>状态</th><th>加密配置</th><th>入口</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div></div>';
+  $('#main').innerHTML = '<div class="wrap">' + updateBannerHtml() + head + body + '</div>';
+  applyBusy();
+}
+/* 所有已知的实例（本地登记 + 已读取的状态），按产品筛选 */
+function knownInstances(base) {
+  var res = [], seen = {};
+  S.state.hosts.forEach(function (hs) {
+    var keys = Object.keys(hs.products || {});
+    var st = S.status[hs.name];
+    if (st) st.products.forEach(function (p) { if (p.installed && keys.indexOf(p.product) < 0) keys.push(p.product); });
+    keys.forEach(function (k) {
+      if (baseOf(k) !== base || seen[hs.name + '|' + k]) return;
+      seen[hs.name + '|' + k] = true;
+      res.push({ host: hs.name, product: k, port: (hs.products[k] || {}).port, version: (hs.products[k] || {}).version });
+    });
+  });
+  return res;
+}
+function clusterOfMember(host, product) {
+  var n = null; clusterNames().forEach(function (k) { (clusters()[k].instances || []).forEach(function (m) { if (m.host === host && m.product === product) n = k; }); });
+  return n;
+}
+function openClusterEdit(name, preset) {
+  var c = name ? clusters()[name] : null, e = (c && c.entry) || {};
+  preset = preset || {};
+  var product = (c && c.product) || preset.product || 'sight-report';
+  var picked = {}; ((c && c.instances) || preset.instances || []).forEach(function (m) { picked[m.host + '|' + m.product] = true; });
+  var nameI = h('input', { type: 'text', class: 'inp mono', value: name || preset.name || '', maxlength: '32', placeholder: '如 report-prod' });
+  var prodS = h('select', { class: 'inp' }, Object.keys(S.state.products).filter(function (k) { return productInfo(k).instances; }).map(function (k) { var o = h('option', { value: k }, [productName(k)]); if (k === product) o.selected = true; return o; }));
+  if (c) prodS.disabled = true;
+  var list = h('div', { class: 'hostpick' });
+  function drawList() {
+    list.innerHTML = '';
+    var ins = knownInstances(prodS.value);
+    if (!ins.length) list.appendChild(h('div', { class: 'help', style: 'color:var(--muted);font-size:13px' }, ['还没有发现已安装的实例：先在服务器上安装，并刷新状态。']));
+    ins.forEach(function (m) {
+      var id = m.host + '|' + m.product, other = clusterOfMember(m.host, m.product);
+      var cb = h('input', { type: 'checkbox' }); cb.checked = !!picked[id];
+      if (other && other !== name) cb.disabled = true;
+      var row = h('label', { class: 'opt tight' + (cb.checked ? ' on' : '') }, [cb, h('div', null, [h('div', { class: 'o1' }, [memberLabel(m)]),
+        h('div', { class: 'o2' }, [(m.port ? '端口 ' + m.port : '') + (m.version ? ' · ' + m.version : '') + (other && other !== name ? ' · 已在集群「' + other + '」' : '')])])]);
+      cb.addEventListener('change', function () { picked[id] = cb.checked; row.classList.toggle('on', cb.checked); });
+      list.appendChild(row);
+    });
+  }
+  prodS.addEventListener('change', function () { picked = {}; drawList(); });
+  drawList();
+  function hostSelect(val, filter, emptyLabel) {
+    var s = h('select', { class: 'inp' }, [h('option', { value: '' }, [emptyLabel])].concat(S.state.hosts.filter(filter || function () { return true; }).map(function (hs) {
+      var o = h('option', { value: hs.name }, [hs.name + '（' + hs.host + '）']); if (hs.name === val) o.selected = true; return o;
+    })));
+    return s;
+  }
+  var entS = hostSelect(e.host || '', null, '暂不设置入口');
+  var portI = h('input', { type: 'number', class: 'inp', value: String(e.port || 80), min: '1', max: '65535' });
+  var snI = h('input', { type: 'text', class: 'inp mono', value: e.server_name || '', placeholder: '可空；如 report.example.com' });
+  var puI = h('input', { type: 'text', class: 'inp mono', value: e.public_url || '', placeholder: '可空；如 https://report.example.com' });
+  var sdI = h('input', { type: 'text', class: 'inp mono', value: (c && c.shared_dir) || '', placeholder: '可空；如 /mnt/sight-shared（各实例挂载同一个 NFS）' });
+  var gwS = hostSelect((c && c.gateway) || '', function (hs) { return hs.products && hs.products['sight-mobile-gateway']; }, '没有 / 不提醒');
+  var err = h('div', { class: 'note bad', style: 'margin:10px 0 0;display:none' });
+  function row(label, el, help) { return h('div', { style: 'margin-bottom:12px' }, [h('div', { style: 'font-weight:600;margin-bottom:6px' }, [label]), el, help ? h('div', { style: 'color:var(--muted);font-size:12.5px;margin-top:4px' }, [help]) : null]); }
+  var body = h('div', null, [
+    h('div', { class: 'note info', style: 'margin:0 0 14px', html: ico('help') + '<div>集群 = 连同一个外部数据库、已在管理台「系统管理 › 集群」开启集群模式的几个实例，前面一个 nginx 入口。这里只改本机记录，不动服务器；保存后点「配置入口」生成 nginx 配置。</div>' }),
+    row('集群名', nameI, '小写字母、数字与 -，会用在 nginx 配置文件名里'), row('产品', prodS),
+    row('实例', list), row('入口服务器（装 nginx）', entS, '单独一台最好；放在某个实例所在的服务器上时，那台宕机 = 整体不可用'),
+    h('div', { style: 'display:grid;grid-template-columns:120px 1fr;gap:12px' }, [row('入口端口', portI), row('域名（server_name）', snI)]),
+    row('对外地址', puI, '用户访问的地址（有外层负载均衡 / HTTPS 时填）；同时请在管理台「集群」里填同一个地址'),
+    row('共享目录', sdI, '扩容时写进新实例的 MR_SHARED_DIR'), row('移动网关服务器', gwS, '集群升级后只提醒这一台的移动网关同步升级'), err
+  ]);
+  openModal({
+    title: name ? '编辑集群 ' + name : '新建集群', cls: 'w760', body: body, dismiss: true, enter: 'save',
+    actions: [{ label: '取消', onClick: function (M) { M.close(); } }, { label: '保存', key: 'save', kind: 'primary', onClick: function (M) {
+      var ms = Object.keys(picked).filter(function (k) { return picked[k]; }).map(function (k) { var a = k.split('|'); return { host: a[0], product: a[1] }; });
+      api('POST', '/api/clusters/save', { name: nameI.value.trim(), old_name: name || null, product: prodS.value, instances: ms,
+        entry: entS.value ? { host: entS.value, port: +portI.value || 80, server_name: snI.value.trim(), public_url: puI.value.trim() } : null,
+        shared_dir: sdI.value.trim(), gateway: gwS.value || null }).then(function (r) {
+        M.close(); toast('集群已保存');
+        if (name && r.name !== name) { delete S.clStatus[name]; }
+        return refreshState().then(function () { selectCluster(r.name); });
+      }, function (ex) { err.textContent = ex.message; err.style.display = ''; });
+    } }]
+  });
+}
+function deleteCluster(name) {
+  uiConfirm({ title: '删除集群「' + name + '」？', yes: '删除', danger: true, lines: ['只删除部署助手里的集群记录，不会停止任何实例，也不会删除入口服务器上的 nginx 配置（/etc/nginx/conf.d/sight-' + name + '.conf，需要时手工删除并重载 nginx）。'] }).then(function (y) {
+    if (!y) return;
+    api('POST', '/api/clusters/delete', { name: name }).then(function () { S.cl = null; lsSet('sd_cl', ''); delete S.clStatus[name]; return refreshState().then(renderAll); }, function (e) { toast(e.message); });
+  });
+}
+/* 选安装包（本机 / 官网下载），拿到包后回调 */
+function pickPackage(productId, title, cb) {
+  var pk = buildPicker({ kind: 'package', prefer: productId, autoSelect: true, onChange: function () { sync(); } }), M;
+  function sync() { if (M && M.btn.next) M.btn.next.disabled = !pk.get() || pk.isUploading(); }
+  M = openModal({
+    title: title, cls: 'w760', body: h('div', null, [pk.el]), dismiss: true, enter: 'next',
+    actions: [{ label: '取消', onClick: function (m) { m.close(); } }, { label: '下一步', key: 'next', kind: 'primary', disabled: !pk.get(), onClick: function (m) {
+      var s0 = pk.get();
+      if (s0.product && s0.product !== productId) { toast('这是 ' + productName(s0.product) + ' 的安装包，请选 ' + productName(productId) + ' 的'); return; }
+      m.close();
+      if (!s0.online) { cb(s0); return; }
+      startJob('download_package', { product: s0.product }, { title: '下载 ' + productName(s0.product) + ' ' + s0.version, closeLabel: '下一步', failTitle: '下载没有完成', noRefresh: true,
+        onClose: function (j) { if (j.ok && j.result) cb(j.result); } });
+    } }]
+  });
+  $('.mb', M.md).style.minHeight = '320px';
+}
+function clusterUpgradeFlow(name) {
+  var c = clusters()[name];
+  pickPackage(c.product, '集群升级 · 选择 ' + productName(c.product) + ' 安装包', function (pkg) {
+    startJob('cluster_upgrade', { cluster: name, package: pkg.path }, { title: '集群升级 · ' + name + ' → ' + (pkg.version || pkg.name), failTitle: '集群升级没有完成',
+      onClose: function () { delete S.clStatus[name]; loadClusterStatus(name); }, noRefresh: true });
+  });
+}
+function clusterExpandFlow(name) {
+  var c = clusters()[name];
+  var hostS = h('select', { class: 'inp' }, S.state.hosts.map(function (hs) { return h('option', { value: hs.name }, [hs.name + '（' + hs.host + '）']); }));
+  var instI = h('input', { type: 'text', class: 'inp mono', value: '', maxlength: '16', placeholder: '这台已装过 ' + productName(c.product) + ' 时必填，如 b' });
+  var err = h('div', { class: 'note bad', style: 'margin:10px 0 0;display:none' });
+  function sug() {
+    var hs = getHost(hostS.value), used = {};
+    Object.keys((hs && hs.products) || {}).forEach(function (k) { if (baseOf(k) === c.product) used[k.split('@')[1] || ''] = true; });
+    if (!used['']) { instI.value = ''; return; }
+    for (var ch = 98; ch < 123; ch++) if (!used[String.fromCharCode(ch)]) { instI.value = String.fromCharCode(ch); return; }
+  }
+  hostS.addEventListener('change', sug);
+  var mems = (c.instances || []).map(function (m) { return m.host; });
+  var free = S.state.hosts.filter(function (hs) { return mems.indexOf(hs.name) < 0; })[0];
+  if (free) hostS.value = free.name;
+  sug();
+  var body = h('div', null, [
+    h('div', { class: 'note info', style: 'margin:0 0 14px', html: ico('help') + '<div>在选定的服务器上装一个新实例：数据库连接和加密配置从集群里已有的实例拷过去（经 SSH 加密通道传输，写进新实例的 <span class="mono">sight.env</span>，权限 600，不进日志），<b>不走安装向导</b>，启动后自动入群；就绪后挂进入口 nginx，插件一并拷过去。<br>新机器要重签集群授权（会给出这台机器的身份），授权宽限期内可以先用。</div>' }),
+    h('div', { style: 'font-weight:600;margin-bottom:6px' }, ['装到哪台服务器']), hostS,
+    h('div', { style: 'font-weight:600;margin:12px 0 6px' }, ['实例名']), instI,
+    h('div', { style: 'color:var(--muted);font-size:12.5px;margin-top:4px' }, ['同一台服务器上第二套起要起实例名（小写字母、数字与 -）；新服务器留空即可。']), err
+  ]);
+  openModal({
+    title: '扩容 · ' + name, cls: 'w600', body: body, dismiss: true, enter: 'next',
+    actions: [{ label: '取消', onClick: function (M) { M.close(); } }, { label: '下一步：选择安装包', key: 'next', kind: 'primary', onClick: function (M) {
+      var v = instI.value.trim();
+      if (v && !/^[a-z0-9][a-z0-9-]{0,15}$/.test(v)) { err.textContent = '实例名不合法：小写字母、数字与 -，以字母或数字开头，最多 16 个字符'; err.style.display = ''; return; }
+      var hs = getHost(hostS.value), key = v ? c.product + '@' + v : c.product;
+      if (hs && hs.products && hs.products[key]) { err.textContent = hostS.value + ' 上已经有 ' + productName(key) + ' 了：换一个实例名，或在「编辑」里把它归进集群'; err.style.display = ''; return; }
+      M.close();
+      var host = hostS.value;
+      pickPackage(c.product, '扩容 · 选择 ' + productName(c.product) + ' 安装包（与集群同一版本）', function (pkg) {
+        startJob('cluster_expand', { cluster: name, host: host, instance: v || undefined, package: pkg.path }, { title: '扩容 · ' + name + ' → ' + host + (v ? ' 实例 ' + v : ''), failTitle: '扩容没有完成',
+          onClose: function () { delete S.clStatus[name]; refreshState().then(function () { renderSide(); loadClusterStatus(name); }); }, noRefresh: true });
+      });
+    } }]
+  });
+}
+function clusterEntryJob(name, extra, title) {
+  startJob('cluster_entry', Object.assign({ cluster: name }, extra || {}), { title: title || '配置入口 · ' + name, failTitle: '入口没有配置好',
+    onClose: function () { refreshState().then(function () { renderSide(); loadClusterStatus(name); }); }, noRefresh: true });
+}
+function identityBox(r) {
+  if (!r || !r.identity) return null;
+  return h('div', { class: 'tok' }, [h('div', { class: 'tt', html: ico('bang') + '<span>新机器的身份：集群授权需要包含这台机器</span>' }),
+    h('div', { class: 'tv' }, [h('code', { style: 'font-size:12px;white-space:pre-wrap' }, [r.identity]), h('button', { class: 'btn sm', type: 'button', 'data-copy': r.identity }, ['复制'])]),
+    h('div', { class: 'tn' }, ['粘贴到 SightReport 管理台「授权注册」重新生成环境信息，发给我们重签授权。授权宽限期内新实例可以先正常使用。'])]);
 }
 
 /* 同机多实例：先起实例名，再走正常的选包 → 选服务器流程（deploy 带 instance） */
@@ -1872,6 +2154,17 @@ document.addEventListener('click', function (e) {
     case 'delhost': if (hs) deleteHost(hs); break;
     case 'deploy': deployFlow(S.sel, p || null); break;
     case 'addinst': addInstanceFlow(S.sel, p); break;
+    case 'selcl': selectCluster(t.getAttribute('data-n')); break;
+    case 'newcl': openClusterEdit(null); break;
+    case 'clsug': (function () { var g = (S.state.cluster_suggestions || [])[+t.getAttribute('data-i')]; if (g) openClusterEdit(null, { product: g.product, instances: g.instances }); })(); break;
+    case 'clrefresh': loadClusterStatus(S.cl); break;
+    case 'cledit': openClusterEdit(S.cl); break;
+    case 'cldel': deleteCluster(S.cl); break;
+    case 'clentry': clusterEntryJob(S.cl); break;
+    case 'clexpand': clusterExpandFlow(S.cl); break;
+    case 'clupgrade': clusterUpgradeFlow(S.cl); break;
+    case 'clup': clusterEntryJob(S.cl, { up: [t.getAttribute('data-m')] }, '放回入口 · ' + S.cl); break;
+    case 'cldown': uiConfirm({ title: '从入口摘下这个实例？', yes: '摘下', lines: ['入口不再把新请求分给它（实例本身照常运行）。维护完成后点「放回入口」。'] }).then(function (y) { if (y) clusterEntryJob(S.cl, { down: [t.getAttribute('data-m')] }, '摘下实例 · ' + S.cl); }); break;
     case 'svc': serviceAction(S.sel, p, t.getAttribute('data-a')); break;
     case 'logs': openLogs(S.sel, p); break;
     case 'rollback': openRollback(S.sel, p); break;

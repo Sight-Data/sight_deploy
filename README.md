@@ -72,6 +72,13 @@ SightReport / SightWall / Sight DataLink / Sight 移动网关的产品安装包�
   - Sight DataLink 用外部元数据库时，升级前必须勾选确认已备份；PostgreSQL 且服务器上有 `pg_dump` 时可勾选让本工具先备份到 `sight-backups/`（`sight-datalink-db-<版本>-<时间>.dump`；密码经 `PGPASSWORD` 传入，不出现在命令行和日志里；与程序备份一样按「保留份数」清理较早的，只清理本工具按这个命名生成的文件）。升级前记录数据库结构版本（`schemaVersion`），回滚时外部库结构版本变了就拒绝只回滚程序，提示先用数据库备份恢复；内置 H2 在 `data/` 里，随备份一起恢复。
   - Sight DataLink 升级后新版本持续 60 秒处于等待模式（`mode=waiting`，连不上元数据库）时，不再等满「等待服务就绪秒数」：直接说明「服务已启动但连不上元数据库」并显示最近一次连接错误（口令打码），随后照常显示日志、询问是否回滚。首次安装时等待模式不算失败。
   - 可以多选服务器依次滚动升级，某台失败时会询问是否继续处理剩下的。Sight DataLink 不做自动滚动升级：多选时提醒集群（共用外部库）要先全部停止、先升级一台等迁移完成再升级其余，确认后才依次处理。
+- **同机多实例**：已安装的 SightReport / SightWall 卡片上「再装一个实例」：同一台服务器上再装一套（单独的目录 `/opt/sight-report-<实例名>`、端口、系统服务 `sight-report-<实例名>`），需要 2.0.117 及以上的完整安装包。
+- **集群**（SightReport / SightWall；几个实例连同一个外部数据库、在管理台开启集群模式，前面一个 nginx 入口）：
+  - 识别：刷新状态时记下每个实例的数据库地址指纹（只存指纹，不存地址），同一个库的实例 ≥2 个时侧栏提示「归为一个集群」；也可以手工新建。
+  - 入口：选一台服务器做入口，部署助手装 / 检查 nginx（≥1.18，系统源安装），只写自己的两个文件 `/etc/nginx/conf.d/sight-<集群>.conf`、`/etc/nginx/sight/<集群>-proxy.conf`，不改主配置；写入后 `nginx -t`，通过才重载，不通过恢复上一份。上游就是集群的实例表；未就绪（503）的实例自动换一台，`/assets/` 在新旧版本间 404 也换一台，`/api/machine/` 不经入口暴露，WebSocket 日志不记查询参数（令牌）。实例可以手工「摘下 / 放回入口」。
+  - 扩容：在选定的服务器上装一个新实例，数据库连接（`data/work/database.config` / `MR_DB_*`）和整组加密配置（`SIGHTDATA_*_KEY`、`SIGHTDATA_CRYPTO_AES_GCM`）从已有实例拷过去，写进新实例的 `sight.env`（600），**不走安装向导**；就绪后挂进入口，插件一并拷过去。新机器会给出机器身份（`install.sh identity`），用于重签集群授权。
+  - 集群升级：新包的 `release.json` 声明了可混跑的最低版本（`rollingFrom`），且所有实例都不低于它 → 滚动升级：逐个实例「从入口摘下 → 停止（实例内完成下线）→ 备份并升级 → 等 `/api/health/ready` 且版本对上 → 放回」；否则整体停机升级（全停 → 升第一个执行数据库迁移 → 再升其余）。某个实例失败就停在那里、不放回入口，已升级的不自动回滚。
+  - 集群页：每个实例的版本、就绪状态、leader、加密配置是否一致（只在本机比较散列），入口 nginx 的状态与经入口访问是否正常。
 - **Sight 移动网关**（SightReport 配套的手机访问入口，Go 单文件程序，部署在手机能访问到的前置机 / DMZ 上，**不是 SightReport 所在的那台机器**；没有 Java、没有数据库，不用联网）：
   - 首次安装：检查 CPU 架构与安装包一致（`uname -m` 的 x86_64 / aarch64 / loongarch64 对应 amd64 / arm64 / loong64）、systemd、手机侧端口（默认 8080）和隧道端口（7443）是否被占用、磁盘。界面里填「SightReport 访问网关用的域名或 IP」（可多个，会写进证书）和手机侧端口，然后上传解压 → 先在服务器上试跑 `version` → `init -hostnames …` → `install` → `start` → 用 `curl -sk https://127.0.0.1:7443/healthz` 确认返回 `{"agents":n}`。
   - 安装完成页醒目显示**网关地址、证书指纹、接入令牌**（可一键复制），并写明下一步：到 SightReport「移动 › 设置 › 网络与部署」启用移动网关，网关地址填 `wss://<主机>:7443/tunnel`。令牌是机密：只显示在界面上，不写进本地日志和历史记录；之后可在服务器详情点「查看接入信息」（执行 `show`）再看。
@@ -95,6 +102,7 @@ SightReport / SightWall / Sight DataLink / Sight 移动网关的产品安装包�
 - 联网只有一件事：访问官网下载中心（`https://www.sightdata.top`）读版本信息、按你的操作下载安装包 / 新版工具；查不到时才退到 GitHub Release。内网环境可在设置里关闭「启动时自动检查更新」。
   - `logs/`：操作日志，不含任何密码，出问题时发给技术支持即可。
 - sudo 密码通过标准输入传给 sudo，不出现在命令行、进程列表或日志里。
+- 集群扩容拷贝的数据库连接与加密配置：从已有实例读出时不进本地日志；经 SSH 通道的标准输入写到新服务器上的临时文件（600），合并进 `sight.env`（600，属主为运行账号）后立即删除——不出现在命令行、`ps`、sudo 日志里，也不用 systemd 的 `Environment=`（`systemctl show` 任何人可读）。
 
 ## 服务器端约定
 
@@ -113,6 +121,8 @@ SightReport / SightWall / Sight DataLink / Sight 移动网关的产品安装包�
 | 非默认端口 | `/etc/systemd/system/<服务>.service.d/10-sight-deploy.conf` |
 | 移动网关的备份与配置 | 升级前备份旧可执行文件到 `<安装目录上级>/sight-backups/sight-mobile-gateway/sight-mobile-gateway-<版本>-<时间>.bin`（保留份数同上）；`gateway.yaml`（含接入令牌）和 `data/`（含证书私钥）升级、回滚都不动 |
 | 安装记录 | 安装目录下的 `.sight-deploy.json`（版本、端口、启动参数） |
+| 同机多实例 | 安装目录下 `.sight-instance`（一行实例名）；实例 `b` 的服务名 `<服务>-b`、默认目录 `<目录>-b`；实例级配置在 `sight.env`（600） |
+| 集群入口 | 入口服务器上 `/etc/nginx/conf.d/sight-<集群>.conf` 与 `/etc/nginx/sight/<集群>-proxy.conf`（上一份留 `.bak`）；升级中的实例写成 `server … down;` |
 
 支持的服务器：x86_64 / aarch64 的 Linux，有无 systemd 都可以（没有 systemd 时以后台进程方式运行）。Sight 移动网关另支持龙芯 loongarch64，但必须有 systemd。
 

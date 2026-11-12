@@ -209,6 +209,37 @@ Sight DataLink 的数据库描述来自 `data/datalink.properties` 的 `DB_URL`�
 - **安装包要求**：需要 2.0.117 起的完整安装包（`.zip`，带 `bin/sight-common.sh`，`install.sh --instance`）；旧包传 `instance` 直接失败：「同机多实例需要 2.0.117 及以上版本的完整安装包（.zip）」。
 - 安装时助手在安装目录写 `.sight-instance`，并给 `install.sh` 加 `--instance <名字>`。
 
+### 集群
+
+几个实例连同一个外部数据库、前面一个 nginx 入口。见 sight-data 仓库 `docs/集群部署与集群入口-设计.md` §4、§6、§8。
+
+`GET /api/state` 另有：
+```json
+"clusters": {"report-prod": {"product": "sight-report", "db_fp": "库地址指纹",
+   "entry": {"host": "入口服务器名", "port": 80, "server_name": "", "public_url": ""},
+   "instances": [{"host": "node-01", "product": "sight-report", "port": 9091, "install_dir": "/opt/sight-report", "down": false}],
+   "shared_dir": "/mnt/sight-shared", "gateway": "dmz-01", "created": "2026-11-12 10:00"}},
+"cluster_suggestions": [{"product": "sight-report", "db_fp": "…", "cluster_mode": true,
+   "instances": [{"host": "node-01", "product": "sight-report", "port": 9091, "version": "2.0.117", "cluster_mode": true}]}]
+```
+- 实例 = 服务器名 + 产品键（带实例名，如 `sight-report@b`），在接口参数里写成 `"<服务器>|<产品键>"`。
+- `status` 结果的产品项另有 `cluster`（所属集群名）；hosts.json 里的产品记录另有 `db_fp`（外部库地址规范化后的 sha256 前 16 位）、`cluster_mode`。`cluster_suggestions` = 同一产品、同一 `db_fp`、还没归组的实例 ≥2 个。
+- 删除服务器时，它若是某个集群的实例或入口，返回 400「请先在集群里把它移除」。
+
+| 接口 | 参数 | 说明 |
+|---|---|---|
+| `POST /api/clusters/save` | `name, old_name?（改名 / 编辑时）, product, instances: [{host, product, port?, addr?}], entry: {host, port, server_name, public_url} 或 null, shared_dir, gateway` | 只改本地记录。校验：集群名 `^[a-z0-9][a-z0-9-]{0,31}$`；实例属于该产品、不在别的集群；`db_fp` 不能不同；入口端口不能与同机实例端口相同；`public_url` 要 http(s)。编辑时保留各实例的 `down`。返回 `{"name"}` |
+| `POST /api/clusters/delete` | `name` | 只删记录，不动服务器和 nginx |
+
+| 任务 kind | params | result |
+|---|---|---|
+| `cluster_status` | `cluster` | `{"cluster", "instances": [{host, product, port, dir, version, running, healthy, ready, state, reasons, mode, leader, node_id, active_nodes, crypto_fp, crypto_ok, down, error}], "crypto_consistent", "versions", "entry": {host, port, nginx, version, test, test_out, confd, wst, running, conf, upstream: [{addr, port, down}], probe, error}}`。`crypto_fp` 是本机对各实例加密配置算的散列（只用于比较），`probe` 是在入口机上经入口访问 `/api/health/live` 的状态码 |
+| `cluster_entry` | `cluster, up?: [实例], down?: [实例]` | 先改实例的 `down`，再：检查 / 安装 nginx（没有就 `confirm` 后用 dnf / yum / apt-get / zypper 安装；版本 <1.9.13 拒绝，<1.18 提醒；主配置没 include `conf.d/*.conf` 拒绝；现有配置 `nginx -t` 不过拒绝；没设 `worker_shutdown_timeout` 提示）→ 写两个文件 → `nginx -t` → 通过才重载（没在跑就启动），不通过恢复 `.bak` 并失败 → 防火墙放行入口端口（`confirm`）→ 经入口探测。返回 `{"url"}` |
+| `cluster_expand` | `cluster, host, instance?, package` | 从集群里第一个没摘下的实例读数据库连接与加密配置（`secret_out`，不进日志）；来源不是集群模式 / 包版本不同会 `confirm`；照常 `do_install`（会问目录、端口），在 `install.sh` 之前把机密经 stdin 写进新实例的 `sight.env` 与 `data/work/database.config`（600）；等就绪 → 拷插件（有的话，重启一次）→ 新机器跑 `install.sh identity` → 记进集群 → 挂进入口。返回 `{"host", "product", "url", "identity"}` |
+| `cluster_upgrade` | `cluster, package` | 预检读各实例版本（有实例比包新 → 失败，不做降级；都已是这个版本 → 直接成功）。`rolling_decision(rollingFrom, 各实例版本)`；滚动且没有入口时 `confirm`；集群层面一次 `confirm`（已备份数据库），之后各实例的升级不再逐台问。滚动：每个实例 `down` → 重载 → `do_upgrade` → 等 `/api/health/ready` 200 且版本对上 → 放回 → 重载；失败停在该实例、不放回，错误里列出已升级的实例。整体停机：全停 → 逐个升级 → 原本已是新版本的实例重新启动。返回 `{"upgraded": [...], "rolling": true/false/null}`；集群登记了移动网关时只提醒那一台同步升级 |
+
+另外：`deploy` 单独升级一个属于多实例集群的实例时，先 `warn` 再 `confirm`（建议用集群升级）；升级 SightReport 后的移动网关提醒（`gateway_notices`），该实例属于登记了 `gateway` 的集群时只针对那一台。
+
 ### Sight 移动网关
 
 非 Java 产品，`deploy` / `service` / `logs` / `follow_logs` / `list_backups` / `rollback` / `status` 都按 `product: "sight-mobile-gateway"` 走同一批接口，差别：
@@ -229,6 +260,8 @@ Sight DataLink 的数据库描述来自 `data/datalink.properties` 的 `DB_URL`�
 
 1. **服务器列表**（左栏）：名字、user@host、已知产品徽标；「+ 添加服务器」。选中一台就跑 `status` 任务，结果显示在右侧。
 2. **服务器详情**（右侧）：顶部名字/地址 +「刷新」「修改密码」「删除」；每个产品一张卡（SightReport、SightWall、Sight DataLink，按 `/api/state` 的 `products`）：
+   - 左栏服务器列表上方是「集群」：每个集群一项（产品、实例数、入口、已摘下几个）+「新建集群」；有 `cluster_suggestions` 时显示「N 个实例连着同一个数据库 · 归为一个集群」（打开新建对话框并预选这些实例）。
+     集群页：「刷新」（`cluster_status`）「编辑」「配置入口」（`cluster_entry`）「扩容」（选服务器与实例名 → 选包 → `cluster_expand`，结果里有 `identity` 时醒目显示并可复制）「删除」，主按钮「集群升级」（选包 → `cluster_upgrade`）；入口卡片（nginx 状态、访问地址、配置文件）；实例表（版本、就绪状态、leader、加密配置一致性、是否在入口，「摘下 / 放回入口」）。
    - 未安装：灰卡 +「安装」按钮。
    - 已安装：状态徽标（运行中 / 启动中或无响应 / 未运行）、版本、访问地址（可点击，新窗口打开）、目录、端口、服务方式、Java、数据库、健康（未初始化时提示去 `setup_url` 或 `/setup`；`mode=setup` 徽标「安装向导」并提示需要初始化令牌；`mode=waiting` 徽标「等待数据库」并说明服务在自动重试；`admin_initialized=false` 提示去「初始化管理员」）、备份数、磁盘剩余。
      按钮：「升级」「重启」「停止 / 启动」「日志」「回滚」；`instances=true` 的产品另有「再装一个实例」（先问实例名，默认第一个没用过的字母 b、c…，校验格式与重名，再走「安装 / 升级」流程，`deploy` 带 `instance`）。同机多实例各一张卡，标题「SightReport（实例 b）」，按 `status` 结果的顺序排在基础产品后面。

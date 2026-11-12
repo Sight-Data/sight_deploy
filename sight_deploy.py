@@ -47,6 +47,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
 import zipfile
 from pathlib import Path
@@ -908,10 +909,18 @@ class Package:
             raise DeployError("实例名「%s」不合法：小写字母数字与 -，以字母数字开头，不超过 16 个字符" % inst)
         if not supports_instances(self.product):
             raise DeployError("%s 不支持同机多实例" % self.name)
-        if not self.supports_instances:
+        if self.full and not self.supports_instances:  # 单独 jar 只用于升级已有实例，脚本已在服务器上
             raise DeployError("这个版本（%s）的安装包还不支持同机多实例" % self.version,
                               "同机多实例需要 2.0.117 及以上版本的完整安装包（.zip）")
         self.product = instance_key(split_instance(self.product)[0], inst)
+
+    def for_product(self, key):
+        """集群里逐个实例升级：把包切到某个实例（基础实例或「产品@实例」）。"""
+        base, inst = split_instance(key)
+        if base != split_instance(self.product)[0]:
+            raise DeployError("安装包是 %s 的，不能用于 %s" % (PRODUCTS[split_instance(self.product)[0]]["name"], key))
+        self.product = base
+        self.use_instance(inst)
 
     @property
     def jar_sha(self):
@@ -2659,7 +2668,9 @@ def posixdir(p):
 # 首次安装
 # =============================================================================
 
-def do_install(ctx, r, pkg):
+def do_install(ctx, r, pkg, seed=None):
+    """seed（集群扩容用）：{"env": {...}, "dbconf": bytes}——写进新实例的 sight.env 与 data/work/database.config，
+    启动即连上集群的库，不走安装向导。"""
     product = pkg.product
     P = PRODUCTS[product]
     if not pkg.full:
@@ -2739,6 +2750,9 @@ def do_install(ctx, r, pkg):
         s += "printf '%%s\\n' %s > %s\n" % (shlex.quote(P["instance"]), shlex.quote(posix_join(inst_dir, INSTANCE_FILE)))
     s += "mkdir -p %s/logs %s/data\n" % (shlex.quote(inst_dir), shlex.quote(inst_dir))
     s += "chmod 600 %s\n" % shlex.quote(posix_join(inst_dir, MARKER))
+    if seed:
+        # 机密经 SSH 标准输入写进临时文件（不进命令行 / 日志），这里合并进 sight.env 后删掉
+        s += seed_apply_script(push_seed(r, seed_payload(seed.get("env"), seed.get("dbconf"))), inst_dir, owner)
     if owner != "root":
         if P["owned_dirs"]:
             s += "chown -R %s: %s\n" % (shlex.quote(owner), " ".join(shlex.quote(posix_join(inst_dir, d)) for d in P["owned_dirs"]))
@@ -2929,7 +2943,8 @@ def default_backup_dir(inst_dir, product):
     return posix_join(parent if parent else "/", "sight-backups", PRODUCTS[product]["service"])
 
 
-def do_upgrade(ctx, r, pkg, inst):
+def do_upgrade(ctx, r, pkg, inst, preconfirmed=False):
+    """preconfirmed：集群升级时已在集群层面确认过「已备份数据库 / 开始升级」，这里不再逐台询问。"""
     product = pkg.product
     P = PRODUCTS[product]
     inst_dir, port = inst["dir"], inst["port"]
@@ -3026,6 +3041,8 @@ def do_upgrade(ctx, r, pkg, inst):
         pg_target = confirm_external_db_backup(r, product, inst, bdir, stamp)
         if pg_target is False:
             return None
+    elif db["kind"] == "external" and preconfirmed:
+        pass
     elif db["kind"] == "external":
         warn("使用的是外部数据库：本工具只备份程序和 data/ 目录，不备份数据库本身")
         if not confirm("已备份数据库，继续升级？", False, danger=True, detail=[
@@ -3036,7 +3053,7 @@ def do_upgrade(ctx, r, pkg, inst):
         if not confirm("H2 数据库文件不在安装目录，不会被备份。继续？", False, danger=True):
             return None
 
-    if not confirm("开始升级？", True, detail=["%s：%s" % x for x in plan] +
+    if not preconfirmed and not confirm("开始升级？", True, detail=["%s：%s" % x for x in plan] +
                    ["", "升级过程中服务会停止约 1~3 分钟；失败时可一键回滚。"]):
         return None
 
@@ -5081,7 +5098,13 @@ def job_status(ctx, p):
                 item["setup_url"] = "http://%s:%d%s" % (r.host, inst["port"], P["setup_path"])
             res["products"].append(item)
             ctx.store.set_product(r.alias, prod, {"install_dir": inst["dir"], "port": inst["port"],
-                                                  "version": inst["version"]})
+                                                  "version": inst["version"],
+                                                  # 集群识别：同一个外部库的实例认作一组（只存指纹，不存地址）
+                                                  "db_fp": db_fingerprint(inst["db"].get("url")) if inst["db"]["kind"] == "external" else None,
+                                                  "cluster_mode": bool(h and h.get("mode") == "CLUSTER")})
+            cn, _ = cluster_of(ctx.store.snapshot().get("clusters"), r.alias, prod)
+            if cn:
+                item["cluster"] = cn
         # 服务器上已经没有的产品，从本地缓存里去掉
         for it in res["products"]:
             if not it["installed"]:
@@ -5123,6 +5146,11 @@ def job_deploy(ctx, p):
                 r = open_host(ctx.store, name)
                 out("检查 %s 是否已安装 …" % pkg.name)
                 inst = locate_install(ctx, r, pkg.product)
+                cn, crec = cluster_of(ctx.store.snapshot().get("clusters"), name, pkg.product)
+                if inst and cn and len(crec.get("instances") or []) > 1:
+                    warn("%s 上的 %s 是集群「%s」的实例" % (name, pkg.name, cn))
+                    if not confirm("集群建议在集群页做「集群升级」（自动摘流量、判定能否滚动）。仍要单独升级这一台？", False):
+                        raise UserAbort()
                 if is_gateway(pkg.product):
                     res = do_gateway_upgrade(ctx, r, pkg, inst) if inst else do_gateway_install(ctx, r, pkg)
                 else:
@@ -5135,7 +5163,11 @@ def job_deploy(ctx, p):
                         item[k] = res[k]
                 if res and split_instance(pkg.product)[0] == "sight-report":
                     # 升级 / 安装 SightReport 之后：助手里登记的移动网关版本与它不一致，就提醒同步升级
-                    notices = gateway_sync_notices(ctx.store.snapshot().get("hosts"), pkg.version)
+                    snap = ctx.store.snapshot()
+                    gw = (cluster_of(snap.get("clusters"), name, pkg.product)[1] or {}).get("gateway")
+                    hs_ = snap.get("hosts") or {}
+                    # 属于某个集群且登记了它的移动网关：只提醒那一台；否则照旧提醒所有登记的网关
+                    notices = gateway_sync_notices({gw: hs_[gw]} if gw and gw in hs_ else hs_, pkg.version)
                     for n in notices:
                         warn(n["text"])
                     if notices:
@@ -5298,6 +5330,946 @@ def job_rollback(ctx, p):
         r.close()
 
 
+# =============================================================================
+# 集群：多个实例共用一个外部元数据库，前面一个 nginx 入口（docs/集群部署与集群入口-设计.md §8）
+# =============================================================================
+#
+# hosts.json:
+#   "clusters": {"report-prod": {
+#       "product": "sight-report",
+#       "db_fp": "库地址指纹（识别归组用，可空）",
+#       "entry": {"host": "入口服务器名", "port": 80, "server_name": "report.example.com", "public_url": ""},
+#       "instances": [{"host": "node-01", "product": "sight-report", "port": 9091, "install_dir": "...", "down": false}],
+#       "shared_dir": "/mnt/sight-shared", "gateway": "dmz-01"}}
+# 实例用「服务器名 + 产品键」标识（产品键带实例名，如 sight-report@b）。nginx 上游 = instances；
+# 升级中 / 失败没放回的实例 down=true，生成配置时写成 `server … down;`，而不是删掉。
+
+CLUSTER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+# 集群里所有实例必须一致的加密配置（产品 CryptoConfigFingerprint 同一组）
+CRYPTO_KEYS = ("SIGHTDATA_DATASOURCE_KEY", "SIGHTDATA_AI_KEY", "SIGHTDATA_SERVER_KEY", "SIGHTDATA_FRONT_KEY",
+               "SIGHTDATA_MCP_EXT_KEY", "SIGHTDATA_CRYPTO_AES_GCM")
+DB_ENV_KEYS = ("MR_DB_URL", "MR_DB_USERNAME", "MR_DB_PASSWORD")
+NGINX_MIN = (1, 9, 13)    # proxy_next_upstream 不重试 POST 的行为从这个版本起
+NGINX_RECOMMENDED = (1, 18)
+
+
+def db_fingerprint(url):
+    """规范化后的库地址 → 指纹（16 位十六进制）。只用于把同一个库的实例认作一组，不可逆推出地址。
+    协议、主机名不区分大小写；参数里只保留决定「是哪个库 / 哪个模式」的几项（schema、currentSchema 等），其余忽略。"""
+    u = (url or "").strip()
+    if not u:
+        return None
+    if u.lower().startswith("jdbc:"):
+        u = u[5:]
+    if u.lower().startswith("h2:"):
+        return None  # 内置库不能组集群
+    base, _, query = u.partition("?")
+    base, _, semi = base.partition(";")  # SQL Server 风格的 ;databaseName=…
+    keep = {}
+    for part in re.split(r"[&;]", query + ";" + semi):
+        k, _, v = part.partition("=")
+        if k.strip().lower() in ("currentschema", "schema", "searchpath", "databasename", "database", "search_path"):
+            keep[k.strip().lower()] = v.strip()
+    m = re.match(r"^([a-z0-9:+.-]+)://([^/]*)(.*)$", base, re.I)
+    if m:
+        base = "%s://%s%s" % (m.group(1).lower(), m.group(2).lower(), m.group(3).rstrip("/"))
+    norm = base + "".join("|%s=%s" % kv_ for kv_ in sorted(keep.items()))
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+
+
+def member_id(m):
+    return "%s|%s" % (m.get("host"), m.get("product"))
+
+
+def cluster_of(clusters, host, product):
+    """这个实例属于哪个集群：返回 (名字, 记录) 或 (None, None)。"""
+    for n, c in sorted((clusters or {}).items()):
+        for m in c.get("instances") or []:
+            if m.get("host") == host and m.get("product") == product:
+                return n, c
+    return None, None
+
+
+def cluster_suggestions(snapshot):
+    """按库地址指纹分组：同一个产品、同一个外部库、还没归进集群的实例 ≥2 个 → 建议归组（纯函数）。"""
+    hosts, clusters = snapshot.get("hosts") or {}, snapshot.get("clusters") or {}
+    groups = {}
+    for hn, h in sorted(hosts.items()):
+        for pk, info_ in sorted((h.get("products") or {}).items()):
+            fp = info_.get("db_fp")
+            if not fp or pk not in PRODUCTS or is_gateway(pk) or cluster_of(clusters, hn, pk)[0]:
+                continue
+            groups.setdefault((split_instance(pk)[0], fp), []).append(
+                {"host": hn, "product": pk, "port": info_.get("port"), "version": info_.get("version"),
+                 "cluster_mode": bool(info_.get("cluster_mode"))})
+    res = []
+    for (base, fp), ms in sorted(groups.items()):
+        if len(ms) >= 2:
+            res.append({"product": base, "db_fp": fp, "instances": ms,
+                        "cluster_mode": all(m["cluster_mode"] for m in ms)})
+    return res
+
+
+def member_addr(m, entry_host, hosts):
+    """nginx 上游里这个实例的地址：与入口同机 → 127.0.0.1；否则用登记的服务器地址（可在记录里用 addr 覆盖）。"""
+    if m.get("addr"):
+        return m["addr"]
+    if entry_host and m.get("host") == entry_host:
+        return "127.0.0.1"
+    return ((hosts or {}).get(m.get("host")) or {}).get("host") or m.get("host")
+
+
+def nginx_names(name):
+    ident = name.replace("-", "_")
+    return {"conf": "/etc/nginx/conf.d/sight-%s.conf" % name, "proxy": "/etc/nginx/sight/%s-proxy.conf" % name,
+            "upstream": "sight_%s" % ident, "conn": "$sight_conn_%s" % ident, "log": "sight_noargs_%s" % ident,
+            "wslog": "/var/log/nginx/sight-%s-ws.log" % name}
+
+
+def nginx_server_names(rec, hosts):
+    e = rec.get("entry") or {}
+    names = [x for x in re.split(r"[\s,]+", e.get("server_name") or "") if x]
+    pu = (e.get("public_url") or "").strip()
+    if pu:
+        hn = urllib.parse.urlsplit(pu if "://" in pu else "http://" + pu).hostname
+        if hn and hn not in names:
+            names.append(hn)
+    addr = ((hosts or {}).get(e.get("host")) or {}).get("host")
+    if addr and addr not in names:
+        names.append(addr)
+    return names or ["_"]
+
+
+def nginx_conf(name, rec, hosts):
+    """生成入口 nginx 的两份文件（纯函数）：(conf.d 主文件, 公共代理头)。模板见设计文档 §4.3。"""
+    n = nginx_names(name)
+    e = rec.get("entry") or {}
+    port = _int(e.get("port")) or 80
+    proxy = "\n".join([
+        "# 由 Sight 部署助手生成，集群 %s 的公共代理头；手工改动会在下次生成时被覆盖" % name,
+        "proxy_http_version 1.1;",
+        "proxy_set_header Host              $host;",
+        "proxy_set_header X-Real-IP         $remote_addr;",
+        "proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;",
+        "proxy_set_header X-Forwarded-Proto $scheme;", ""])
+    ups = []
+    for m in rec.get("instances") or []:
+        line = "    server %s:%d max_fails=2 fail_timeout=10s%s;" % (
+            member_addr(m, e.get("host"), hosts), _int(m.get("port")), " down" if m.get("down") else "")
+        ups.append(line + "   # %s %s" % (m.get("host"), m.get("product")))
+    inc = "        include %s;" % n["proxy"]
+    conf = "\n".join([
+        "# 由 Sight 部署助手生成：集群 %s（%s）的入口。手工改动会在下次生成时被覆盖；" % (name, rec.get("product")),
+        "# 升级中的实例会被标成 down，升级完成后放回。",
+        "map $http_upgrade %s { default upgrade; '' ''; }" % n["conn"],
+        "log_format %s '$remote_addr [$time_local] \"$request_method $uri\" $status $body_bytes_sent $request_time';" % n["log"],
+        "",
+        "upstream %s {" % n["upstream"]] + ups + [
+        "    keepalive 32;",
+        "}",
+        "",
+        "server {",
+        "    listen %d;" % port,
+        "    server_name %s;" % " ".join(nginx_server_names(rec, hosts)),
+        "    client_max_body_size 220m;",
+        "    proxy_read_timeout 300s;",
+        "    # 503 = 实例未就绪 / 正在下线：换一台；POST 默认不重试",
+        "    proxy_next_upstream error timeout http_503;",
+        "",
+        "    location /api/machine/ { return 404; }",
+        "",
+        "    location /ws/ {",
+        inc,
+        "        proxy_set_header Upgrade    $http_upgrade;",
+        "        proxy_set_header Connection %s;" % n["conn"],
+        "        proxy_read_timeout 3600s;",
+        "        access_log %s %s;" % (n["wslog"], n["log"]),
+        "        proxy_pass http://%s;" % n["upstream"],
+        "    }",
+        "    location /assets/ {",
+        inc,
+        "        proxy_set_header Connection \"\";",
+        "        proxy_next_upstream error timeout http_404 http_503;",
+        "        proxy_pass http://%s;" % n["upstream"],
+        "    }",
+        "    location / {",
+        inc,
+        "        proxy_set_header Connection \"\";",
+        "        proxy_pass http://%s;" % n["upstream"],
+        "    }",
+        "}", ""])
+    return conf, proxy
+
+
+NGINX_INFO_SH = r'''
+C=%(conf)s
+N=$(command -v nginx 2>/dev/null); [ -z "$N" ] && [ -x /usr/sbin/nginx ] && N=/usr/sbin/nginx
+if [ -n "$N" ]; then
+  echo "nginx=$N"
+  echo "version=$("$N" -v 2>&1 | sed -n 's#.*nginx/\([0-9.]*\).*#\1#p')"
+  if T=$("$N" -t 2>&1); then echo test=ok; else echo test=fail; echo "test_out=$(printf '%%s' "$T" | tail -3 | tr '\n' ' ')"; fi
+  A=$("$N" -T 2>/dev/null)
+  printf '%%s' "$A" | grep -Eq 'include[[:space:]]+[^;]*conf\.d/\*\.conf' && echo confd=1 || echo confd=0
+  printf '%%s' "$A" | grep -q worker_shutdown_timeout && echo wst=1 || echo wst=0
+fi
+pgrep -x nginx >/dev/null 2>&1 && echo running=1 || echo running=0
+if [ -f "$C" ]; then echo conf=1; grep -E '^[[:space:]]*server[[:space:]]+[^;]+;' "$C" | sed 's/^[[:space:]]*/up=/' ; else echo conf=0; fi
+for pm in dnf yum apt-get zypper; do command -v $pm >/dev/null 2>&1 && { echo pkg=$pm; break; }; done
+'''
+
+
+def parse_nginx_info(o):
+    d = {"upstream": []}
+    for line in (o or "").splitlines():
+        k, _, v = line.partition("=")
+        if k == "up":
+            m = re.match(r"server\s+(\S+?)(?::(\d+))?\s[^;]*?(\bdown\b)?\s*;", v + " ")
+            if m:
+                d["upstream"].append({"addr": m.group(1), "port": _int(m.group(2)), "down": bool(m.group(3))})
+        elif k:
+            d[k] = v.strip()
+    return d
+
+
+def nginx_info(r, name):
+    code, o, _ = r.run(NGINX_INFO_SH % {"conf": shlex.quote(nginx_names(name)["conf"])}, sudo=True, timeout=60)
+    return parse_nginx_info(o)
+
+
+def ensure_nginx(r, name):
+    """入口服务器上要有能用的 nginx：没有就（经确认）用系统包管理器装；返回 nginx_info。"""
+    d = nginx_info(r, name)
+    if not d.get("nginx"):
+        pm = d.get("pkg")
+        if not pm:
+            raise DeployError("入口服务器 %s 上没有 nginx，也没有找到包管理器" % r.label(),
+                              "请先手工安装 nginx（1.18 及以上），再回来点「配置入口」")
+        if not confirm("入口服务器 %s 上没有 nginx，现在用 %s 从软件源安装？" % (r.label(), pm), True, detail=[
+                "需要服务器能访问软件源（内网一般有本地 yum / apt 源，或挂载了系统 ISO）。",
+                "装不上时请手工安装 nginx 1.18 及以上版本，再回来点「配置入口」。"]):
+            raise UserAbort()
+        cmd = {"dnf": "dnf -y install nginx", "yum": "yum -y install nginx",
+               "apt-get": "DEBIAN_FRONTEND=noninteractive apt-get install -y nginx",
+               "zypper": "zypper -n install nginx"}[pm]
+        step("安装 nginx")
+        r.run(cmd + "\n(systemctl enable nginx || true) >/dev/null 2>&1", sudo=True, check=True, what="安装 nginx",
+              timeout=900, on_line=logline)
+        d = nginx_info(r, name)
+        if not d.get("nginx"):
+            raise DeployError("nginx 安装后仍然找不到", "请在服务器上确认 nginx 是否装好（nginx -v）")
+    v = parse_version(d.get("version"))
+    if v and v < NGINX_MIN:
+        raise DeployError("入口服务器上的 nginx 版本 %s 太旧（至少 1.9.13，建议 1.18 以上）" % d.get("version"),
+                          "请升级 nginx 后再配置入口")
+    if v and v < NGINX_RECOMMENDED:
+        warn("nginx %s 低于建议的 1.18" % d.get("version"))
+    else:
+        ok("nginx %s" % (d.get("version") or "（版本未知）"))
+    if d.get("confd") == "0":
+        raise DeployError("nginx 主配置没有包含 conf.d/*.conf，部署助手不改主配置",
+                          "请在 nginx.conf 的 http { } 里加一行 include /etc/nginx/conf.d/*.conf; 再回来点「配置入口」")
+    if d.get("test") == "fail":
+        raise DeployError("入口服务器上现有的 nginx 配置本身就校验不通过：%s" % d.get("test_out", ""),
+                          "请先修好现有配置（nginx -t），部署助手不会在一份坏配置上继续改")
+    if d.get("wst") == "0":
+        info("提示：nginx 主配置没有设置 worker_shutdown_timeout，建议在 nginx.conf 顶层加 worker_shutdown_timeout 30s;"
+             "（每次重载时老连接最多再保留 30 秒）")
+    return d
+
+
+def apply_nginx(r, name, rec, hosts):
+    """写入配置 → nginx -t → 通过才重载（nginx 没在跑就启动）；不通过恢复上一份并报错。"""
+    n = nginx_names(name)
+    conf, proxy = nginx_conf(name, rec, hosts)
+    s = r'''set -e
+P=%(proxy)s; C=%(conf)s
+mkdir -p "$(dirname "$P")" "$(dirname "$C")"
+restore(){ for f in "$P" "$C"; do if [ -f "$f.bak" ]; then mv -f "$f.bak" "$f"; else rm -f "$f"; fi; done; }
+for f in "$P" "$C"; do rm -f "$f.bak"; if [ -f "$f" ]; then cp -p "$f" "$f.bak"; fi; done
+%(write_p)s%(write_c)s
+set +e
+OUT=$(nginx -t 2>&1); rc=$?
+if [ $rc -ne 0 ]; then printf '%%s\n' "$OUT" | tail -5; restore; echo SIGHT_NGINX=TEST_FAIL; exit 0; fi
+if pgrep -x nginx >/dev/null 2>&1; then nginx -s reload 2>&1 || systemctl reload nginx 2>&1 || { echo SIGHT_NGINX=RELOAD_FAIL; exit 0; }
+else (systemctl enable nginx >/dev/null 2>&1; systemctl start nginx 2>&1) || nginx 2>&1 || { echo SIGHT_NGINX=START_FAIL; exit 0; }; fi
+echo SIGHT_NGINX=OK
+''' % {"proxy": shlex.quote(n["proxy"]), "conf": shlex.quote(n["conf"]),
+       "write_p": heredoc(n["proxy"], proxy), "write_c": heredoc(n["conf"], conf)}
+    code, o, e = r.run(s, sudo=True, timeout=120)
+    if "SIGHT_NGINX=OK" not in o:
+        why = [x for x in (o + "\n" + e).splitlines() if x.strip() and not x.startswith("SIGHT_NGINX=")][-5:]
+        if "TEST_FAIL" in o:
+            raise DeployError("生成的 nginx 配置没有通过 nginx -t，已恢复上一份配置：%s" % " / ".join(why),
+                              "常见原因：端口被其他 server 占用、server_name 冲突")
+        raise DeployError("nginx 重载 / 启动失败：%s" % " / ".join(why), "在入口服务器上执行 nginx -t 与 systemctl status nginx 查看原因")
+    return conf
+
+
+def _entry_probe(r, port, server_name):
+    """入口生效后从入口机本机访问一次 /api/health/live。"""
+    hn = "" if server_name in ("", "_") else server_name
+    code, o, _ = r.run("curl -s --noproxy '*' -m 8 -o /dev/null -w '%%{http_code}' %s http://127.0.0.1:%d/api/health/live"
+                       % (("-H " + shlex.quote("Host: " + hn)) if hn else "", port), timeout=20)
+    return o.strip()[-3:]
+
+
+def _cluster(ctx, name):
+    rec = (ctx.store.snapshot().get("clusters") or {}).get(name or "")
+    if not rec:
+        raise DeployError("集群「%s」不存在" % name, "请刷新页面")
+    return rec
+
+
+def entry_apply(ctx, name, rec=None, install=False, quiet=False):
+    """按当前记录重新生成并生效入口配置。没设置入口时返回 False。"""
+    rec = rec or _cluster(ctx, name)
+    e = rec.get("entry") or {}
+    if not e.get("host"):
+        return False
+    hosts = ctx.store.snapshot().get("hosts") or {}
+    r = open_host(ctx.store, e["host"])
+    try:
+        if install:
+            step("检查入口服务器 %s 上的 nginx" % r.label())
+            ensure_nginx(r, name)
+        if not quiet:
+            out("写入 nginx 配置并校验 …")
+        apply_nginx(r, name, rec, hosts)
+        downs = [m for m in rec.get("instances") or [] if m.get("down")]
+        ok("入口已生效%s" % (("（%d 个实例标为下线：%s）" % (len(downs), "、".join(
+            "%s %s" % (m["host"], productName_(m["product"])) for m in downs))) if downs else ""))
+        return True
+    finally:
+        r.close()
+
+
+def productName_(key):
+    P = PRODUCTS.get(key) if key in PRODUCTS else None
+    return P["name"] if P else key
+
+
+def set_down(ctx, name, mid, down):
+    with ctx.store.lock:
+        rec = (ctx.store.data.get("clusters") or {}).get(name)
+        for m in (rec or {}).get("instances") or []:
+            if member_id(m) == mid:
+                m["down"] = bool(down)
+        ctx.store.save()
+    return _cluster(ctx, name)
+
+
+CLUSTER_SECRETS_SH = r'''
+D=%(dir)s; SVC=%(svc)s
+b64(){ base64 2>/dev/null | tr -d '\n'; }
+if [ -f "$D/sight.env" ]; then printf '@@envfile '; b64 < "$D/sight.env"; echo; fi
+if command -v systemctl >/dev/null 2>&1 && systemctl cat "$SVC" >/dev/null 2>&1; then printf '@@unit '; systemctl cat "$SVC" 2>/dev/null | b64; echo; fi
+if [ -f "$D/data/work/database.config" ]; then printf '@@dbconf '; b64 < "$D/data/work/database.config"; echo; fi
+'''
+
+
+def _env_lines(text):
+    """KEY=VALUE 文本（sight.env / EnvironmentFile 格式）→ dict；值两端的引号去掉。"""
+    res = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        k, _, v = line.partition("=")
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        res[k.strip()] = v
+    return res
+
+
+def _unit_env(text):
+    """systemctl cat 的输出 → Environment= 里的变量（可能一行多个、带引号）。"""
+    res = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("Environment="):
+            continue
+        try:
+            items = shlex.split(line[len("Environment="):])
+        except ValueError:
+            continue
+        for it in items:
+            k, sep, v = it.partition("=")
+            if sep:
+                res[k] = v
+    return res
+
+
+def parse_instance_secrets(o):
+    """CLUSTER_SECRETS_SH 的输出 → {"env": {要拷贝的变量}, "dbconf": bytes|None, "jvm_props": bool}（纯函数）。
+    systemd 里 EnvironmentFile（sight.env）覆盖 Environment=，这里按同样的顺序合并。"""
+    parts = {}
+    for line in (o or "").splitlines():
+        if line.startswith("@@"):
+            tag, _, data = line[2:].partition(" ")
+            try:
+                parts[tag] = base64.b64decode(data.strip() or b"")
+            except Exception:
+                parts[tag] = b""
+    unit = parts.get("unit", b"").decode("utf-8", "replace")
+    merged = _unit_env(unit)
+    merged.update(_env_lines(parts.get("envfile", b"").decode("utf-8", "replace")))
+    env = {k: merged[k] for k in CRYPTO_KEYS + DB_ENV_KEYS if merged.get(k) not in (None, "")}
+    opts = " ".join([merged.get("JVM_OPTS", ""), merged.get("JAVA_OPTS", ""), unit])
+    return {"env": env, "dbconf": parts.get("dbconf") or None,
+            "jvm_props": bool(re.search(r"-D(sightdata\.|mr\.db\.)", opts))}
+
+
+def crypto_fingerprint(env):
+    """本地比对用：几个实例的加密配置是否一致（只比较散列，值不离开内存、不进日志）。"""
+    s = "\n".join("%s=%s" % (k, env.get(k, "\0unset")) for k in CRYPTO_KEYS)
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:8]
+
+
+def read_instance_secrets(r, product, inst_dir):
+    code, o, _ = r.run(CLUSTER_SECRETS_SH % {"dir": shlex.quote(inst_dir), "svc": shlex.quote(PRODUCTS[product]["service"])},
+                       sudo=True, timeout=60, secret_out=True)
+    return parse_instance_secrets(o)
+
+
+def seed_payload(env, dbconf):
+    """要写进新实例的机密 → 每行「类型 base64」的文本（纯函数）。键名校验过，值不能含换行。"""
+    lines = []
+    for k, v in sorted((env or {}).items()):
+        if not re.match(r"^[A-Z][A-Z0-9_]*$", k):
+            raise DeployError("变量名不合法：%s" % k)
+        if "\n" in v or "\r" in v:
+            raise DeployError("变量 %s 的值含换行，不能写进 sight.env" % k)
+        lines.append("ENV " + base64.b64encode(("%s=%s" % (k, v)).encode("utf-8")).decode())
+    if dbconf:
+        lines.append("DBCONF " + base64.b64encode(dbconf).decode())
+    return "\n".join(lines) + "\n"
+
+
+SEED_APPLY_SH = r'''
+( umask 077
+E="$D/sight.env"; [ -f "$E" ] || : > "$E"
+while read -r kind data; do
+  case "$kind" in
+    ENV) line=$(printf '%%s' "$data" | base64 -d); k=${line%%%%=*}
+         { grep -v "^${k}=" "$E" || true; printf '%%s\n' "$line"; } > "$E.tmp" && mv -f "$E.tmp" "$E" ;;
+    DBCONF) mkdir -p "$D/data/work"; printf '%%s' "$data" | base64 -d > "$D/data/work/database.config" ;;
+  esac
+done < %(seed)s )
+rm -f %(seed)s
+chmod 600 "$D/sight.env"; [ -f "$D/data/work/database.config" ] && chmod 600 "$D/data/work/database.config"
+%(chown)s
+'''
+
+
+def push_seed(r, payload):
+    """机密经 SSH 通道的标准输入写到服务器上的临时文件（0600，登录账号），返回路径；不进命令行、不进日志。"""
+    code, o, e = r.run_raw("umask 077; f=$(mktemp \"${TMPDIR:-/tmp}/.sight-seed.XXXXXX\") && cat > \"$f\" && echo \"$f\"",
+                           stdin=payload, timeout=60, secret_out=True)
+    path = (o.strip().splitlines() or [""])[-1]
+    if code != 0 or not path.startswith("/"):
+        raise DeployError("向服务器写入连接配置失败：%s" % (e.strip() or o.strip())[:200])
+    return path
+
+
+def seed_apply_script(seed_path, inst_dir, owner):
+    return ("D=%s\n" % shlex.quote(inst_dir)) + SEED_APPLY_SH % {
+        "seed": shlex.quote(seed_path),
+        "chown": ('chown %s: "$D/sight.env"; [ -d "$D/data/work" ] && chown -R %s: "$D/data/work"\n' % (
+            shlex.quote(owner), shlex.quote(owner))) if owner != "root" else ""}
+
+
+def wait_ready(r, port, version, timeout):
+    """等 /api/health/ready 返回 200 且版本号对上（老版本没有这个接口时看 /api/health 的 ready）。"""
+    t0, lid, last = time.time(), "ready%d" % int(time.time() * 1000), ""
+    while time.time() - t0 < timeout:
+        check_cancel()
+        st, body = r.http_get(port, "/api/health/ready")
+        j = {}
+        try:
+            j = json.loads(body) if body else {}
+        except Exception:
+            pass
+        if st == 404 or (st == 200 and not isinstance(j, dict)):
+            h = r.health(port) or {}
+            st, j = (200 if h.get("ready", True) and h else 503), h
+        v = (j or {}).get("version")
+        if st == 200 and (not version or not v or parse_version(v) == parse_version(version)):
+            live(lid, "")
+            ok("实例已就绪%s" % (("（版本 %s）" % v) if v else ""))
+            return True
+        last = "状态 %s%s%s" % (st or "无响应", (" · %s" % j.get("state")) if j.get("state") else "",
+                               (" · 版本 %s" % v) if v else "")
+        live(lid, "等待实例就绪（%d 秒）… %s" % (time.time() - t0, last))
+        time.sleep(3)
+    live(lid, "")
+    fail("等待就绪超时（%d 秒）：%s" % (timeout, last))
+    return False
+
+
+def _member_status(ctx, m):
+    """读一个实例的状态（集群页用）；SSH 失败不抛出，记在 error 里。"""
+    it = {"host": m["host"], "product": m["product"], "port": m.get("port"), "down": bool(m.get("down"))}
+    try:
+        r = open_host(ctx.store, m["host"])
+    except DeployError as e:
+        it["error"] = str(e)
+        return it
+    try:
+        inst = locate_install(ctx, r, m["product"], quiet=True, ask_user=False)
+        if not inst:
+            it.update({"installed": False, "error": "服务器上找不到这个实例"})
+            return it
+        h = r.health(inst["port"]) or {}
+        st, body = r.http_get(inst["port"], "/api/health/ready")
+        try:
+            rj = json.loads(body) if body else {}
+        except Exception:
+            rj = {}
+        it.update({"installed": True, "port": inst["port"], "dir": inst["dir"], "version": inst["version"],
+                   "running": bool(inst["pids"]) or inst["active"] == "active", "healthy": bool(h),
+                   "ready": (st == 200) if st in (200, 503) else h.get("ready"),
+                   "state": (rj or {}).get("state") or h.get("state"), "reasons": (rj or {}).get("reasons"),
+                   "mode": h.get("mode"), "leader": h.get("leader"), "node_id": h.get("nodeId"),
+                   "active_nodes": h.get("activeNodes")})
+        if not it["port"] == m.get("port"):
+            it["port_changed"] = True
+        try:
+            sec = read_instance_secrets(r, m["product"], inst["dir"])
+            it["crypto_fp"] = crypto_fingerprint(sec["env"])
+        except DeployError:
+            pass
+        ctx.store.set_product(r.alias, m["product"], {"install_dir": inst["dir"], "port": inst["port"],
+                                                      "version": inst["version"]})
+        return it
+    except DeployError as e:
+        it["error"] = str(e)
+        return it
+    finally:
+        r.close()
+
+
+def job_cluster_status(ctx, p):
+    name = p.get("cluster")
+    rec = _cluster(ctx, name)
+    res = {"cluster": name, "instances": [], "entry": None}
+    for i, m in enumerate(rec.get("instances") or [], 1):
+        out("读取实例 %d/%d：%s %s …" % (i, len(rec["instances"]), m["host"], productName_(m["product"])))
+        res["instances"].append(_member_status(ctx, m))
+    fps = [x.get("crypto_fp") for x in res["instances"] if x.get("crypto_fp")]
+    if fps:
+        major = max(set(fps), key=fps.count)
+        for x in res["instances"]:
+            if x.get("crypto_fp"):
+                x["crypto_ok"] = x["crypto_fp"] == major
+        res["crypto_consistent"] = len(set(fps)) == 1
+    vs = sorted({x.get("version") for x in res["instances"] if x.get("version")}, key=parse_version)
+    res["versions"] = vs
+    e = rec.get("entry") or {}
+    if e.get("host"):
+        out("检查入口 %s …" % e["host"])
+        try:
+            r = open_host(ctx.store, e["host"])
+            try:
+                d = nginx_info(r, name)
+                d["host"], d["port"] = e["host"], _int(e.get("port")) or 80
+                if d.get("conf") == "1" and d.get("running") == "1":
+                    d["probe"] = _entry_probe(r, d["port"], nginx_server_names(rec, ctx.store.snapshot().get("hosts"))[0])
+                res["entry"] = d
+            finally:
+                r.close()
+        except DeployError as ex:
+            res["entry"] = {"host": e["host"], "error": str(ex)}
+    return res
+
+
+def job_cluster_entry(ctx, p):
+    """配置 / 重新生成入口；up / down 参数：把某个实例放回 / 摘下（实例 id = 服务器|产品键）。"""
+    name = p.get("cluster")
+    rec = _cluster(ctx, name)
+    if not (rec.get("entry") or {}).get("host"):
+        raise DeployError("这个集群还没有设置入口服务器", "先在「编辑集群」里选入口服务器")
+    for mid in p.get("up") or []:
+        rec = set_down(ctx, name, mid, False)
+    for mid in p.get("down") or []:
+        rec = set_down(ctx, name, mid, True)
+    step("配置入口 nginx")
+    entry_apply(ctx, name, rec, install=True)
+    e = rec["entry"]
+    port = _int(e.get("port")) or 80
+    r = open_host(ctx.store, e["host"])
+    try:
+        env = probe_env(r, rec["product"], "/opt", port)
+        open_firewall(r, env, port)
+        code = _entry_probe(r, port, nginx_server_names(rec, ctx.store.snapshot().get("hosts"))[0])
+        if code == "200":
+            ok("经入口访问正常（/api/health/live 200）")
+        else:
+            warn("经入口访问 /api/health/live 返回 %s：实例可能都还没启动，或都已摘下" % (code or "无响应"))
+    finally:
+        r.close()
+    url = (e.get("public_url") or "").strip() or "http://%s%s/" % (
+        (ctx.store.get(e["host"]) or {}).get("host", e["host"]), "" if port == 80 else ":%d" % port)
+    info("入口地址：%s" % url)
+    info("请在 SightReport 管理台「系统管理 › 集群」里把对外地址设为入口地址、把入口服务器加入受信任代理")
+    return {"url": url}
+
+
+def _cluster_member_hosts(rec):
+    return {m["host"] for m in rec.get("instances") or []}
+
+
+def job_cluster_expand(ctx, p):
+    """扩容：在 host 上装一个新实例，连接配置与加密配置从已有实例拷过去（经 SSH 标准输入，写进 sight.env 0600），
+    不走安装向导，就绪后挂进 nginx。见设计文档 §8.3。"""
+    name, host = p.get("cluster"), p.get("host")
+    rec = _cluster(ctx, name)
+    pkg = load_package(p.get("package") or "")
+    base = rec["product"]
+    if pkg.product != base:
+        raise DeployError("选错了安装包：这是 %s 的包，集群是 %s" % (pkg.name, productName_(base)))
+    if not ctx.store.get(host):
+        raise DeployError("服务器「%s」不存在" % host)
+    inst_name = (p.get("instance") or "").strip()
+    pkg.use_instance(inst_name)
+    if cluster_of(ctx.store.snapshot().get("clusters"), host, pkg.product)[0]:
+        raise DeployError("%s 上的 %s 已经在集群里了" % (host, productName_(pkg.product)))
+    members = rec.get("instances") or []
+    if not members:
+        raise DeployError("集群里还没有实例：第一个实例请照常安装并完成安装向导、开启集群，再归进集群")
+    src = next((m for m in members if not m.get("down")), members[0])
+
+    step("从已有实例读取连接配置：%s %s" % (src["host"], productName_(src["product"])))
+    rs = open_host(ctx.store, src["host"])
+    try:
+        sinst = locate_install(ctx, rs, src["product"], quiet=True, ask_user=False)
+        if not sinst:
+            raise DeployError("在 %s 上找不到来源实例" % src["host"])
+        h = rs.health(sinst["port"]) or {}
+        if h.get("mode") != "CLUSTER":
+            warn("来源实例当前不是集群模式（%s）：新实例启动后会按单机运行" % (h.get("mode") or "未知"))
+            if not confirm("请先在管理台「系统管理 › 集群」开启集群（需要 Redis）。仍要继续扩容？", False):
+                raise UserAbort()
+        if sinst["version"] and pkg.version and parse_version(sinst["version"]) != parse_version(pkg.version):
+            warn("安装包版本 %s 与集群现有版本 %s 不同" % (pkg.version, sinst["version"]))
+            if not confirm("新实例与集群版本不一致（版本差超过兼容范围时它不会入群）。继续？", False):
+                raise UserAbort()
+        sec = read_instance_secrets(rs, src["product"], sinst["dir"])
+        if not sec["dbconf"] and not sec["env"].get("MR_DB_URL"):
+            raise DeployError("没有从来源实例读到数据库连接（data/work/database.config 或 MR_DB_URL）")
+        if sec["jvm_props"]:
+            warn("来源实例的 JVM 参数里有 -Dsightdata.* / -Dmr.db.*：这部分不会自动拷贝，请对照来源实例手工补到新实例")
+        got = [k for k in CRYPTO_KEYS if k in sec["env"]]
+        ok("已读取：数据库连接%s%s" % ("（database.config）" if sec["dbconf"] else "（MR_DB_*）",
+                                 ("，加密配置 %d 项" % len(got)) if got else "，加密配置为缺省值"))
+        plugins = None
+        code, o, _ = rs.run("ls -A %s 2>/dev/null | head -1" % shlex.quote(posix_join(sinst["dir"], "plugins")), sudo=True)
+        if o.strip():
+            plugins = sinst["dir"]
+    finally:
+        rs.close()
+    env = dict(sec["env"])
+    if rec.get("shared_dir"):
+        env["MR_SHARED_DIR"] = rec["shared_dir"]
+
+    r = open_host(ctx.store, host)
+    try:
+        if locate_install(ctx, r, pkg.product, quiet=True, ask_user=False):
+            raise DeployError("%s 上已经装了 %s" % (host, productName_(pkg.product)),
+                              "换一个实例名，或先把那一套归进集群（编辑集群）")
+        res = do_install(ctx, r, pkg, seed={"env": env, "dbconf": sec["dbconf"]})
+        if not res:
+            raise UserAbort()
+        inst = locate_install(ctx, r, pkg.product, quiet=True, ask_user=False)
+        if not inst:
+            raise DeployError("安装后没有找到新实例")
+        step("等待新实例就绪并加入集群")
+        if not wait_ready(r, inst["port"], pkg.version, ctx.settings["health_timeout"]):
+            show_logs(r, pkg.product, inst["dir"], inst["unit"])
+            raise DeployError("新实例没有就绪，没有挂进入口", "看上面的日志；常见原因：库连不上、Redis 连不上、授权不含这台机器")
+        h = r.health(inst["port"]) or {}
+        if h.get("mode") == "CLUSTER":
+            ok("已加入集群（当前在线实例 %s 个）" % h.get("activeNodes", "?"))
+        if plugins:
+            copy_plugins(ctx, src, plugins, r, pkg.product, inst)
+        identity = None
+        if host not in _cluster_member_hosts(rec):
+            step("新机器的身份（集群授权要包含这台机器）")
+            code, o, e = r.run("cd %s && env PATH=%s:\"$PATH\" bash ./install.sh identity" % (
+                shlex.quote(inst["dir"]), shlex.quote(java_home_of((inst.get("java") or {}).get("path") or "java") + "/bin")),
+                sudo=True, timeout=120)
+            identity = o.strip() if code == 0 and o.strip() else None
+            if identity:
+                info("把下面这段机器身份粘贴到 SightReport 管理台「授权注册」，重新生成环境信息并找我们重签授权；"
+                     "在授权宽限期内新实例可以先正常使用")
+            else:
+                warn("没能读取这台机器的身份：可在安装目录执行 ./install.sh identity 获取")
+        with ctx.store.lock:
+            c = ctx.store.data["clusters"][name]
+            c.setdefault("instances", []).append({"host": host, "product": pkg.product, "port": inst["port"],
+                                                  "install_dir": inst["dir"], "down": False})
+            ctx.store.save()
+            rec = json.loads(json.dumps(c))
+    finally:
+        r.close()
+    if (rec.get("entry") or {}).get("host"):
+        step("挂进入口 nginx")
+        entry_apply(ctx, name, rec)
+    else:
+        info("这个集群还没有设置入口：在集群页点「配置入口」后，新实例会一起挂上去")
+    return {"host": host, "product": pkg.product, "url": res.get("url"), "identity": identity}
+
+
+def copy_plugins(ctx, src, src_dir, r, product, inst):
+    """把来源实例 plugins/ 下的插件拷到新实例（插件不放共享目录，见设计文档 §5.5）。"""
+    step("拷贝插件")
+    tmp_local = Path(tempfile.mkdtemp(prefix="sight-plugins-"))
+    try:
+        rs = open_host(ctx.store, src["host"])
+        try:
+            remote_tgz = "/tmp/.sight-plugins-%s.tgz" % uuid.uuid4().hex[:8]
+            rs.run("tar -czf %s -C %s plugins && chmod 644 %s" % (shlex.quote(remote_tgz), shlex.quote(src_dir),
+                                                                 shlex.quote(remote_tgz)), sudo=True, check=True, what="打包插件")
+            try:
+                rs.sftp().get(remote_tgz, str(tmp_local / "plugins.tgz"))
+            finally:
+                rs.run("rm -f %s" % shlex.quote(remote_tgz), sudo=True)
+        finally:
+            rs.close()
+        dst_tgz = "/tmp/.sight-plugins-%s.tgz" % uuid.uuid4().hex[:8]
+        r.upload(str(tmp_local / "plugins.tgz"), dst_tgz, "插件")
+        own = ("chown -R %s: %s/plugins" % (shlex.quote(inst["owner"]), shlex.quote(inst["dir"]))) if inst.get("owner") and inst["owner"] != "root" else ":"
+        r.run("tar -xzf %s -C %s && %s; rm -f %s" % (shlex.quote(dst_tgz), shlex.quote(inst["dir"]), own, shlex.quote(dst_tgz)),
+              sudo=True, check=True, what="解开插件")
+        ok("插件已拷贝（重启新实例后生效）")
+        name = "重启"
+        s = svc_functions(product, inst["dir"], inst["owner"], inst["unit"], inst["profile"], start_env_of(inst))
+        r.run(s + "stop_svc && start_svc\n", sudo=True, check=True, what=name, timeout=300, on_line=_print_task_line)
+        wait_ready(r, inst["port"], None, ctx.settings["health_timeout"])
+    except (DeployError, OSError) as e:
+        warn("插件没有拷贝成功：%s。请手工把来源实例 plugins/ 下的文件拷到 %s/plugins/ 并重启" % (e, inst["dir"]))
+    finally:
+        shutil.rmtree(tmp_local, ignore_errors=True)
+
+
+def rolling_decision(rolling_from, versions):
+    """能否滚动升级（纯函数）：新包声明了 rollingFrom，且集群里每个实例的版本都 ≥ 它。返回 (bool, 原因)。"""
+    if not rolling_from:
+        return False, "安装包没有声明可混跑的最低版本（release.json 的 rollingFrom），按整体停机升级"
+    low = [v for v in versions if not parse_version(v) or parse_version(v) < parse_version(rolling_from)]
+    if low:
+        return False, "有实例的版本（%s）低于新版本允许混跑的最低版本 %s，按整体停机升级" % ("、".join(sorted(set(low))), rolling_from)
+    return True, "所有实例都 ≥ %s，可以逐个滚动升级（不停服）" % rolling_from
+
+
+def _stop_member(ctx, m):
+    r = open_host(ctx.store, m["host"])
+    try:
+        inst = _get_install(ctx, r, m["product"])
+        s = svc_functions(m["product"], inst["dir"], inst["owner"], inst["unit"], inst["profile"], start_env_of(inst))
+        r.run(s + "stop_svc && say 已停止\n", sudo=True, check=True, what="停止", timeout=300, on_line=_print_task_line)
+    finally:
+        r.close()
+
+
+def _upgrade_member(ctx, pkg, m, rolling):
+    r = open_host(ctx.store, m["host"])
+    try:
+        inst = locate_install(ctx, r, m["product"], quiet=True, ask_user=False)
+        if not inst:
+            raise DeployError("在 %s 上找不到实例 %s" % (m["host"], productName_(m["product"])))
+        pkg.for_product(m["product"])
+        res = do_upgrade(ctx, r, pkg, inst, preconfirmed=True)
+        if res is None:
+            raise UserAbort()
+        if rolling and not wait_ready(r, inst["port"], pkg.version, ctx.settings["health_timeout"]):
+            raise DeployError("%s 上的实例升级后没有就绪" % m["host"])
+        return res
+    finally:
+        r.close()
+
+
+def job_cluster_upgrade(ctx, p):
+    """集群升级（设计文档 §6.1）：能滚动就逐个实例「摘下 → 停 → 升 → 等就绪 → 放回」，不能就整体停机升级。
+    某个实例失败：停在那里、不放回入口，已升级的实例不自动回滚。"""
+    name = p.get("cluster")
+    rec = _cluster(ctx, name)
+    pkg = load_package(p.get("package") or "")
+    if pkg.product != rec["product"]:
+        raise DeployError("选错了安装包：这是 %s 的包，集群是 %s" % (pkg.name, productName_(rec["product"])))
+    members = rec.get("instances") or []
+    if not members:
+        raise DeployError("集群里还没有实例")
+    step("预检：读取各实例的版本")
+    vers = {}
+    for m in members:
+        st = _member_status(ctx, m)
+        if st.get("error") or not st.get("version"):
+            raise DeployError("读不到 %s 上实例的状态：%s" % (m["host"], st.get("error") or "版本未知"),
+                              "先在集群页点「刷新」，处理好这台再升级")
+        vers[member_id(m)] = st["version"]
+        out("%s %s：%s%s" % (m["host"], productName_(m["product"]), st["version"], "（已摘下）" if m.get("down") else ""))
+    newer = [v for v in vers.values() if parse_version(v) > parse_version(pkg.version)]
+    if newer:
+        raise DeployError("集群里有实例比安装包 %s 更新（%s），集群不做降级" % (pkg.version, "、".join(sorted(set(newer)))),
+                          "需要回到旧版本请恢复数据库与程序备份（人工处理）")
+    todo = [m for m in members if parse_version(vers[member_id(m)]) != parse_version(pkg.version)]
+    if not todo:
+        ok("所有实例都已经是 %s" % pkg.version)
+        return {"upgraded": [], "rolling": None}
+    rolling, why = rolling_decision(pkg.rolling_from, list(vers.values()))
+    has_entry = bool((rec.get("entry") or {}).get("host"))
+    plan = [("集群", name), ("安装包", "%s %s" % (pkg.name, pkg.version)),
+            ("要升级的实例", "、".join("%s %s" % (m["host"], productName_(m["product"])) for m in todo)),
+            ("方式", ("滚动升级：逐个实例摘下 → 停止 → 升级 → 等就绪 → 放回入口" if rolling else
+                    "整体停机升级：先停掉全部实例，升级第一个（执行数据库迁移），就绪后再升级其余")), ("判定", why)]
+    kv("集群升级计划", plan)
+    if rolling and not has_entry:
+        warn("这个集群没有由部署助手管理的入口：升级某个实例时，请求可能仍会打到它（实例在下线期间返回 503）")
+        if not confirm("没有入口可以摘流量，仍然逐个升级？", False):
+            raise UserAbort()
+    detail = ["%s：%s" % x for x in plan] + ["", "外部数据库不在部署助手的备份范围内：新版本可能会升级数据库结构（不可逆）。",
+                                              PRODUCTS[rec["product"]]["db_backup_hint"]]
+    if not rolling:
+        detail.append("整体停机期间所有用户都无法访问，通常需要几分钟。")
+    if not confirm("已备份数据库，开始%s？" % ("滚动升级" if rolling else "整体停机升级"), False, danger=True, detail=detail):
+        raise UserAbort()
+
+    done = []
+    if rolling:
+        for i, m in enumerate(todo, 1):
+            mid, label = member_id(m), "%s %s" % (m["host"], productName_(m["product"]))
+            step("第 %d/%d 个实例：%s" % (i, len(todo), label))
+            if has_entry:
+                out("从入口摘下 %s …" % label)
+                try:
+                    entry_apply(ctx, name, set_down(ctx, name, mid, True), quiet=True)
+                except Exception:
+                    set_down(ctx, name, mid, False)  # 没摘成（nginx 已恢复上一份）：记录也改回去，什么都没动
+                    raise
+            try:
+                _upgrade_member(ctx, pkg, m, True)
+            except (DeployError, UserAbort, JobCancelled) as e:
+                if has_entry:
+                    warn("%s 没有放回入口（其他实例照常服务）。处理好之后在集群页点「放回入口」" % label)
+                raise DeployError("滚动升级停在 %s：%s" % (label, e if isinstance(e, DeployError) else "已取消"),
+                                  "已升级的实例：%s。已升级的实例不会自动回滚（数据库只增不删，新旧可以共存）" % (
+                                      "、".join(done) or "无"))
+            if has_entry:
+                out("放回入口 …")
+                entry_apply(ctx, name, set_down(ctx, name, mid, False), quiet=True)
+            done.append(label)
+    else:
+        step("停止全部实例")
+        for m in members:
+            out("停止 %s %s …" % (m["host"], productName_(m["product"])))
+            _stop_member(ctx, m)
+        for i, m in enumerate(todo, 1):
+            label = "%s %s" % (m["host"], productName_(m["product"]))
+            step("第 %d/%d 个实例：%s%s" % (i, len(todo), label, "（执行数据库迁移）" if i == 1 else ""))
+            try:
+                _upgrade_member(ctx, pkg, m, False)
+            except (DeployError, UserAbort, JobCancelled) as e:
+                raise DeployError("整体升级停在 %s：%s" % (label, e if isinstance(e, DeployError) else "已取消"),
+                                  "已升级的实例：%s；其余实例仍是停止状态，处理好后在各服务器上升级或启动" % ("、".join(done) or "无"))
+            done.append(label)
+        rest = [m for m in members if m not in todo]
+        for m in rest:  # 本来就是新版本的实例（之前单独升级过）：整体停机时被停了，重新启动
+            r = open_host(ctx.store, m["host"])
+            try:
+                inst = _get_install(ctx, r, m["product"])
+                s = svc_functions(m["product"], inst["dir"], inst["owner"], inst["unit"], inst["profile"], start_env_of(inst))
+                r.run(s + "start_svc\n", sudo=True, check=True, what="启动", timeout=300, on_line=_print_task_line)
+            finally:
+                r.close()
+    step("集群升级完成")
+    ok("%d 个实例已升级到 %s" % (len(done), pkg.version))
+    gw = rec.get("gateway")
+    if split_instance(rec["product"])[0] == "sight-report":
+        hosts = ctx.store.snapshot().get("hosts") or {}
+        for n in gateway_sync_notices({gw: hosts[gw]} if gw and gw in hosts else hosts, pkg.version):
+            warn(n["text"])
+    return {"upgraded": done, "rolling": rolling}
+
+
+def save_cluster(store, body):
+    """新建 / 编辑集群（不连服务器，只改本地记录）。返回保存后的名字。"""
+    name = (body.get("name") or "").strip()
+    old = (body.get("old_name") or "").strip() or None
+    if not CLUSTER_RE.match(name):
+        raise DeployError("集群名请用小写字母、数字与 -，以字母或数字开头，不超过 32 个字符（会用在 nginx 配置文件名里）")
+    product = body.get("product") or "sight-report"
+    if product not in PRODUCTS or not supports_instances(product) or split_instance(product)[1]:
+        raise DeployError("这个产品不支持集群：%s" % product)
+    with store.lock:
+        clusters = store.data.setdefault("clusters", {})
+        if name != old and name in clusters:
+            raise DeployError("已经有一个叫「%s」的集群" % name)
+        prev = clusters.get(old or name) or {}
+        prev_by = {member_id(m): m for m in prev.get("instances") or []}
+        hosts = store.data["hosts"]
+        ms, seen = [], set()
+        for m in body.get("instances") or []:
+            hn, pk = m.get("host"), m.get("product")
+            if hn not in hosts:
+                raise DeployError("服务器「%s」不存在" % hn)
+            if pk not in PRODUCTS or split_instance(pk)[0] != product:
+                raise DeployError("%s 上的 %s 不是 %s" % (hn, pk, productName_(product)))
+            mid = member_id({"host": hn, "product": pk})
+            if mid in seen:
+                continue
+            seen.add(mid)
+            on, _ = cluster_of({k: v for k, v in clusters.items() if k != (old or name)}, hn, pk)
+            if on:
+                raise DeployError("%s 上的 %s 已经在集群「%s」里" % (hn, productName_(pk), on))
+            saved = (hosts[hn].get("products") or {}).get(pk) or {}
+            port = _int(m.get("port")) or _int(saved.get("port")) or (prev_by.get(mid) or {}).get("port")
+            if not port:
+                raise DeployError("不知道 %s 上 %s 的端口：请先刷新这台服务器的状态" % (hn, productName_(pk)))
+            item = {"host": hn, "product": pk, "port": port, "install_dir": saved.get("install_dir"),
+                    "down": bool((prev_by.get(mid) or {}).get("down"))}
+            if m.get("addr") or (prev_by.get(mid) or {}).get("addr"):
+                item["addr"] = (m.get("addr") or prev_by[mid]["addr"]).strip()
+            ms.append(item)
+        e = body.get("entry") or {}
+        entry = None
+        if e.get("host"):
+            if e["host"] not in hosts:
+                raise DeployError("入口服务器「%s」不存在" % e["host"])
+            port = _int(e.get("port")) or 80
+            if not 0 < port < 65536:
+                raise DeployError("入口端口请填 1~65535")
+            sn = (e.get("server_name") or "").strip()
+            if sn and not re.match(r"^[A-Za-z0-9.*_ ,:-]+$", sn):
+                raise DeployError("域名只能包含字母、数字、点和 -（多个用空格分开）")
+            pu = (e.get("public_url") or "").strip()
+            if pu and not re.match(r"^https?://[^\s/]+", pu):
+                raise DeployError("对外地址请填 http:// 或 https:// 开头的地址")
+            entry = {"host": e["host"], "port": port, "server_name": sn, "public_url": pu}
+            for m in ms:
+                if m["host"] == e["host"] and m["port"] == port:
+                    raise DeployError("入口端口 %d 与 %s 上实例的端口相同" % (port, e["host"]))
+        sd = (body.get("shared_dir") or "").strip()
+        if sd and not sd.startswith("/"):
+            raise DeployError("共享目录请填服务器上的绝对路径")
+        gw = (body.get("gateway") or "").strip() or None
+        if gw and gw not in hosts:
+            raise DeployError("移动网关服务器「%s」不存在" % gw)
+        fps = sorted({((hosts[m["host"]].get("products") or {}).get(m["product"]) or {}).get("db_fp") for m in ms} - {None})
+        if len(fps) > 1:
+            raise DeployError("这几个实例连的不是同一个数据库，不能组成一个集群")
+        rec = {"product": product, "db_fp": (fps[0] if fps else prev.get("db_fp")), "entry": entry,
+               "instances": ms, "shared_dir": sd or None, "gateway": gw,
+               "created": prev.get("created") or _dt.datetime.now().strftime("%Y-%m-%d %H:%M")}
+        if old and old != name:
+            clusters.pop(old, None)
+        clusters[name] = rec
+        store.save()
+    return name
+
+
 JOB_HANDLERS = {
     "add_host": lambda ctx, p: add_host(ctx.store, p),
     "edit_host": lambda ctx, p: edit_host(ctx.store, p),
@@ -5312,11 +6284,17 @@ JOB_HANDLERS = {
     "download_package": job_download_package,
     "download_tool": job_download_tool,
     "gateway_show": job_gateway_show,
+    "cluster_status": job_cluster_status,
+    "cluster_entry": job_cluster_entry,
+    "cluster_expand": job_cluster_expand,
+    "cluster_upgrade": job_cluster_upgrade,
 }
 JOB_TITLES = {"add_host": "添加服务器", "edit_host": "修改密码", "test_host": "测试连接", "status": "查询状态",
               "deploy": "安装 / 升级", "service": "启停服务", "logs": "查看日志", "follow_logs": "实时日志",
               "list_backups": "读取备份列表", "rollback": "回滚",
-              "download_package": "下载安装包", "download_tool": "下载新版部署助手", "gateway_show": "查看移动网关接入信息"}
+              "download_package": "下载安装包", "download_tool": "下载新版部署助手", "gateway_show": "查看移动网关接入信息",
+              "cluster_status": "读取集群状态", "cluster_entry": "配置集群入口", "cluster_expand": "集群扩容",
+              "cluster_upgrade": "集群升级"}
 
 
 class Job:
@@ -5565,7 +6543,13 @@ def api_state():
                              "kind": v.get("kind", "java"), "tunnel_port": v.get("tunnel_port"),
                              "instances": bool(v.get("instances")), "service": v.get("service")}
                          for k, v in PRODUCTS.items()},
+            "clusters": snap_clusters(),
+            "cluster_suggestions": cluster_suggestions(APP.store.snapshot()),
             "log_path": str(LOG.path or "")}
+
+
+def snap_clusters():
+    return APP.store.snapshot().get("clusters") or {}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -5730,7 +6714,22 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/hosts/delete":
                 if APP.busy():
                     return self._err("有任务正在执行，请稍后再删", 409)
+                for cn, c in sorted((APP.store.snapshot().get("clusters") or {}).items()):
+                    if (c.get("entry") or {}).get("host") == body.get("name") or any(
+                            m.get("host") == body.get("name") for m in c.get("instances") or []):
+                        return self._err("这台服务器在集群「%s」里（实例或入口），请先在集群里把它移除" % cn)
                 APP.store.remove(body.get("name"))
+                return self._json({"ok": True})
+            if u.path == "/api/clusters/save":
+                if APP.busy():
+                    return self._err("有任务正在执行，请稍后再改", 409)
+                return self._json({"ok": True, "name": save_cluster(APP.store, body)})
+            if u.path == "/api/clusters/delete":
+                if APP.busy():
+                    return self._err("有任务正在执行，请稍后再删", 409)
+                with APP.store.lock:
+                    (APP.store.data.get("clusters") or {}).pop(body.get("name"), None)
+                    APP.store.save()
                 return self._json({"ok": True})
             if u.path == "/api/shutdown":
                 if APP.busy():
