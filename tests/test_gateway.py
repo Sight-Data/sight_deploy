@@ -747,7 +747,7 @@ class OnlineSite(unittest.TestCase):
         sd._http_json = self._h
 
     def test_gateway_variants(self):
-        tool, prods, _nginx = sd._online_from_site()
+        tool, prods, _nginx, _valkey = sd._online_from_site()
         g = prods[sd.GATEWAY]
         self.assertEqual(sorted(g["variants"]), ["amd64", "arm64"])  # 没有安装包文件的条目当作没有
         self.assertEqual(g["variants"]["amd64"]["url"], sd.SITE_BASE + "/downloads/file/dl-gateway-linux-amd64")

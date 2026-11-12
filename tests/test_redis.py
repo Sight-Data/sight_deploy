@@ -17,7 +17,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import sight_deploy as sd  # noqa: E402
 
-REDIS_SERVER = shutil.which("redis-server")
+SERVERS = [b for b in (shutil.which("redis-server"), shutil.which("valkey-server")) if b]
 
 
 def free_port():
@@ -201,7 +201,7 @@ class CheckAgainstFake(unittest.TestCase):
         self.assertEqual(seen["stdin"], "TopSecret123\n")
 
 
-@unittest.skipUnless(REDIS_SERVER, "本机没有 redis-server")
+@unittest.skipUnless(SERVERS, "本机没有 redis-server / valkey-server")
 class RealRedis(unittest.TestCase):
     """真 Redis：检查脚本 + 本机 Redis 配置脚本（追加的配置块要真的生效）。"""
 
@@ -215,8 +215,8 @@ class RealRedis(unittest.TestCase):
             p.terminate()
             p.wait(5)
 
-    def start(self, conf):
-        p = subprocess.Popen([REDIS_SERVER, conf], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=self.d)
+    def start(self, conf, server=None):
+        p = subprocess.Popen([server or SERVERS[0], conf], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=self.d)
         self.procs.append(p)
         return p
 
@@ -229,18 +229,23 @@ class RealRedis(unittest.TestCase):
                 time.sleep(0.1)
         self.fail("redis 没起来")
 
-    def apply(self, conf, port, pw):
+    def apply(self, conf, port, pw, bind="127.0.0.1"):
         seed = os.path.join(self.d, "seed")
         with open(seed, "w") as f:
             f.write(pw + "\n")
         os.chmod(seed, 0o600)
-        p = subprocess.run(["bash", "-c", sd.redis_apply_script(conf, seed, port)], capture_output=True, text=True)
+        p = subprocess.run(["bash", "-c", sd.redis_apply_script(conf, seed, port, bind)], capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertFalse(os.path.exists(seed), "种子文件用完即删")
 
     def test_apply_block_takes_effect_and_is_idempotent(self):
+        for server in SERVERS:
+            with self.subTest(server=os.path.basename(server)):
+                self.apply_and_check(server)
+
+    def apply_and_check(self, server):
         port = free_port()
-        conf = os.path.join(self.d, "redis.conf")
+        conf = os.path.join(self.d, "redis-%d.conf" % port)
         with open(conf, "w") as f:
             f.write("bind 0.0.0.0\nprotected-mode no\nport 7777\nappendonly no\nrequirepass oldpass\ndir %s\n" % self.d)
         self.apply(conf, port, "first-pass")
@@ -253,13 +258,29 @@ class RealRedis(unittest.TestCase):
             bak = f.read()
         self.assertIn("requirepass oldpass", bak, "备份是改动前的原始配置")
         self.assertNotIn(sd.REDIS_BLOCK_BEGIN, bak, "备份里没有托管配置块")
-        self.start(conf)
+        self.start(conf, server)
         self.wait_up(port)
         rem = LocalRemote()
         self.assertEqual(sd.redis_check(rem, "127.0.0.1", port, "second-pass")["state"], "OK")
         self.assertEqual(sd.redis_check(rem, "127.0.0.1", port, "first-pass")["state"], "WRONGPASS")
         self.assertEqual(sd.redis_check(rem, "127.0.0.1", port, "")["state"], "NOAUTH")
-        self.assertEqual(sd.redis_check(rem, "127.0.0.1", port, "second-pass")["version"][0].isdigit(), True)
+        self.assertTrue(sd.redis_check(rem, "127.0.0.1", port, "second-pass")["version"][0].isdigit())
+
+    def test_multi_address_bind(self):
+        """多机集群：监听 127.0.0.1 与内网地址（这里用回环的 127.0.0.2 代替）；没列出的地址连不上。"""
+        for server in SERVERS:
+            with self.subTest(server=os.path.basename(server)):
+                port = free_port()
+                conf = os.path.join(self.d, "multi-%d.conf" % port)
+                with open(conf, "w") as f:
+                    f.write("bind 0.0.0.0\ndir %s\nsave \"\"\n" % self.d)
+                self.apply(conf, port, "pw1", bind="127.0.0.1 127.0.0.2")
+                self.start(conf, server)
+                self.wait_up(port)
+                rem = LocalRemote()
+                self.assertTrue(sd.redis_check(rem, "127.0.0.1", port, "pw1")["ok"])
+                self.assertTrue(sd.redis_check(rem, "127.0.0.2", port, "pw1")["ok"])
+                self.assertEqual(sd.redis_check(rem, "127.0.0.3", port, "pw1")["state"], "NOCONN", "没列出的地址不监听")
 
     def test_real_redis_without_password(self):
         port = free_port()
@@ -276,15 +297,40 @@ class Scripts(unittest.TestCase):
     def test_scripts_parse(self):
         for name, body in (("check", sd.redis_check_script("10.0.0.1", 6379)),
                            ("probe", sd.REDIS_PROBE_SH.replace("@PORT@", "6379")),
-                           ("apply", sd.redis_apply_script("/etc/redis/redis.conf", "/tmp/.seed", 6379))):
+                           ("apply", sd.redis_apply_script("/etc/redis/redis.conf", "/tmp/.seed", 6379)),
+                           ("valkey-install", sd.BUNDLED_VALKEY_INSTALL_SH % {"tgz": "/tmp/x.tgz", "dir": "/opt/sight-valkey"})):
             p = subprocess.run(["bash", "-n"], input=body.encode(), capture_output=True)
             self.assertEqual(p.returncode, 0, "%s: %s" % (name, p.stderr.decode()))
 
     def test_apply_only_listens_locally(self):
         s = sd.redis_apply_script("/etc/redis/redis.conf", "/tmp/.seed", 6379)
-        self.assertIn("bind 127.0.0.1", s)
+        self.assertIn("'bind 127.0.0.1'", s)
         self.assertIn("protected-mode yes", s)
         self.assertNotIn("0.0.0.0", s)
+
+    def test_bind_must_be_ipv4_list(self):
+        self.assertIn("'bind 127.0.0.1 10.0.0.20'", sd.redis_apply_script("/c", "/s", 6379, "127.0.0.1 10.0.0.20"))
+        for bad in ("0.0.0.0 ; rm -rf /", "", "::1", "host.name", "10.0.0.1\necho x"):
+            with self.assertRaises(sd.DeployError, msg=bad):
+                sd.redis_apply_script("/c", "/s", 6379, bad)
+
+    def test_fw_script_only_for_known_firewalls_and_ipv4_sources(self):
+        self.assertIsNone(sd.redis_fw_script(None, 6379, ["10.0.0.1"]))
+        self.assertIsNone(sd.redis_fw_script("firewalld", 6379, []))
+        self.assertIsNone(sd.redis_fw_script("firewalld", 6379, ["a.example.com"]))
+        f = sd.redis_fw_script("firewalld", 6379, ["10.0.0.1", "10.0.0.2"])
+        self.assertIn("source address=$S port port=$P", f)
+        self.assertIn("10.0.0.1 10.0.0.2", f)
+        self.assertNotIn("--add-port", f, "不能对所有来源开放端口")
+        self.assertEqual(subprocess.run(["bash", "-n"], input=f.encode()).returncode, 0)
+        u = sd.redis_fw_script("ufw", 6379, ["10.0.0.1"])
+        self.assertIn('ufw allow from "$S" to any port', u)
+        self.assertEqual(subprocess.run(["bash", "-n"], input=u.encode()).returncode, 0)
+
+    def test_probe_output_collects_ips(self):
+        d = sd.parse_kv_lines("bin=/usr/bin/valkey-server\nip=10.0.0.5\nip=172.17.0.1\nfw=firewalld\narch=x86_64\n")
+        self.assertEqual(d["ips"], ["10.0.0.5", "172.17.0.1"])
+        self.assertEqual((d["fw"], d["arch"]), ("firewalld", "x86_64"))
 
     def test_parse_kv(self):
         d = sd.parse_kv_lines("bin=/usr/bin/redis-server\nlisten=0\nunit=redis-server\nnoise\nsystemd=1\n")
@@ -292,26 +338,98 @@ class Scripts(unittest.TestCase):
 
 
 class ClusterRecord(unittest.TestCase):
-    def store(self):
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        st = sd.Store.__new__(sd.Store)
-        return st
-
-    def test_install_refused_for_multi_host_cluster(self):
+    def test_install_unknown_host_rejected(self):
         class Ctx:
             class store:
                 lock = threading.RLock()
 
                 @staticmethod
                 def snapshot():
-                    return {"clusters": {"c": {"product": "sight-report", "instances": [
-                        {"host": "a", "product": "sight-report", "port": 9091},
-                        {"host": "b", "product": "sight-report", "port": 9091}]}}}
+                    return {"hosts": {"a": {"host": "10.0.0.1"}}, "clusters": {"c": {"product": "sight-report", "instances": [
+                        {"host": "a", "product": "sight-report", "port": 9091}]}}}
 
         with self.assertRaises(sd.DeployError) as cm:
+            sd.job_cluster_redis_install(Ctx, {"cluster": "c", "host": "nope"})
+        self.assertIn("不存在", str(cm.exception))
+
+    def test_install_empty_cluster_rejected(self):
+        class Ctx:
+            class store:
+                lock = threading.RLock()
+
+                @staticmethod
+                def snapshot():
+                    return {"hosts": {}, "clusters": {"c": {"product": "sight-report", "instances": []}}}
+
+        with self.assertRaises(sd.DeployError):
             sd.job_cluster_redis_install(Ctx, {"cluster": "c"})
-        self.assertIn("单点", cm.exception.hint)
+
+
+def make_valkey_pkg(d, name="sight-valkey-9.0.7.1-linux-amd64.tar.gz", machine=0x3E, extra=None, drop=None, magic=b"\x7fELF"):
+    import io
+    import tarfile
+    elf = magic + bytes([2, 1, 1]) + bytes(9) + (b"\x03\x00") + machine.to_bytes(2, "little") + bytes(40)
+    files = {"sight-valkey/bin/valkey-server": elf, "sight-valkey/bin/valkey-cli": elf,
+             "sight-valkey/conf/valkey.conf.default": b"dir /var/lib/sight-valkey\n",
+             "sight-valkey/conf/sight-valkey.service": b"[Unit]\n", "sight-valkey/licenses/NOTICE": b"x",
+             "sight-valkey/VERSION": b"package=9.0.7.1\nvalkey=9.0.7\narch=amd64\n"}
+    for k in (drop or ()):
+        files.pop(k)
+    files.update(extra or {})
+    path = os.path.join(d, name)
+    with tarfile.open(path, "w:gz") as tf:
+        for n, data in files.items():
+            ti = tarfile.TarInfo(n)
+            ti.size = len(data)
+            tf.addfile(ti, io.BytesIO(data))
+    return path
+
+
+class ValkeyPackage(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, True)
+
+    def test_ok(self):
+        m = sd.inspect_valkey_pkg(make_valkey_pkg(self.d), "amd64")
+        self.assertEqual((m["version"], m["valkey"], m["arch"]), ("9.0.7.1", "9.0.7", "amd64"))
+
+    def test_wrong_arch_for_server(self):
+        with self.assertRaises(sd.DeployError) as cm:
+            sd.inspect_valkey_pkg(make_valkey_pkg(self.d), "arm64")
+        self.assertIn("ARM64", str(cm.exception))
+
+    def test_renamed_package_detected_by_elf_header(self):
+        p = make_valkey_pkg(self.d, name="sight-valkey-9.0.7.1-linux-arm64.tar.gz", machine=0x3E)
+        with self.assertRaises(sd.DeployError) as cm:
+            sd.inspect_valkey_pkg(p, "arm64")
+        self.assertIn("架构", str(cm.exception))
+
+    def test_not_elf(self):
+        with self.assertRaises(sd.DeployError):
+            sd.inspect_valkey_pkg(make_valkey_pkg(self.d, magic=b"#!/b"), "amd64")
+
+    def test_incomplete(self):
+        with self.assertRaises(sd.DeployError) as cm:
+            sd.inspect_valkey_pkg(make_valkey_pkg(self.d, drop=["sight-valkey/conf/sight-valkey.service"]), "amd64")
+        self.assertIn("不完整", str(cm.exception))
+
+    def test_path_traversal_and_foreign_paths(self):
+        for bad in ("../evil", "/etc/passwd", "other/x"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(sd.DeployError):
+                    sd.inspect_valkey_pkg(make_valkey_pkg(self.d, extra={bad: b"x"}), "amd64")
+
+    def test_bad_name(self):
+        p = os.path.join(self.d, "valkey.tar.gz")
+        shutil.copy(make_valkey_pkg(self.d), p)
+        with self.assertRaises(sd.DeployError):
+            sd.inspect_valkey_pkg(p)
+
+    def test_arch_mapping(self):
+        self.assertEqual(sd.valkey_pkg_arch("x86_64"), "amd64")
+        self.assertEqual(sd.valkey_pkg_arch("aarch64"), "arm64")
+        self.assertIsNone(sd.valkey_pkg_arch("loongarch64"))
 
 
 class FakeStore:

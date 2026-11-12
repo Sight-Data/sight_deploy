@@ -4484,6 +4484,12 @@ def _online_from_site():
         if d and d.get("localFile") and d.get("version"):
             nginx[arch] = {"latest": str(d["version"]), "file_name": d.get("fileName") or "", "size_text": d.get("fileSize") or "",
                            "url": "%s/downloads/file/%s" % (SITE_BASE, spec["site_id"])}
+    valkey = {}  # 集群 Redis 用的离线 Valkey 包，按架构分两个下载项
+    for arch, spec in VALKEY_PKG_ARCHES.items():
+        d = by.get(spec["site_id"])
+        if d and d.get("localFile") and d.get("version"):
+            valkey[arch] = {"latest": str(d["version"]), "file_name": d.get("fileName") or "", "size_text": d.get("fileSize") or "",
+                            "url": "%s/downloads/file/%s" % (SITE_BASE, spec["site_id"])}
     tool, plat = None, tool_platform()
     cands = [by.get(i) for i in ("dl-deploy-win", "dl-deploy-win7", "dl-deploy-mac") if by.get(i) and by[i].get("version")]
     if cands:
@@ -4495,7 +4501,7 @@ def _online_from_site():
         elif mine and mine.get("localFile") and str(mine.get("version")) == latest:
             url, fname, size_text = "%s/downloads/file/%s" % (SITE_BASE, mine["id"]), mine.get("fileName") or "", mine.get("fileSize") or ""
         tool = {"latest": latest, "url": url, "file_name": fname, "size_text": size_text}
-    return tool, prods, nginx
+    return tool, prods, nginx, valkey
 
 
 def _online_tool_from_github():
@@ -4518,11 +4524,11 @@ def check_online(force=False):
         if not force and _online["data"] and time.time() - _online["at"] < ONLINE_TTL:
             return _online["data"]
         res = {"checked_at": int(time.time()), "source": None, "error": None, "site": SITE_BASE,
-               "tool": None, "products": {}, "nginx": {}}
+               "tool": None, "products": {}, "nginx": {}, "valkey": {}}
         errs = []
-        tool = prods = nginx = None
+        tool = prods = nginx = valkey = None
         try:
-            tool, prods, nginx = _online_from_site()
+            tool, prods, nginx, valkey = _online_from_site()
             res["source"] = "site"
         except Exception as e:
             errs.append("官网：" + _net_err(e))
@@ -4535,6 +4541,7 @@ def check_online(force=False):
         if prods:
             res["products"] = prods
         res["nginx"] = nginx or {}
+        res["valkey"] = valkey or {}
         if tool:
             tool.update(current=TOOL_VERSION, platform=tool_platform(), page=SITE_BASE + "/downloads",
                         update=parse_version(tool["latest"]) > parse_version(TOOL_VERSION),
@@ -6006,26 +6013,44 @@ def job_cluster_redis_check(ctx, p):
     return {"redis": tg, "results": res}
 
 
-# ---- 同机多实例：在这台服务器上装一个本机 Redis（只监听 127.0.0.1，设密码）
-# 多台服务器的集群不提供：Redis 要被多台访问，放在哪台都是新的单点，由现场自己准备（已有的 Redis 或专用机器）。
+# ---- 安装 Redis（兼容实现）：同机多实例装本机 Redis；多台服务器的集群选一台装，只对节点服务器开放
+# 来源：系统软件源（redis 或 valkey 包），或 Sight 提供的离线 Valkey 包（静态编译，装到 /opt/sight-valkey）。
+# Valkey 是 Linux 基金会维护的 Redis 兼容分支，BSD-3-Clause 许可，协议与 Redis 7.2 兼容（产品用的 Redis 客户端不用改）。
+# 为什么离线包用 Valkey：Redis 7.4 起不再是开源许可（RSALv2 / SSPLv1），8.0 起可选 AGPLv3，随产品分发有合规负担（7.2.x 仍是 BSD，
+# 只有修复没有新特性）。现场已有的 Redis（任何版本）和系统软件源里的 redis 包都可以直接用。选型依据见设计文档 §17。
+VALKEY_PKG_ARCHES = {
+    "amd64": {"label": "x86_64", "uname": ("x86_64", "amd64"), "elf": 0x3E, "site_id": "dl-valkey-linux-amd64"},
+    "arm64": {"label": "ARM64", "uname": ("aarch64", "arm64"), "elf": 0xB7, "site_id": "dl-valkey-linux-arm64"},
+}
+VALKEY_PKG_RE = re.compile(r"^sight-valkey-(\d+(?:\.\d+)*)-linux-(amd64|arm64)\.tar\.gz$", re.I)
+BUNDLED_VALKEY_DIR = "/opt/sight-valkey"
+# 已装的离线 Valkey 低于这个版本时提醒升级（Valkey 发安全公告、我们出新包时一起调）
+VALKEY_BUNDLED_MIN = "9.0.7"
+
 REDIS_PROBE_SH = r"""
-echo "bin=$(command -v redis-server 2>/dev/null || true)"
+for b in redis-server valkey-server; do p=$(command -v $b 2>/dev/null || true); [ -n "$p" ] && { echo "bin=$p"; break; }; done
 echo "listen=$( (ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null) | grep -cE '[:.]@PORT@[[:space:]]' )"
-for u in redis-server redis redis6; do
+for u in redis-server redis redis6 valkey-server valkey sight-valkey; do
   if systemctl list-unit-files "$u.service" 2>/dev/null | grep -q "^$u.service"; then echo "unit=$u"; break; fi
 done
-for c in /etc/redis/redis.conf /etc/redis.conf /etc/redis/6379.conf; do [ -f "$c" ] && { echo "conf=$c"; break; }; done
+for c in /etc/redis/redis.conf /etc/redis.conf /etc/redis/6379.conf /etc/valkey/valkey.conf /etc/valkey.conf /opt/sight-valkey/conf/valkey.conf; do [ -f "$c" ] && { echo "conf=$c"; break; }; done
 for m in dnf yum apt-get zypper; do command -v $m >/dev/null 2>&1 && { echo "pkg=$m"; break; }; done
-command -v systemctl >/dev/null 2>&1 && echo "systemd=1"
+command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ] && echo "systemd=1"
+echo "arch=$(uname -m)"
+for ip in $( (ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1) || true ); do echo "ip=$ip"; done
+if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then echo "fw=firewalld"
+elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "^Status: active"; then echo "fw=ufw"; fi
 """
 
+# 系统软件源里 Redis 兼容的包：先试 redis，再试 valkey（RHEL 10 / 较新的 Debian 系只有 valkey）
 REDIS_INSTALL_CMDS = {
-    "dnf": "dnf -y install redis", "yum": "yum -y install redis",
-    "apt-get": "DEBIAN_FRONTEND=noninteractive apt-get install -y redis-server",
-    "zypper": "zypper -n install redis",
+    "dnf": "dnf -y install redis || dnf -y install valkey",
+    "yum": "yum -y install redis || yum -y install valkey",
+    "apt-get": "export DEBIAN_FRONTEND=noninteractive; apt-get install -y redis-server || apt-get install -y valkey-server",
+    "zypper": "zypper -n install redis || zypper -n install valkey",
 }
 
-# 往 Redis 配置末尾追加（先删掉自己上一次写的）一段：只监听本机、设密码、开 AOF。同名指令以后出现的为准，不动原来的内容。
+# 往配置末尾追加（先删掉自己上一次写的）一段：监听地址、密码、开 AOF。同名指令以后出现的为准，不动原来的内容。
 # 密码从种子文件读（push_seed 写的 0600 临时文件），不进命令行。
 REDIS_APPLY_SH = r"""
 set -e
@@ -6035,7 +6060,7 @@ PW=$(cat "$SEED"); rm -f "$SEED"
 sed -i '\|@BEGIN@|,\|@END@|d' "$CONF"
 {
   echo '@BEGIN@'
-  echo 'bind @LOCAL@'
+  echo 'bind @BIND@'
   echo 'protected-mode yes'
   echo "port $PORT"
   echo "requirepass $PW"
@@ -6044,73 +6069,288 @@ sed -i '\|@BEGIN@|,\|@END@|d' "$CONF"
 } >> "$CONF"
 """
 
+BIND_ITEM_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 
-def redis_apply_script(conf, seed, port=REDIS_DEFAULT_PORT):
+
+def redis_apply_script(conf, seed, port=REDIS_DEFAULT_PORT, bind=REDIS_LOCAL):
+    addrs = bind.split() if isinstance(bind, str) else list(bind)
+    if not addrs or not all(BIND_ITEM_RE.match(a) for a in addrs):
+        raise DeployError("Redis 的监听地址不合法：%s" % bind)
     return (REDIS_APPLY_SH.replace("@CONF@", shlex.quote(conf)).replace("@SEED@", shlex.quote(seed))
             .replace("@PORT@", str(int(port))).replace("@BEGIN@", REDIS_BLOCK_BEGIN)
-            .replace("@END@", REDIS_BLOCK_END).replace("@LOCAL@", REDIS_LOCAL))
+            .replace("@END@", REDIS_BLOCK_END).replace("@BIND@", " ".join(addrs)))
 
 
 def parse_kv_lines(o):
     d = {}
     for line in (o or "").splitlines():
-        k, _, v = line.partition("=")
-        if k and _:
-            d[k.strip()] = v.strip()
+        k, sep, v = line.partition("=")
+        if k and sep:
+            if k == "ip":
+                d.setdefault("ips", []).append(v.strip())
+            else:
+                d[k.strip()] = v.strip()
     return d
 
 
+# 只放行节点服务器的地址访问 Redis 端口（firewalld 富规则 / ufw）；没有启用的防火墙就什么都不做
+REDIS_FW_SH = r"""
+P=@PORT@
+if [ "@FW@" = firewalld ]; then
+  for S in @SOURCES@; do firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=$S port port=$P protocol=tcp accept" >/dev/null; done
+  firewall-cmd --reload >/dev/null && echo SIGHT_FW=OK
+elif [ "@FW@" = ufw ]; then
+  for S in @SOURCES@; do ufw allow from "$S" to any port "$P" proto tcp >/dev/null; done
+  echo SIGHT_FW=OK
+fi
+"""
+
+
+def redis_fw_script(fw, port, sources):
+    if fw not in ("firewalld", "ufw") or not sources or not all(BIND_ITEM_RE.match(x) for x in sources):
+        return None
+    return (REDIS_FW_SH.replace("@PORT@", str(int(port))).replace("@FW@", fw).replace("@SOURCES@", " ".join(sources)))
+
+
+# ---- 离线 Valkey 包（sight-data 仓库 scripts/valkey/build-release.sh 静态编译，x86_64 / ARM64）
+def valkey_pkg_arch(uname_m):
+    m = (uname_m or "").strip().lower()
+    return next((a for a, sp in VALKEY_PKG_ARCHES.items() if m in sp["uname"]), None)
+
+
+def inspect_valkey_pkg(path, arch=None):
+    """校验离线 Valkey 包：只有 sight-valkey/ 下的普通文件与目录、带 bin/valkey-server 与服务文件、程序架构与包名一致。
+    返回 {"version", "valkey", "arch"}；有问题抛 DeployError。"""
+    name = os.path.basename(path)
+    m = VALKEY_PKG_RE.match(name)
+    if not m:
+        raise DeployError("文件名不像 Sight 的离线 Valkey 包：%s" % name,
+                          "应为 sight-valkey-<版本>-linux-<amd64|arm64>.tar.gz（官网下载中心「Sight Valkey」）")
+    ver, parch = m.group(1), m.group(2).lower()
+    if arch and parch != arch:
+        raise DeployError("这个 Valkey 包是 %s 的，服务器是 %s" % (
+            VALKEY_PKG_ARCHES[parch]["label"], VALKEY_PKG_ARCHES[arch]["label"]), "请换成对应架构的包")
+    need = {"sight-valkey/bin/valkey-server", "sight-valkey/conf/valkey.conf.default",
+            "sight-valkey/conf/sight-valkey.service", "sight-valkey/VERSION"}
+    meta = {}
+    try:
+        with tarfile.open(path, "r:gz") as tf:
+            for mm in tf.getmembers():
+                n = mm.name
+                if n.startswith("/") or ".." in n.split("/") or not (n == "sight-valkey" or n.startswith("sight-valkey/")):
+                    raise DeployError("Valkey 包里有不该有的路径：%s" % n)
+                if not (mm.isfile() or mm.isdir()):
+                    raise DeployError("Valkey 包里有链接或特殊文件：%s" % n)
+                need.discard(n)
+            if need:
+                raise DeployError("Valkey 包不完整，缺少 %s" % "、".join(sorted(need)))
+            head = tf.extractfile("sight-valkey/bin/valkey-server").read(20)
+            meta = _env_lines(tf.extractfile("sight-valkey/VERSION").read().decode("utf-8", "replace"))
+    except (tarfile.TarError, OSError, EOFError) as e:
+        raise DeployError("Valkey 包损坏或不是 tar.gz：%s" % e, "请重新下载")
+    if len(head) < 20 or head[:4] != b"\x7fELF":
+        raise DeployError("Valkey 包里的 bin/valkey-server 不是 Linux 可执行文件")
+    machine = int.from_bytes(head[18:20], "little" if head[5] == 1 else "big")
+    if machine != VALKEY_PKG_ARCHES[parch]["elf"]:
+        raise DeployError("包名是 %s，但里面的 Valkey 不是这个架构的，包可能被改名或打错了" % parch)
+    return {"version": meta.get("package") or ver, "valkey": meta.get("valkey") or "", "arch": parch}
+
+
+def find_valkey_pkgs():
+    found = {}
+    for d in search_dirs():
+        for f in d.glob("sight-valkey-*.tar.gz"):
+            if f.is_file() and VALKEY_PKG_RE.match(f.name):
+                found[str(f.resolve())] = f
+    return sorted(found.values(), key=lambda f: f.stat().st_mtime, reverse=True)[:12]
+
+
+def api_valkey_pkgs():
+    res = []
+    for f in find_valkey_pkgs():
+        it = _file_item(f)
+        m = VALKEY_PKG_RE.match(f.name)
+        it["version"], it["arch"], it["kind"] = m.group(1), m.group(2).lower(), "valkey"
+        res.append(it)
+    return res
+
+
+def obtain_valkey_pkg(arch):
+    """拿到一个能用的离线 Valkey 包（本机路径）：本机已有的 → 官网下载 → 让用户选文件。"""
+    local = [f for f in find_valkey_pkgs() if VALKEY_PKG_RE.match(f.name).group(2).lower() == arch]
+    local.sort(key=lambda f: parse_version(VALKEY_PKG_RE.match(f.name).group(1)), reverse=True)
+    best = local[0] if local else None
+    if best and parse_version(VALKEY_PKG_RE.match(best.name).group(1)) >= parse_version(VALKEY_BUNDLED_MIN):
+        info("使用本机已有的 Valkey 离线包：%s" % best)
+        return str(best)
+    out("查询官网下载中心的 Valkey 离线包 …")
+    on = check_online(force=True)
+    it = (on.get("valkey") or {}).get(arch)
+    if it:
+        name = _safe_name(it.get("file_name"), "sight-valkey-%s-linux-%s.tar.gz" % (it["latest"], arch))
+        if not VALKEY_PKG_RE.match(name):
+            name = "sight-valkey-%s-linux-%s.tar.gz" % (it["latest"], arch)
+        if confirm("从官网下载 Valkey 离线包 %s（%s）？" % (it["latest"], VALKEY_PKG_ARCHES[arch]["label"]), True, detail=[
+                "下载到这台电脑，再经 SSH 上传到服务器；服务器不需要能上网。"]):
+            size = _remote_size(it["url"])
+            dest = download_file(it["url"], CONF_DIR / "uploads" / name, "下载 Valkey %s" % it["latest"], size)
+            return str(dest)
+    elif on.get("error"):
+        warn("连不上官网（%s）" % on["error"])
+    if best:
+        warn("本机的 Valkey 离线包 %s 版本较旧，建议换新版" % best.name)
+        if confirm("仍然使用 %s？" % best.name, False):
+            return str(best)
+    return ask_file("选择 Valkey 离线包（%s）" % VALKEY_PKG_ARCHES[arch]["label"], "valkey",
+                    "sight-valkey-<版本>-linux-%s.tar.gz" % arch, detail=[
+                        "官网下载中心「Sight Valkey（集群 Redis）」，按服务器的架构选择。"])
+
+
+# 装到 /opt/sight-valkey，系统服务 sight-valkey；配置文件只在没有时从默认配置复制（升级不覆盖），数据在 /var/lib/sight-valkey
+BUNDLED_VALKEY_INSTALL_SH = r'''
+set -e
+T=%(tgz)s; D=%(dir)s
+W=$(mktemp -d); trap 'rm -rf "$W" "$T"' EXIT
+tar -xzf "$T" -C "$W"
+N="$W/sight-valkey"
+"$N/bin/valkey-server" --version 2>&1 || { echo SIGHT_VALKEY_INSTALL=CANNOT_RUN; exit 0; }
+id sight-valkey >/dev/null 2>&1 || useradd -r -M -d /nonexistent -s /sbin/nologin sight-valkey 2>/dev/null \
+  || useradd -r -s /sbin/nologin sight-valkey
+mkdir -p "$D/bin" "$D/conf" "$D/licenses" /var/lib/sight-valkey
+chown sight-valkey: /var/lib/sight-valkey; chmod 750 /var/lib/sight-valkey
+for b in valkey-server valkey-cli; do
+  [ -f "$N/bin/$b" ] && { install -m 755 "$N/bin/$b" "$D/bin/$b.new" && mv -f "$D/bin/$b.new" "$D/bin/$b"; }
+done
+cp -f "$N/conf/valkey.conf.default" "$D/conf/valkey.conf.default"
+[ -f "$D/conf/valkey.conf" ] || cp "$N/conf/valkey.conf.default" "$D/conf/valkey.conf"
+chown root:sight-valkey "$D/conf/valkey.conf"; chmod 640 "$D/conf/valkey.conf"
+cp -f "$N/VERSION" "$D/VERSION"; cp -f "$N"/licenses/* "$D/licenses/"
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+  cp -f "$N/conf/sight-valkey.service" /etc/systemd/system/sight-valkey.service
+  systemctl daemon-reload; systemctl enable sight-valkey >/dev/null 2>&1 || true
+else
+  echo SIGHT_VALKEY_NO_SYSTEMD=1
+fi
+echo SIGHT_VALKEY_INSTALL=OK
+'''
+
+
+def install_bundled_valkey(r, local_pkg, arch):
+    """把离线 Valkey 包装到服务器的 /opt/sight-valkey（只装程序、默认配置与服务文件，设密码与启动由调用方接着做）。"""
+    meta = inspect_valkey_pkg(local_pkg, arch)
+    step("安装 Sight Valkey %s 到 %s" % (meta["version"], BUNDLED_VALKEY_DIR))
+    remote = "/tmp/.sight-valkey-%s.tar.gz" % uuid.uuid4().hex[:8]
+    r.upload(local_pkg, remote, "Valkey 离线包")
+    code, o, e = r.run(BUNDLED_VALKEY_INSTALL_SH % {"tgz": shlex.quote(remote), "dir": shlex.quote(BUNDLED_VALKEY_DIR)},
+                       sudo=True, timeout=300, on_line=logline)
+    if "SIGHT_VALKEY_INSTALL=OK" not in o:
+        why = [x for x in (o + "\n" + e).splitlines() if x.strip() and not x.startswith("SIGHT_VALKEY")][-5:]
+        if "CANNOT_RUN" in o:
+            raise DeployError("这个 Valkey 程序在服务器上运行不了：%s" % " / ".join(why), "确认包的架构与服务器一致")
+        raise DeployError("Valkey 没能装好：%s" % " / ".join(why))
+    if "SIGHT_VALKEY_NO_SYSTEMD=1" in o:
+        raise DeployError("服务器没有 systemd，部署助手不启动 Valkey",
+                          "请手工运行 %s/bin/valkey-server %s/conf/valkey.conf" % (BUNDLED_VALKEY_DIR, BUNDLED_VALKEY_DIR))
+    ok("Sight Valkey %s 已装到 %s" % (meta["version"], BUNDLED_VALKEY_DIR))
+    return meta
+
+
+def _ipv4_literal(x):
+    return bool(x and BIND_ITEM_RE.match(x) and all(0 <= int(o) <= 255 for o in x.split(".")))
+
+
 def job_cluster_redis_install(ctx, p):
-    """同机多实例的集群：在这台服务器上装一个本机 Redis（系统软件源），只监听 127.0.0.1 并设密码。"""
+    """在一台服务器上装 Redis 兼容服务（系统自带的 Redis / Valkey，或 Sight 的离线 Valkey 包），设密码、开 AOF。
+    集群的实例都在同一台服务器：只监听 127.0.0.1；多台服务器：选一台装，监听它的内网地址并只对节点服务器放行端口。"""
     name = p.get("cluster")
     rec = _cluster(ctx, name)
-    hosts = sorted({m["host"] for m in rec.get("instances") or []})
-    if len(hosts) != 1:
-        raise DeployError("部署助手只给「同一台服务器上的多个实例」装本机 Redis",
-                          "多台服务器的集群，Redis 放在哪一台都会成为新的单点：请用现场已有的 Redis（或专门一台），"
-                          "在「编辑集群」里填它的地址，再点「检查 Redis」")
-    hn = hosts[0]
+    member_hosts = sorted({m["host"] for m in rec.get("instances") or []})
+    if not member_hosts:
+        raise DeployError("集群里还没有实例")
+    multi = len(member_hosts) > 1
+    hosts_cfg = ctx.store.snapshot().get("hosts") or {}
+    hn = p.get("host") or ""
+    if not hn:
+        if not multi:
+            hn = member_hosts[0]
+        else:
+            opts = [("%s（%s）%s" % (h, (hosts_cfg.get(h) or {}).get("host", ""), " · 集群节点" if h in member_hosts else ""), h, None)
+                    for h in sorted(hosts_cfg)]
+            hn = choose("Redis 装在哪台服务器上？", opts, default=1, allow_back=False,
+                        detail=["Redis 是集群的会话与协调中心，它停了所有实例一起受影响：建议用一台独立的服务器，"
+                                "或至少不要和 nginx 入口放在同一台。"])
+    if hn not in hosts_cfg:
+        raise DeployError("服务器「%s」不存在" % hn)
     r = open_host(ctx.store, hn)
     try:
         step("检查 %s 上的 Redis" % hn)
         code, o, _ = r.run(REDIS_PROBE_SH.replace("@PORT@", str(REDIS_DEFAULT_PORT)), sudo=True, timeout=60)
         d = parse_kv_lines(o)
         listening = _int(d.get("listen")) or 0
+        ips = [x for x in d.get("ips", []) if _ipv4_literal(x)]
+        # 监听哪些地址、记录哪个地址
+        if multi:
+            if not ips:
+                raise DeployError("读不到 %s 的 IPv4 地址" % hn, "请手工安装 Redis，再用「编辑集群」填它的地址")
+            ip = ips[0] if len(ips) == 1 else choose(
+                "节点服务器通过哪个地址访问 Redis？", [(x, x, None) for x in ips], default=1, allow_back=False,
+                detail=["选各节点服务器都能访问到的内网地址；Redis 只监听它和 127.0.0.1。"])
+            bind, address_host = "%s %s" % (REDIS_LOCAL, ip), ip
+        else:
+            bind, address_host = REDIS_LOCAL, REDIS_LOCAL
         if listening and not d.get("bin"):
-            raise DeployError("本机 %d 端口已经被占用，但没有找到 redis-server" % REDIS_DEFAULT_PORT,
+            raise DeployError("%s 的 %d 端口已经被占用，但没有找到 redis-server / valkey-server" % (hn, REDIS_DEFAULT_PORT),
                               "确认占用的是什么；如果是别处的 Redis，用「编辑集群」填它的地址")
         if listening and d.get("bin"):
-            warn("本机已经有 Redis 在运行：部署助手不改它的配置，只检查能不能用")
+            warn("%s 上已经有 Redis 在运行：部署助手不改它的配置，只检查能不能用" % hn)
             pw = ask_secret_optional("这个 Redis 的密码（没设密码就留空）", detail=["只用于这次检查，不会保存。"])
             res = redis_check(r, REDIS_LOCAL, REDIS_DEFAULT_PORT, pw)
             if not res["ok"]:
-                raise DeployError("本机的 Redis 用不了：%s" % res["text"], res.get("hint") or "")
-            ok("本机 Redis 可用%s" % (("（%s）" % res["version"]) if res.get("version") else ""))
-            _save_redis(ctx, name, REDIS_LOCAL, REDIS_DEFAULT_PORT)
-            return {"host": hn, "address": "%s:%d" % (REDIS_LOCAL, REDIS_DEFAULT_PORT), "installed": False, "password": None}
+                raise DeployError("%s 上的 Redis 用不了：%s" % (hn, res["text"]), res.get("hint") or "")
+            ok("Redis 可用%s" % (("（%s）" % res["version"]) if res.get("version") else ""))
+            if multi:
+                warn("它原来的监听地址与防火墙没有改：节点服务器要能连上，请用「检查 Redis」确认")
+            _save_redis(ctx, name, address_host, REDIS_DEFAULT_PORT)
+            return {"host": hn, "address": "%s:%d" % (address_host, REDIS_DEFAULT_PORT), "installed": False, "password": None}
         if not d.get("systemd"):
-            raise DeployError("这台服务器没有 systemd，部署助手不安装 Redis", "请手工安装并启动 Redis，再用「编辑集群」填地址")
+            raise DeployError("%s 没有 systemd，部署助手不安装 Redis" % hn, "请手工安装并启动 Redis，再用「编辑集群」填地址")
+        arch = valkey_pkg_arch(d.get("arch"))
         if not d.get("bin"):
             pm = d.get("pkg")
-            if not pm:
-                raise DeployError("没有找到包管理器，没法安装 Redis", "请手工安装 Redis，再用「编辑集群」填地址")
-            if not confirm("在 %s 上用 %s 安装 Redis？" % (hn, pm), True,
-                           detail=["只监听 127.0.0.1（本机的几个实例访问，外面连不上），自动生成密码，开启 AOF 持久化。",
-                                   "需要服务器能访问软件源。Redis 是这个集群的会话与协调中心，本机停了所有实例一起受影响。"]):
-                raise UserAbort()
-            step("从软件源安装 Redis")
-            r.run(REDIS_INSTALL_CMDS[pm], sudo=True, timeout=900, on_line=logline)
-            code, o, _ = r.run(REDIS_PROBE_SH.replace("@PORT@", str(REDIS_DEFAULT_PORT)), sudo=True, timeout=60)
-            d = parse_kv_lines(o)
-            if not d.get("bin"):
-                raise DeployError("从软件源没有装上 Redis", "服务器可能访问不了软件源：请手工安装 Redis，再用「编辑集群」填地址")
+            opts = []
+            if pm:
+                opts.append(("从系统软件源安装（%s）" % pm, "pkg", "需要服务器能访问软件源（本地 yum / apt 源或挂载的系统 ISO）"))
+            if arch:
+                opts.append(("使用 Sight 提供的离线 Valkey 包", "bundled",
+                             "服务器不用联网：这台电脑下载后经 SSH 上传，装到 %s（系统服务 sight-valkey）" % BUNDLED_VALKEY_DIR))
+            if not opts:
+                raise DeployError("%s 上没有 Redis，没有包管理器，CPU 架构（%s）也没有离线包" % (hn, d.get("arch")),
+                                  "请手工安装 Redis，再用「编辑集群」填它的地址")
+            how = choose("%s 上没有 Redis，怎么安装？" % hn, opts, default=1, allow_back=False, detail=[
+                "监听 %s，自动生成密码，开启 AOF 持久化。" % bind.replace(" ", " 和 ")])
+            if how == "pkg":
+                step("从软件源安装 Redis")
+                r.run(REDIS_INSTALL_CMDS[pm], sudo=True, timeout=900, on_line=logline)
+                code, o, _ = r.run(REDIS_PROBE_SH.replace("@PORT@", str(REDIS_DEFAULT_PORT)), sudo=True, timeout=60)
+                d = parse_kv_lines(o)
+                if not d.get("bin"):
+                    if not arch:
+                        raise DeployError("从软件源没有装上 Redis", "服务器可能访问不了软件源：请手工安装 Redis，再用「编辑集群」填地址")
+                    warn("从软件源没有装上 Redis（服务器可能访问不了软件源）")
+                    if not confirm("改用 Sight 提供的离线 Valkey 包？", True):
+                        raise UserAbort()
+                    how = "bundled"
+            if how == "bundled":
+                install_bundled_valkey(r, obtain_valkey_pkg(arch), arch)
+                code, o, _ = r.run(REDIS_PROBE_SH.replace("@PORT@", str(REDIS_DEFAULT_PORT)), sudo=True, timeout=60)
+                d = parse_kv_lines(o)
         conf, unit = d.get("conf"), d.get("unit")
         if not conf or not unit:
-            raise DeployError("找不到 Redis 的配置文件或系统服务", "请手工配置 Redis（监听 127.0.0.1、设密码），再用「编辑集群」填地址")
+            raise DeployError("找不到 Redis 的配置文件或系统服务", "请手工配置 Redis（设密码、监听地址），再用「编辑集群」填地址")
         pw = _secrets.token_hex(16)
-        step("配置 Redis（只监听本机、设密码、开启 AOF）")
+        step("配置 Redis（监听 %s、设密码、开启 AOF）" % bind.replace(" ", " 和 "))
         seed = push_seed(r, pw + "\n")
-        r.run(redis_apply_script(conf, seed), sudo=True, check=True, what="写入 Redis 配置", timeout=60)
+        r.run(redis_apply_script(conf, seed, REDIS_DEFAULT_PORT, bind), sudo=True, check=True, what="写入 Redis 配置", timeout=60)
         step("启动 Redis")
         r.run("systemctl enable %s >/dev/null 2>&1 || true; systemctl restart %s" % (shlex.quote(unit), shlex.quote(unit)),
               sudo=True, check=True, what="启动 Redis", timeout=120)
@@ -6123,12 +6363,47 @@ def job_cluster_redis_install(ctx, p):
         if not res or not res["ok"]:
             raise DeployError("Redis 装好了但连不上：%s" % (res or {}).get("text", ""),
                               "在服务器上查看 systemctl status %s 与 %s" % (unit, conf))
-        ok("Redis 已就绪%s，只监听 %s:%d" % ((" " + res["version"]) if res.get("version") else "", REDIS_LOCAL, REDIS_DEFAULT_PORT))
-        _save_redis(ctx, name, REDIS_LOCAL, REDIS_DEFAULT_PORT)
+        ok("Redis 已就绪%s，监听 %s:%d" % ((" " + res["version"]) if res.get("version") else "",
+                                           bind.replace(" ", " 和 "), REDIS_DEFAULT_PORT))
+        if multi:
+            srcs = []
+            for h in member_hosts:
+                if h == hn:
+                    continue
+                a = (hosts_cfg.get(h) or {}).get("host", "")
+                if _ipv4_literal(a):
+                    srcs.append(a)
+                else:
+                    warn("节点 %s 的地址 %s 不是 IPv4，没法写防火墙规则，请手工放行它访问 %s:%d" % (h, a, address_host, REDIS_DEFAULT_PORT))
+            fw = redis_fw_script(d.get("fw"), REDIS_DEFAULT_PORT, srcs)
+            if fw:
+                step("防火墙：只放行节点服务器访问 %d 端口（%s）" % (REDIS_DEFAULT_PORT, "、".join(srcs)))
+                code, o2, _ = r.run(fw, sudo=True, timeout=60)
+                if "SIGHT_FW=OK" in o2:
+                    ok("已放行：%s" % "、".join(srcs))
+                else:
+                    warn("防火墙规则没有写成功，请手工放行节点服务器访问 %d 端口" % REDIS_DEFAULT_PORT)
+            elif d.get("fw") is None:
+                info("服务器上没有启用 firewalld / ufw；如果有云安全组或网络防火墙，请放行节点服务器访问 %d 端口" % REDIS_DEFAULT_PORT)
+        _save_redis(ctx, name, address_host, REDIS_DEFAULT_PORT)
     finally:
         r.close()
+    if multi:
+        step("从各节点服务器验证能连上")
+        for h in member_hosts:
+            if h == hn:
+                continue
+            rr = open_host(ctx.store, h)
+            try:
+                x = redis_check(rr, address_host, REDIS_DEFAULT_PORT, pw)
+            finally:
+                rr.close()
+            if x["ok"]:
+                ok("%s：能连上" % h)
+            else:
+                warn("%s：%s（%s）" % (h, x["text"], x.get("hint") or ""))
     info("把下面的地址和密码填到 SightReport 管理台「系统管理 › 集群」的 Redis 拓扑配置里（密码只在这里显示一次，请复制保存）")
-    return {"host": hn, "address": "%s:%d" % (REDIS_LOCAL, REDIS_DEFAULT_PORT), "installed": True, "password": pw}
+    return {"host": hn, "address": "%s:%d" % (address_host, REDIS_DEFAULT_PORT), "installed": True, "password": pw}
 
 
 def _save_redis(ctx, name, host, port):
@@ -6841,7 +7116,7 @@ JOB_TITLES = {"add_host": "添加服务器", "edit_host": "修改密码", "test_
               "list_backups": "读取备份列表", "rollback": "回滚",
               "download_package": "下载安装包", "download_tool": "下载新版部署助手", "gateway_show": "查看移动网关接入信息",
               "cluster_status": "读取集群状态", "cluster_entry": "配置集群入口", "cluster_expand": "集群扩容",
-              "cluster_upgrade": "集群升级", "cluster_redis_check": "检查 Redis", "cluster_redis_install": "安装本机 Redis"}
+              "cluster_upgrade": "集群升级", "cluster_redis_check": "检查 Redis", "cluster_redis_install": "安装 Redis"}
 
 
 class Job:
@@ -7055,7 +7330,7 @@ def api_fs(qs):
         d = str(p)
     if not p.is_dir():
         raise DeployError("文件夹不存在：%s" % d)
-    exts = {"package": (".zip", ".jar"), "jdk": (".tar.gz", ".tgz"), "nginx": (".tar.gz",)}.get(kind)
+    exts = {"package": (".zip", ".jar"), "jdk": (".tar.gz", ".tgz"), "nginx": (".tar.gz",), "valkey": (".tar.gz",)}.get(kind)
     entries = []
     try:
         items = list(p.iterdir())
@@ -7213,6 +7488,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json([_file_item(f) for f in find_jdk_archives()])
             if u.path == "/api/nginxpkgs":
                 return self._json(api_nginx_pkgs())
+            if u.path == "/api/valkeypkgs":
+                return self._json(api_valkey_pkgs())
             if u.path == "/api/fs":
                 return self._json(api_fs(qs))
             m = re.match(r"^/api/jobs/(\w+)/events$", u.path)

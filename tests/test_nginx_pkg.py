@@ -106,7 +106,7 @@ class OnlineCatalog(unittest.TestCase):
         sd._http_json = self._h
 
     def test_nginx_variants(self):
-        _, prods, nginx = sd._online_from_site()
+        _, prods, nginx, _valkey = sd._online_from_site()
         self.assertEqual(sorted(nginx), ["amd64"])
         self.assertTrue(nginx["amd64"]["url"].endswith("/downloads/file/dl-nginx-linux-amd64"))
         self.assertNotIn("nginx", prods)

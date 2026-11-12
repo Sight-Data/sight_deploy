@@ -542,7 +542,7 @@ function openBrowser(kind, startDir, onPick) {
   var shorts = h('div', { class: 'shorts' }), list = h('div', { class: 'flist' });
   var body = h('div', null, [h('div', { class: 'crumb' }, [up, path]), shorts, list]);
   var M = openModal({
-    title: kind === 'key' ? '选择私钥文件' : kind === 'jdk' ? '选择 JDK 压缩包' : kind === 'nginx' ? '选择 nginx 离线包' : '选择安装包', sub: '浏览本机文件，双击文件即可选择', cls: 'w600', body: body, dismiss: true, enter: 'ok',
+    title: kind === 'key' ? '选择私钥文件' : kind === 'jdk' ? '选择 JDK 压缩包' : kind === 'nginx' ? '选择 nginx 离线包' : kind === 'valkey' ? '选择 Valkey 离线包' : '选择安装包', sub: '浏览本机文件，双击文件即可选择', cls: 'w600', body: body, dismiss: true, enter: 'ok',
     actions: [{ label: '取消', onClick: function (M) { M.close(); } },
       { label: '选择', key: 'ok', kind: 'primary', disabled: true, onClick: function (M) { M.close(); onPick(selPath); } }]
   });
@@ -573,7 +573,7 @@ function openBrowser(kind, startDir, onPick) {
 }
 
 /* ---------- file picker (discovered list + browse + drop upload) ---------- */
-/* opts: kind 'package'|'jdk'|'nginx'|'key', prefer: product id, onChange(sel) ; returns {el, get()} */
+/* opts: kind 'package'|'jdk'|'nginx'|'valkey'|'key', prefer: product id, onChange(sel) ; returns {el, get()} */
 function buildPicker(opts) {
   var kind = opts.kind || 'package', sel = null, items = [], uploading = false;
   var localDone = kind === 'key', onlineDone = kind !== 'package', onlineWait = false;
@@ -581,7 +581,7 @@ function buildPicker(opts) {
   var selEl = h('div', { class: 'sel' });
   var drop = h('div', { class: 'drop', tabindex: '0', role: 'button' });
   var fileInp = h('input', { type: 'file', class: 'hidden' });
-  var noun = kind === 'jdk' ? 'JDK 压缩包' : kind === 'nginx' ? 'nginx 离线包' : kind === 'key' ? '私钥文件' : '安装包';
+  var noun = kind === 'jdk' ? 'JDK 压缩包' : kind === 'nginx' ? 'nginx 离线包' : kind === 'valkey' ? 'Valkey 离线包' : kind === 'key' ? '私钥文件' : '安装包';
   var browseBtn = h('button', { class: 'btn', type: 'button', html: ico('folder') + '浏览…' });
   var el = h('div', null, [listEl, drop, fileInp, h('div', { class: 'pickrow' }, [selEl, browseBtn])]);
   function resetDrop() {
@@ -599,7 +599,7 @@ function buildPicker(opts) {
     var prod = p.product && S.state && S.state.products[p.product] ? S.state.products[p.product].name : null;
     var b = h('button', { class: 'pk', type: 'button', 'data-path': p.path, html:
       '<div class="fi">' + ico('box') + '</div><div class="pm"><div class="pn">' + esc(p.name) +
-      (prod ? '<span class="tag">' + esc(prod) + (p.version ? ' ' + esc(p.version) : '') + '</span>' : p.kind === 'nginx' && p.version ? '<span class="tag">nginx ' + esc(p.version) + '</span>' : '') +
+      (prod ? '<span class="tag">' + esc(prod) + (p.version ? ' ' + esc(p.version) : '') + '</span>' : p.kind === 'nginx' && p.version ? '<span class="tag">nginx ' + esc(p.version) + '</span>' : p.kind === 'valkey' && p.version ? '<span class="tag">Valkey ' + esc(p.version) + '</span>' : '') +
       (p.arch ? archTag(p.arch) : '') + (p.arch && opts.arch && p.arch !== opts.arch ? '<span class="tag" style="background:var(--warn-bg);color:var(--warn)">与服务器架构不符</span>' : '') +
       '</div><div class="pd" title="' + esc(p.dir) + '">' + esc(p.dir) + '</div></div><div class="ps">' + fmtSize(p.size) + '<small>' + fmtTime(p.mtime) + '</small></div>' });
     b.addEventListener('click', function () { setSel(p); });
@@ -669,7 +669,7 @@ function buildPicker(opts) {
       else if (autoCheckOn()) { onlineWait = true; loadOnline(false).then(function () { onlineWait = false; onlineDone = true; renderList(); autoPick(); }); }
       else onlineDone = true;
     }
-    api('GET', kind === 'jdk' ? '/api/jdks' : kind === 'nginx' ? '/api/nginxpkgs' : '/api/packages').then(function (r) {
+    api('GET', kind === 'jdk' ? '/api/jdks' : kind === 'nginx' ? '/api/nginxpkgs' : kind === 'valkey' ? '/api/valkeypkgs' : '/api/packages').then(function (r) {
       items = r || []; localDone = true; renderList(); autoPick();
     }, function () { items = []; localDone = true; renderList(); autoPick(); });
   } else listEl.style.display = 'none';
@@ -1654,7 +1654,7 @@ function renderCluster(name) {
   if ((c.instances || []).some(function (m) { return m.down; })) note('warn', 'bang', '有实例被摘下（升级失败或手工摘下）：入口不会把请求分给它。处理好之后点「放回入口」。');
   var rd = c.redis || {}, oneHost = (function () { var hs = {}; (c.instances || []).forEach(function (m) { hs[m.host] = 1; }); return Object.keys(hs).length === 1; })();
   if (!rd.host) note('warn', 'bang', '还没有记录 Redis 地址。集群的会话、选主、分布式锁、跨节点广播都靠 Redis（有了 nginx 也不能去掉）：点「检查 Redis」填地址并检查各服务器能否连上' +
-    (oneHost ? '；这个集群的实例都在同一台服务器上，也可以让部署助手' + '<a href="#" data-act="clredisinst">装一个本机 Redis</a>' : '') + '。');
+    '；也可以让部署助手' + '<a href="#" data-act="clredisinst">' + (oneHost ? '装一个本机 Redis' : '选一台服务器装 Redis（Valkey）') + '</a>。');
   else note('info', 'help', 'Redis：<span class="mono">' + esc(rd.host + ':' + (rd.port || 6379)) + '</span>（会话与协调中心，它停了所有实例一起受影响）。<a href="#" data-act="clredis">重新检查</a>');
   if (!e.host) note('info', 'help', '还没有设置入口：点「编辑」选一台服务器做入口（装 nginx），再点「配置入口」。入口放在某个实例所在的服务器上时，那台宕机 = 整体不可用。');
   var ent = '';
@@ -2181,9 +2181,14 @@ document.addEventListener('click', function (e) {
     case 'clexpand': clusterExpandFlow(S.cl); break;
     case 'clredis': startJob('cluster_redis_check', { cluster: S.cl }, { title: '检查 Redis · ' + S.cl, closeLabel: '关闭', failTitle: '有服务器连不上 Redis', noRefresh: true,
       onClose: function () { refreshState().then(function () { renderSide(); renderMain(); }); } }); break;
-    case 'clredisinst': (function (n) { uiConfirm({ title: '在这台服务器上安装本机 Redis？', yes: '继续', lines: ['只监听 127.0.0.1（本机的实例访问，外面连不上），自动生成密码，开启 AOF 持久化。', '这是集群的会话与协调中心：它停了，本机所有实例一起受影响。'] }).then(function (y) {
-      if (y) startJob('cluster_redis_install', { cluster: n }, { title: '安装本机 Redis · ' + n, failTitle: '本机 Redis 没有装好', noRefresh: true,
-        onClose: function () { refreshState().then(function () { renderSide(); renderMain(); }); } }); }); })(S.cl); break;
+    case 'clredisinst': (function (n) {
+      var c = clusters()[n] || {}, hs = {}; (c.instances || []).forEach(function (m) { hs[m.host] = 1; });
+      var multi = Object.keys(hs).length > 1;
+      uiConfirm({ title: multi ? '装一个 Redis（Valkey）？' : '在这台服务器上安装本机 Redis？', yes: '继续',
+        lines: multi ? ['接下来选一台服务器装：监听它的内网地址并设密码，防火墙只放行集群节点服务器，自动生成密码，开启 AOF 持久化。', '这是集群的会话与协调中心：它停了所有实例一起受影响，建议用一台独立的服务器。']
+          : ['只监听 127.0.0.1（本机的实例访问，外面连不上），自动生成密码，开启 AOF 持久化。', '这是集群的会话与协调中心：它停了，本机所有实例一起受影响。'] }).then(function (y) {
+        if (y) startJob('cluster_redis_install', { cluster: n }, { title: '安装 Redis · ' + n, failTitle: 'Redis 没有装好', noRefresh: true,
+          onClose: function () { refreshState().then(function () { renderSide(); renderMain(); }); } }); }); })(S.cl); break;
     case 'clupgrade': clusterUpgradeFlow(S.cl); break;
     case 'clup': clusterEntryJob(S.cl, { up: [t.getAttribute('data-m')] }, '放回入口 · ' + S.cl); break;
     case 'cldown': uiConfirm({ title: '从入口摘下这个实例？', yes: '摘下', lines: ['入口不再把新请求分给它（实例本身照常运行）。维护完成后点「放回入口」。'] }).then(function (y) { if (y) clusterEntryJob(S.cl, { down: [t.getAttribute('data-m')] }, '摘下实例 · ' + S.cl); }); break;
