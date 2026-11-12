@@ -201,7 +201,7 @@ Sight DataLink 的数据库描述来自 `data/datalink.properties` 的 `DB_URL`�
 
 ### 同机多实例
 
-`instances=true` 的产品（SightReport、SightWall）可以在同一台服务器上装几套，用于同机集群（配合 nginx 入口不停机升级）。
+`instances=true` 的产品（只有 SightReport）可以在同一台服务器上装几套，用于同机集群（配合 nginx 入口不停机升级）。
 
 - **产品键**：实例 `b` 的键是 `<产品>@b`，如 `sight-report@b`；基础实例（老的那套）键不变。`service` / `logs` / `follow_logs` / `list_backups` / `rollback` 的 `product` 直接传实例键。
 - **实例名**：`^[a-z0-9][a-z0-9-]{0,15}$`。实例 `b` 的默认安装目录 `<dir>-b`、系统服务 `<service>-b`，新装时默认端口 = 基础端口 + 1（端口被占会照常询问）。
@@ -211,7 +211,7 @@ Sight DataLink 的数据库描述来自 `data/datalink.properties` 的 `DB_URL`�
 
 ### 集群
 
-几个实例连同一个外部数据库、前面一个 nginx 入口。只有 `/api/state` 里 `cluster=true` 的产品能组集群（目前只有 SightReport：SightWall 的大屏实时流还依赖粘性会话）。见 sight-data 仓库 `docs/集群部署与集群入口-设计.md` §4、§6、§8。
+几个实例连同一个外部数据库、前面一个 nginx 入口。只有 `/api/state` 里 `cluster=true` 的产品能组集群（只有 SightReport；SightWall 只做单实例部署）。见 sight-data 仓库 `docs/集群部署与集群入口-设计.md` §4、§6、§8。
 
 `GET /api/state` 另有：
 ```json

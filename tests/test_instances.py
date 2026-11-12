@@ -30,7 +30,8 @@ class InstanceKeys(unittest.TestCase):
         self.assertNotIn("instance", sd.PRODUCTS["sight-report"], "基础产品描述不能被派生污染")
 
     def test_membership_and_iteration(self):
-        self.assertIn("sight-wall@a1", sd.PRODUCTS)
+        self.assertIn("sight-report@a1", sd.PRODUCTS)
+        self.assertNotIn("sight-wall@b", sd.PRODUCTS, "SightWall 只做单实例")
         self.assertNotIn("sight-mobile-gateway@b", sd.PRODUCTS, "移动网关不支持实例")
         self.assertNotIn("sight-report@Bad_Name", sd.PRODUCTS)
         self.assertNotIn("nope@b", sd.PRODUCTS)

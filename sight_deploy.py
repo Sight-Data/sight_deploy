@@ -103,8 +103,8 @@ def _sight_product(key, name, port, start_class, site_id):
         "owned_dirs": None,                 # 交给运行账号的内容：None = 整个安装目录；否则只给这几个子目录，程序文件归 root
         "site_id": site_id,                 # 官网下载中心条目 id
         "rolling_upgrade": True,            # 多台服务器可以依次滚动升级
-        "instances": True,                  # 支持同机多实例（产品包 2.0.117 起的 install.sh --instance）
-        # 能否组集群（nginx 入口、不要粘性会话）。SightWall 的大屏实时流仍依赖粘性会话，另行处理
+        # 同机多实例（产品包 2.0.117 起的 install.sh --instance）与集群只面向 SightReport；SightWall 只做单实例
+        "instances": key == "sight-report",
         "cluster": key == "sight-report",
         "schema_versioned": False,          # 健康检查报告 schemaVersion，升级 / 回滚时核对
         "waiting_mode": False,              # 健康检查有 mode=waiting（服务已启动但连不上元数据库，自动重试）
@@ -6206,7 +6206,7 @@ def save_cluster(store, body):
     product = body.get("product") or "sight-report"
     if product not in PRODUCTS or split_instance(product)[1] or not PRODUCTS[product].get("cluster"):
         raise DeployError("%s 暂不支持由部署助手组集群" % productName_(product),
-                          "目前只支持 SightReport；SightWall 的大屏实时流还依赖粘性会话，集群另行处理")
+                          "集群只支持 SightReport")
     with store.lock:
         clusters = store.data.setdefault("clusters", {})
         if name != old and name in clusters:
