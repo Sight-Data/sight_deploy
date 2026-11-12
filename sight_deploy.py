@@ -52,7 +52,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-TOOL_VERSION = "2.5.1"
+TOOL_VERSION = "2.5.2"
 CONF_DIR = Path(os.environ.get("SIGHT_DEPLOY_HOME") or (Path.home() / ".sight-deploy"))
 FROZEN = getattr(sys, "frozen", False)
 # 程序所在目录：打包后是 exe/.app 所在目录（用来找同目录下的安装包），源码运行是本文件目录
