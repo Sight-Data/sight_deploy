@@ -542,7 +542,7 @@ function openBrowser(kind, startDir, onPick) {
   var shorts = h('div', { class: 'shorts' }), list = h('div', { class: 'flist' });
   var body = h('div', null, [h('div', { class: 'crumb' }, [up, path]), shorts, list]);
   var M = openModal({
-    title: kind === 'key' ? '选择私钥文件' : kind === 'jdk' ? '选择 JDK 压缩包' : '选择安装包', sub: '浏览本机文件，双击文件即可选择', cls: 'w600', body: body, dismiss: true, enter: 'ok',
+    title: kind === 'key' ? '选择私钥文件' : kind === 'jdk' ? '选择 JDK 压缩包' : kind === 'nginx' ? '选择 nginx 离线包' : '选择安装包', sub: '浏览本机文件，双击文件即可选择', cls: 'w600', body: body, dismiss: true, enter: 'ok',
     actions: [{ label: '取消', onClick: function (M) { M.close(); } },
       { label: '选择', key: 'ok', kind: 'primary', disabled: true, onClick: function (M) { M.close(); onPick(selPath); } }]
   });
@@ -573,7 +573,7 @@ function openBrowser(kind, startDir, onPick) {
 }
 
 /* ---------- file picker (discovered list + browse + drop upload) ---------- */
-/* opts: kind 'package'|'jdk'|'key', prefer: product id, onChange(sel) ; returns {el, get()} */
+/* opts: kind 'package'|'jdk'|'nginx'|'key', prefer: product id, onChange(sel) ; returns {el, get()} */
 function buildPicker(opts) {
   var kind = opts.kind || 'package', sel = null, items = [], uploading = false;
   var localDone = kind === 'key', onlineDone = kind !== 'package', onlineWait = false;
@@ -581,7 +581,7 @@ function buildPicker(opts) {
   var selEl = h('div', { class: 'sel' });
   var drop = h('div', { class: 'drop', tabindex: '0', role: 'button' });
   var fileInp = h('input', { type: 'file', class: 'hidden' });
-  var noun = kind === 'jdk' ? 'JDK 压缩包' : kind === 'key' ? '私钥文件' : '安装包';
+  var noun = kind === 'jdk' ? 'JDK 压缩包' : kind === 'nginx' ? 'nginx 离线包' : kind === 'key' ? '私钥文件' : '安装包';
   var browseBtn = h('button', { class: 'btn', type: 'button', html: ico('folder') + '浏览…' });
   var el = h('div', null, [listEl, drop, fileInp, h('div', { class: 'pickrow' }, [selEl, browseBtn])]);
   function resetDrop() {
@@ -599,7 +599,7 @@ function buildPicker(opts) {
     var prod = p.product && S.state && S.state.products[p.product] ? S.state.products[p.product].name : null;
     var b = h('button', { class: 'pk', type: 'button', 'data-path': p.path, html:
       '<div class="fi">' + ico('box') + '</div><div class="pm"><div class="pn">' + esc(p.name) +
-      (prod ? '<span class="tag">' + esc(prod) + (p.version ? ' ' + esc(p.version) : '') + '</span>' : '') +
+      (prod ? '<span class="tag">' + esc(prod) + (p.version ? ' ' + esc(p.version) : '') + '</span>' : p.kind === 'nginx' && p.version ? '<span class="tag">nginx ' + esc(p.version) + '</span>' : '') +
       (p.arch ? archTag(p.arch) : '') + (p.arch && opts.arch && p.arch !== opts.arch ? '<span class="tag" style="background:var(--warn-bg);color:var(--warn)">与服务器架构不符</span>' : '') +
       '</div><div class="pd" title="' + esc(p.dir) + '">' + esc(p.dir) + '</div></div><div class="ps">' + fmtSize(p.size) + '<small>' + fmtTime(p.mtime) + '</small></div>' });
     b.addEventListener('click', function () { setSel(p); });
@@ -669,7 +669,7 @@ function buildPicker(opts) {
       else if (autoCheckOn()) { onlineWait = true; loadOnline(false).then(function () { onlineWait = false; onlineDone = true; renderList(); autoPick(); }); }
       else onlineDone = true;
     }
-    api('GET', kind === 'jdk' ? '/api/jdks' : '/api/packages').then(function (r) {
+    api('GET', kind === 'jdk' ? '/api/jdks' : kind === 'nginx' ? '/api/nginxpkgs' : '/api/packages').then(function (r) {
       items = r || []; localDone = true; renderList(); autoPick();
     }, function () { items = []; localDone = true; renderList(); autoPick(); });
   } else listEl.style.display = 'none';

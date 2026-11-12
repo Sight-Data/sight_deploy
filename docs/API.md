@@ -71,6 +71,7 @@
 - Intel Mac 的部署助手只在 GitHub Release 里，下载地址会指向 GitHub（可用环境变量 `GH_DL_PREFIX` 加速）。
 - `products` 里没有的产品，说明官网没有可下载的包。
 - `sight-mobile-gateway` 按 CPU 架构分三个官网条目（`dl-gateway-linux-amd64` / `-arm64` / `-loong64`）：顶层 `latest` 等字段是版本最高的一个，另有 `variants: {"amd64": {"latest", "file_name", "size_text", "url", ...}, "arm64": {...}}`，只含官网上有安装包文件的架构。界面选包时按服务器架构列出对应条目。
+- `nginx`：集群入口用的离线 nginx 包（官网条目 `dl-nginx-linux-amd64` / `dl-nginx-linux-arm64`），`{"amd64": {"latest", "file_name", "size_text", "url"}}`，只含有文件的架构；界面不直接展示，`cluster_entry` 需要时下载。
 
 `POST /api/reveal` → `{"ok": true}`：在文件管理器里显示刚下载的新版部署助手（只认 `download_tool` 保存的那个文件）。
 
@@ -86,7 +87,9 @@
 
 `GET /api/jdks` → 同上结构（无 product/version），自动发现的 JDK 压缩包。
 
-`GET /api/fs?dir=<绝对路径，可省略>&kind=package|jdk|key|any` → 本机文件浏览（用于「浏览…」）：
+`GET /api/nginxpkgs` → 同上结构，自动发现的离线 nginx 包（`sight-nginx-<版本>-linux-<amd64|arm64>.tar.gz`），另有 `version`、`arch`、`"kind": "nginx"`。
+
+`GET /api/fs?dir=<绝对路径，可省略>&kind=package|jdk|nginx|key|any` → 本机文件浏览（用于「浏览…」）：
 ```json
 {"dir": "/Users/x/Downloads", "parent": "/Users/x",
  "shortcuts": [{"name": "下载", "path": "/Users/x/Downloads"}, {"name": "桌面", "path": "..."}, {"name": "主目录", "path": "..."}],
@@ -234,7 +237,7 @@ Sight DataLink 的数据库描述来自 `data/datalink.properties` 的 `DB_URL`�
 | 任务 kind | params | result |
 |---|---|---|
 | `cluster_status` | `cluster` | `{"cluster", "instances": [{host, product, port, dir, version, running, healthy, ready, state, reasons, mode, leader, node_id, active_nodes, crypto_fp, crypto_ok, down, error}], "crypto_consistent", "versions", "entry": {host, port, nginx, version, test, test_out, confd, wst, running, conf, upstream: [{addr, port, down}], probe, error}}`。`crypto_fp` 是本机对各实例加密配置算的散列（只用于比较），`probe` 是在入口机上经入口访问 `/api/health/live` 的状态码 |
-| `cluster_entry` | `cluster, up?: [实例], down?: [实例]` | 先改实例的 `down`，再：检查 / 安装 nginx（没有就 `confirm` 后用 dnf / yum / apt-get / zypper 安装；版本 <1.9.13 拒绝，<1.18 提醒；主配置没 include `conf.d/*.conf` 拒绝；现有配置 `nginx -t` 不过拒绝；没设 `worker_shutdown_timeout` 提示）→ 写两个文件 → `nginx -t` → 通过才重载（没在跑就启动），不通过恢复 `.bak` 并失败 → 防火墙放行入口端口（`confirm`）→ 经入口探测。返回 `{"url"}` |
+| `cluster_entry` | `cluster, up?: [实例], down?: [实例]` | 先改实例的 `down`，再：检查 / 安装 nginx（没有就 `choose`「从系统软件源安装（dnf / yum / apt-get / zypper）/ 使用 Sight 提供的离线 nginx 包」，没有包管理器只给后者、CPU 不是 x86_64 / aarch64 只给前者；软件源装不上 → `confirm` 改用离线包。离线包：本机已有且版本够新就用 → 官网下载（`confirm`）→ `file` 问题（`file_kind: "nginx"`）让用户选；校验文件名、包内路径、必需文件与 ELF 架构后上传、装到 `/opt/sight-nginx` 并启动 `sight-nginx`。已装的离线 nginx 低于 `NGINX_BUNDLED_MIN` 时 `confirm` 升级；版本 <1.9.13 拒绝，<1.18 提醒；主配置没 include `conf.d/*.conf` 拒绝；现有配置 `nginx -t` 不过拒绝；没设 `worker_shutdown_timeout` 提示）→ 写两个文件 → `nginx -t` → 通过才重载（没在跑就启动），不通过恢复 `.bak` 并失败 → 防火墙放行入口端口（`confirm`）→ 经入口探测。返回 `{"url"}` |
 | `cluster_expand` | `cluster, host, instance?, package` | 从集群里第一个没摘下的实例读数据库连接与加密配置（`secret_out`，不进日志）；来源不是集群模式 / 包版本不同会 `confirm`；照常 `do_install`（会问目录、端口），在 `install.sh` 之前把机密经 stdin 写进新实例的 `sight.env` 与 `data/work/database.config`（600）；等就绪 → 拷插件（有的话，重启一次）→ 新机器跑 `install.sh identity` → 记进集群 → 挂进入口。返回 `{"host", "product", "url", "identity"}` |
 | `cluster_upgrade` | `cluster, package` | 预检读各实例版本（有实例比包新 → 失败，不做降级；都已是这个版本 → 直接成功）。`rolling_decision(rollingFrom, 各实例版本)`；滚动且没有入口时 `confirm`；集群层面一次 `confirm`（已备份数据库），之后各实例的升级不再逐台问。滚动：每个实例 `down` → 重载 → `do_upgrade` → 等 `/api/health/ready` 200 且版本对上 → 放回 → 重载；失败停在该实例、不放回，错误里列出已升级的实例。整体停机：全停 → 逐个升级 → 原本已是新版本的实例重新启动。返回 `{"upgraded": [...], "rolling": true/false/null}`；集群登记了移动网关时只提醒那一台同步升级 |
 

@@ -4478,6 +4478,12 @@ def _online_from_site():
     if variants:  # 顶层是版本最高的一个（界面的「可升级」提示用），各架构自己的在 variants 里
         best = max(variants.values(), key=lambda v: parse_version(v["latest"]))
         prods[GATEWAY] = dict(best, variants=variants)
+    nginx = {}  # 集群入口用的离线 nginx 包，按架构分两个下载项
+    for arch, spec in NGINX_PKG_ARCHES.items():
+        d = by.get(spec["site_id"])
+        if d and d.get("localFile") and d.get("version"):
+            nginx[arch] = {"latest": str(d["version"]), "file_name": d.get("fileName") or "", "size_text": d.get("fileSize") or "",
+                           "url": "%s/downloads/file/%s" % (SITE_BASE, spec["site_id"])}
     tool, plat = None, tool_platform()
     cands = [by.get(i) for i in ("dl-deploy-win", "dl-deploy-win7", "dl-deploy-mac") if by.get(i) and by[i].get("version")]
     if cands:
@@ -4489,7 +4495,7 @@ def _online_from_site():
         elif mine and mine.get("localFile") and str(mine.get("version")) == latest:
             url, fname, size_text = "%s/downloads/file/%s" % (SITE_BASE, mine["id"]), mine.get("fileName") or "", mine.get("fileSize") or ""
         tool = {"latest": latest, "url": url, "file_name": fname, "size_text": size_text}
-    return tool, prods
+    return tool, prods, nginx
 
 
 def _online_tool_from_github():
@@ -4512,11 +4518,11 @@ def check_online(force=False):
         if not force and _online["data"] and time.time() - _online["at"] < ONLINE_TTL:
             return _online["data"]
         res = {"checked_at": int(time.time()), "source": None, "error": None, "site": SITE_BASE,
-               "tool": None, "products": {}}
+               "tool": None, "products": {}, "nginx": {}}
         errs = []
-        tool = prods = None
+        tool = prods = nginx = None
         try:
-            tool, prods = _online_from_site()
+            tool, prods, nginx = _online_from_site()
             res["source"] = "site"
         except Exception as e:
             errs.append("官网：" + _net_err(e))
@@ -4528,6 +4534,7 @@ def check_online(force=False):
                 errs.append("GitHub：" + _net_err(e))
         if prods:
             res["products"] = prods
+        res["nginx"] = nginx or {}
         if tool:
             tool.update(current=TOOL_VERSION, platform=tool_platform(), page=SITE_BASE + "/downloads",
                         update=parse_version(tool["latest"]) > parse_version(TOOL_VERSION),
@@ -5504,18 +5511,190 @@ def nginx_conf(name, rec, hosts):
     return conf, proxy
 
 
+# ---------------------------------------------------------------- 离线 nginx 包（集群入口）
+#
+# 入口服务器装不上系统自带的 nginx（完全离线、没有软件源）时用：官网下载中心的「Sight nginx」，
+# sight-data 仓库 scripts/nginx/build-release.sh 静态编译（不依赖系统库），只出 x86_64 / ARM64。
+# 装到 /opt/sight-nginx，系统服务 sight-nginx；集群配置仍在 /etc/nginx/conf.d（主配置 include 它）。
+
+NGINX_PKG_ARCHES = {
+    "amd64": {"label": "x86_64", "uname": ("x86_64", "amd64"), "elf": 0x3E, "site_id": "dl-nginx-linux-amd64"},
+    "arm64": {"label": "ARM64", "uname": ("aarch64", "arm64"), "elf": 0xB7, "site_id": "dl-nginx-linux-arm64"},
+}
+NGINX_PKG_RE = re.compile(r"^sight-nginx-(\d+(?:\.\d+)*)-linux-(amd64|arm64)\.tar\.gz$", re.I)
+BUNDLED_NGINX_DIR = "/opt/sight-nginx"
+# 已装的离线 nginx 低于这个版本时提醒升级（nginx 发安全公告、我们出新包时一起调）
+NGINX_BUNDLED_MIN = "1.30.6"
+
+
+def nginx_pkg_arch(uname_m):
+    m = (uname_m or "").strip().lower()
+    return next((a for a, sp in NGINX_PKG_ARCHES.items() if m in sp["uname"]), None)
+
+
+def inspect_nginx_pkg(path, arch=None):
+    """校验离线 nginx 包：只有 sight-nginx/ 下的普通文件与目录、带 sbin/nginx 与服务文件、程序架构与包名一致。
+    返回 {"version", "nginx", "arch"}；有问题抛 DeployError。"""
+    name = os.path.basename(path)
+    m = NGINX_PKG_RE.match(name)
+    if not m:
+        raise DeployError("文件名不像 Sight 的离线 nginx 包：%s" % name,
+                          "应为 sight-nginx-<版本>-linux-<amd64|arm64>.tar.gz（官网下载中心「Sight nginx」）")
+    ver, parch = m.group(1), m.group(2).lower()
+    if arch and parch != arch:
+        raise DeployError("这个 nginx 包是 %s 的，入口服务器是 %s" % (
+            NGINX_PKG_ARCHES[parch]["label"], NGINX_PKG_ARCHES[arch]["label"]), "请换成对应架构的包")
+    need = {"sight-nginx/sbin/nginx", "sight-nginx/conf/nginx.conf.default", "sight-nginx/conf/sight-nginx.service",
+            "sight-nginx/conf/mime.types", "sight-nginx/VERSION"}
+    meta = {}
+    try:
+        with tarfile.open(path, "r:gz") as tf:
+            for mm in tf.getmembers():
+                n = mm.name
+                if n.startswith("/") or ".." in n.split("/") or not (n == "sight-nginx" or n.startswith("sight-nginx/")):
+                    raise DeployError("nginx 包里有不该有的路径：%s" % n)
+                if not (mm.isfile() or mm.isdir()):
+                    raise DeployError("nginx 包里有链接或特殊文件：%s" % n)
+                need.discard(n)
+            if need:
+                raise DeployError("nginx 包不完整，缺少 %s" % "、".join(sorted(need)))
+            head = tf.extractfile("sight-nginx/sbin/nginx").read(20)
+            meta = _env_lines(tf.extractfile("sight-nginx/VERSION").read().decode("utf-8", "replace"))
+    except (tarfile.TarError, OSError, EOFError) as e:
+        raise DeployError("nginx 包损坏或不是 tar.gz：%s" % e, "请重新下载")
+    if len(head) < 20 or head[:4] != b"\x7fELF":
+        raise DeployError("nginx 包里的 sbin/nginx 不是 Linux 可执行文件")
+    machine = int.from_bytes(head[18:20], "little" if head[5] == 1 else "big")
+    if machine != NGINX_PKG_ARCHES[parch]["elf"]:
+        raise DeployError("包名是 %s，但里面的 nginx 不是这个架构的，包可能被改名或打错了" % parch)
+    return {"version": meta.get("package") or ver, "nginx": meta.get("nginx") or "", "arch": parch}
+
+
+def find_nginx_pkgs():
+    found = {}
+    for d in search_dirs():
+        for f in d.glob("sight-nginx-*.tar.gz"):
+            if f.is_file() and NGINX_PKG_RE.match(f.name):
+                found[str(f.resolve())] = f
+    return sorted(found.values(), key=lambda f: f.stat().st_mtime, reverse=True)[:12]
+
+
+def api_nginx_pkgs():
+    res = []
+    for f in find_nginx_pkgs():
+        it = _file_item(f)
+        m = NGINX_PKG_RE.match(f.name)
+        it["version"], it["arch"], it["kind"] = m.group(1), m.group(2).lower(), "nginx"
+        res.append(it)
+    return res
+
+
+def obtain_nginx_pkg(arch):
+    """拿到一个能用的离线 nginx 包（本机路径）：本机已有的 → 官网下载 → 让用户选文件。"""
+    local = [f for f in find_nginx_pkgs() if NGINX_PKG_RE.match(f.name).group(2).lower() == arch]
+    local.sort(key=lambda f: parse_version(NGINX_PKG_RE.match(f.name).group(1)), reverse=True)
+    best = local[0] if local else None
+    if best and parse_version(NGINX_PKG_RE.match(best.name).group(1)) >= parse_version(NGINX_BUNDLED_MIN):
+        info("使用本机已有的 nginx 离线包：%s" % best)
+        return str(best)
+    out("查询官网下载中心的 nginx 离线包 …")
+    on = check_online(force=True)
+    it = (on.get("nginx") or {}).get(arch)
+    if it:
+        name = _safe_name(it.get("file_name"), "sight-nginx-%s-linux-%s.tar.gz" % (it["latest"], arch))
+        if not NGINX_PKG_RE.match(name):
+            name = "sight-nginx-%s-linux-%s.tar.gz" % (it["latest"], arch)
+        if confirm("从官网下载 nginx 离线包 %s（%s）？" % (it["latest"], NGINX_PKG_ARCHES[arch]["label"]), True, detail=[
+                "下载到这台电脑，再经 SSH 上传到入口服务器；服务器不需要能上网。"]):
+            size = _remote_size(it["url"])
+            dest = download_file(it["url"], CONF_DIR / "uploads" / name, "下载 nginx %s" % it["latest"], size)
+            return str(dest)
+    elif on.get("error"):
+        warn("连不上官网（%s）" % on["error"])
+    if best:
+        warn("本机的 nginx 离线包 %s 版本较旧，建议换新版" % best.name)
+        if confirm("仍然使用 %s？" % best.name, False):
+            return str(best)
+    return ask_file("选择 nginx 离线包（%s）" % NGINX_PKG_ARCHES[arch]["label"], "nginx",
+                    "sight-nginx-<版本>-linux-%s.tar.gz" % arch, detail=[
+                        "官网下载中心「Sight nginx（集群入口）」，按入口服务器的架构选择。"])
+
+
+BUNDLED_NGINX_INSTALL_SH = r'''
+set -e
+T=%(tgz)s; D=%(dir)s
+W=$(mktemp -d); trap 'rm -rf "$W" "$T"' EXIT
+tar -xzf "$T" -C "$W"
+N="$W/sight-nginx"
+"$N/sbin/nginx" -v 2>&1 || { echo SIGHT_NGINX_INSTALL=CANNOT_RUN; exit 0; }
+id sight-nginx >/dev/null 2>&1 || useradd -r -M -d /nonexistent -s /sbin/nologin sight-nginx 2>/dev/null \
+  || useradd -r -s /sbin/nologin sight-nginx
+mkdir -p "$D/sbin" "$D/conf" "$D/licenses" "$D/temp" /var/log/sight-nginx /var/log/nginx /etc/nginx/conf.d /etc/nginx/sight
+chown sight-nginx "$D/temp"
+UPGRADE=0
+if [ -x "$D/sbin/nginx" ]; then UPGRADE=1; cp -p "$D/sbin/nginx" "$D/sbin/nginx.old"; fi
+install -m 755 "$N/sbin/nginx" "$D/sbin/nginx.new" && mv -f "$D/sbin/nginx.new" "$D/sbin/nginx"
+cp -f "$N/conf/mime.types" "$N/conf/nginx.conf.default" "$D/conf/"
+[ -f "$D/conf/nginx.conf" ] || cp "$N/conf/nginx.conf.default" "$D/conf/nginx.conf"
+cp -f "$N/VERSION" "$D/VERSION"; cp -f "$N"/licenses/* "$D/licenses/"
+[ -d /etc/logrotate.d ] && cp -f "$N/conf/logrotate" /etc/logrotate.d/sight-nginx
+if ! OUT=$("$D/sbin/nginx" -t 2>&1); then
+  printf '%%s\n' "$OUT" | tail -5
+  if [ "$UPGRADE" = 1 ]; then mv -f "$D/sbin/nginx.old" "$D/sbin/nginx"; fi
+  echo SIGHT_NGINX_INSTALL=TEST_FAIL; exit 0
+fi
+rm -f "$D/sbin/nginx.old"
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+  cp -f "$N/conf/sight-nginx.service" /etc/systemd/system/sight-nginx.service
+  systemctl daemon-reload; systemctl enable sight-nginx >/dev/null 2>&1 || true
+  if [ "$UPGRADE" = 1 ] && systemctl is-active -q sight-nginx; then systemctl restart sight-nginx; else systemctl start sight-nginx; fi
+  systemctl is-active -q sight-nginx || { systemctl status sight-nginx --no-pager 2>&1 | tail -8; echo SIGHT_NGINX_INSTALL=START_FAIL; exit 0; }
+else
+  if [ -f /run/sight-nginx.pid ] && kill -0 "$(cat /run/sight-nginx.pid)" 2>/dev/null; then "$D/sbin/nginx" -s quit; sleep 2; fi
+  "$D/sbin/nginx" || { echo SIGHT_NGINX_INSTALL=START_FAIL; exit 0; }
+  echo SIGHT_NGINX_NO_SYSTEMD=1
+fi
+echo SIGHT_NGINX_INSTALL=OK
+'''
+
+
+def install_bundled_nginx(r, local_pkg, arch):
+    """把离线 nginx 包装到（或升级）入口服务器的 /opt/sight-nginx。"""
+    meta = inspect_nginx_pkg(local_pkg, arch)
+    step("安装 Sight nginx %s 到 %s" % (meta["version"], BUNDLED_NGINX_DIR))
+    remote = "/tmp/.sight-nginx-%s.tar.gz" % uuid.uuid4().hex[:8]
+    r.upload(local_pkg, remote, "nginx 离线包")
+    code, o, e = r.run(BUNDLED_NGINX_INSTALL_SH % {"tgz": shlex.quote(remote), "dir": shlex.quote(BUNDLED_NGINX_DIR)},
+                       sudo=True, timeout=300, on_line=logline)
+    if "SIGHT_NGINX_INSTALL=OK" not in o:
+        why = [x for x in (o + "\n" + e).splitlines() if x.strip() and not x.startswith("SIGHT_NGINX")][-5:]
+        if "CANNOT_RUN" in o:
+            raise DeployError("这个 nginx 程序在入口服务器上运行不了：%s" % " / ".join(why), "确认包的架构与服务器一致")
+        if "TEST_FAIL" in o:
+            raise DeployError("nginx 配置校验没有通过，已恢复原来的程序：%s" % " / ".join(why))
+        raise DeployError("nginx 没能启动：%s" % " / ".join(why), "常见原因：端口被其他程序占用（ss -ltnp 查看）")
+    if "SIGHT_NGINX_NO_SYSTEMD=1" in o:
+        warn("服务器没有 systemd：nginx 已直接启动，服务器重启后需要手工运行 %s/sbin/nginx" % BUNDLED_NGINX_DIR)
+    ok("Sight nginx %s 已安装并运行（系统服务 sight-nginx）" % meta["version"])
+    return meta
+
+
 NGINX_INFO_SH = r'''
 C=%(conf)s
+echo "arch=$(uname -m)"
 N=$(command -v nginx 2>/dev/null); [ -z "$N" ] && [ -x /usr/sbin/nginx ] && N=/usr/sbin/nginx
+[ -z "$N" ] && [ -x /opt/sight-nginx/sbin/nginx ] && N=/opt/sight-nginx/sbin/nginx
 if [ -n "$N" ]; then
   echo "nginx=$N"
+  case "$N" in /opt/sight-nginx/*) echo bundled=1 ;; esac
   echo "version=$("$N" -v 2>&1 | sed -n 's#.*nginx/\([0-9.]*\).*#\1#p')"
   if T=$("$N" -t 2>&1); then echo test=ok; else echo test=fail; echo "test_out=$(printf '%%s' "$T" | tail -3 | tr '\n' ' ')"; fi
   A=$("$N" -T 2>/dev/null)
   printf '%%s' "$A" | grep -Eq 'include[[:space:]]+[^;]*conf\.d/\*\.conf' && echo confd=1 || echo confd=0
   printf '%%s' "$A" | grep -q worker_shutdown_timeout && echo wst=1 || echo wst=0
 fi
-pgrep -x nginx >/dev/null 2>&1 && echo running=1 || echo running=0
+ngx_running(){ pgrep -x nginx >/dev/null 2>&1 && return 0; for c in /proc/[0-9]*/comm; do [ "$(cat "$c" 2>/dev/null)" = nginx ] && return 0; done; return 1; }
+ngx_running && echo running=1 || echo running=0
 if [ -f "$C" ]; then echo conf=1; grep -E '^[[:space:]]*server[[:space:]]+[^;]+;' "$C" | sed 's/^[[:space:]]*/up=/' ; else echo conf=0; fi
 for pm in dnf yum apt-get zypper; do command -v $pm >/dev/null 2>&1 && { echo pkg=$pm; break; }; done
 '''
@@ -5540,26 +5719,46 @@ def nginx_info(r, name):
 
 
 def ensure_nginx(r, name):
-    """入口服务器上要有能用的 nginx：没有就（经确认）用系统包管理器装；返回 nginx_info。"""
+    """入口服务器上要有能用的 nginx，返回 nginx_info。没有时让用户选：系统软件源安装，或 Sight 提供的离线包
+    （静态编译、不依赖系统库，装到 /opt/sight-nginx）；已装的离线 nginx 版本过低时提醒升级。"""
     d = nginx_info(r, name)
+    arch = nginx_pkg_arch(d.get("arch"))
     if not d.get("nginx"):
         pm = d.get("pkg")
-        if not pm:
-            raise DeployError("入口服务器 %s 上没有 nginx，也没有找到包管理器" % r.label(),
-                              "请先手工安装 nginx（1.18 及以上），再回来点「配置入口」")
-        if not confirm("入口服务器 %s 上没有 nginx，现在用 %s 从软件源安装？" % (r.label(), pm), True, detail=[
-                "需要服务器能访问软件源（内网一般有本地 yum / apt 源，或挂载了系统 ISO）。",
-                "装不上时请手工安装 nginx 1.18 及以上版本，再回来点「配置入口」。"]):
-            raise UserAbort()
-        cmd = {"dnf": "dnf -y install nginx", "yum": "yum -y install nginx",
-               "apt-get": "DEBIAN_FRONTEND=noninteractive apt-get install -y nginx",
-               "zypper": "zypper -n install nginx"}[pm]
-        step("安装 nginx")
-        r.run(cmd + "\n(systemctl enable nginx || true) >/dev/null 2>&1", sudo=True, check=True, what="安装 nginx",
-              timeout=900, on_line=logline)
-        d = nginx_info(r, name)
-        if not d.get("nginx"):
-            raise DeployError("nginx 安装后仍然找不到", "请在服务器上确认 nginx 是否装好（nginx -v）")
+        opts = []
+        if pm:
+            opts.append(("从系统软件源安装（%s）" % pm, "pkg", "需要服务器能访问软件源（本地 yum / apt 源或挂载的系统 ISO）"))
+        if arch:
+            opts.append(("使用 Sight 提供的离线 nginx 包", "bundled",
+                         "服务器不用联网：这台电脑下载后经 SSH 上传，装到 %s（系统服务 sight-nginx）" % BUNDLED_NGINX_DIR))
+        if not opts:
+            raise DeployError("入口服务器 %s 上没有 nginx，没有包管理器，CPU 架构（%s）也没有离线包" % (r.label(), d.get("arch")),
+                              "请手工安装 nginx 1.18 及以上版本，再回来点「配置入口」")
+        how = choose("入口服务器 %s 上没有 nginx，怎么安装？" % r.label(), opts, default=1, allow_back=False)
+        if how == "pkg":
+            cmd = {"dnf": "dnf -y install nginx", "yum": "yum -y install nginx",
+                   "apt-get": "DEBIAN_FRONTEND=noninteractive apt-get install -y nginx",
+                   "zypper": "zypper -n install nginx"}[pm]
+            step("从软件源安装 nginx")
+            code, _, _ = r.run(cmd + "\n(systemctl enable nginx || true) >/dev/null 2>&1", sudo=True, timeout=900, on_line=logline)
+            d = nginx_info(r, name)
+            if not d.get("nginx"):
+                if not arch:
+                    raise DeployError("从软件源安装 nginx 失败", "请手工安装 nginx 1.18 及以上版本，再回来点「配置入口」")
+                warn("从软件源没有装上 nginx（服务器可能访问不了软件源）")
+                if not confirm("改用 Sight 提供的离线 nginx 包？", True):
+                    raise UserAbort()
+                how = "bundled"
+        if how == "bundled":
+            install_bundled_nginx(r, obtain_nginx_pkg(arch), arch)
+            d = nginx_info(r, name)
+            if not d.get("nginx"):
+                raise DeployError("离线 nginx 安装后仍然找不到", "在服务器上查看 %s 与 systemctl status sight-nginx" % BUNDLED_NGINX_DIR)
+    elif d.get("bundled") == "1" and arch and parse_version(d.get("version")) < parse_version(NGINX_BUNDLED_MIN):
+        warn("入口服务器上的 Sight nginx %s 低于建议版本 %s（新版本修复了安全问题）" % (d.get("version"), NGINX_BUNDLED_MIN))
+        if confirm("现在升级 Sight nginx？", True, detail=["升级会重启 nginx，入口中断几秒；配置文件保持不变，新程序先校验配置，不通过不替换。"]):
+            install_bundled_nginx(r, obtain_nginx_pkg(arch), arch)
+            d = nginx_info(r, name)
     v = parse_version(d.get("version"))
     if v and v < NGINX_MIN:
         raise DeployError("入口服务器上的 nginx 版本 %s 太旧（至少 1.9.13，建议 1.18 以上）" % d.get("version"),
@@ -5586,15 +5785,19 @@ def apply_nginx(r, name, rec, hosts):
     conf, proxy = nginx_conf(name, rec, hosts)
     s = r'''set -e
 P=%(proxy)s; C=%(conf)s
-mkdir -p "$(dirname "$P")" "$(dirname "$C")"
+NG=$(command -v nginx 2>/dev/null || true); [ -z "$NG" ] && [ -x /usr/sbin/nginx ] && NG=/usr/sbin/nginx
+[ -z "$NG" ] && [ -x /opt/sight-nginx/sbin/nginx ] && NG=/opt/sight-nginx/sbin/nginx
+SVC=nginx; case "$NG" in /opt/sight-nginx/*) SVC=sight-nginx ;; esac
+mkdir -p "$(dirname "$P")" "$(dirname "$C")" /var/log/nginx
 restore(){ for f in "$P" "$C"; do if [ -f "$f.bak" ]; then mv -f "$f.bak" "$f"; else rm -f "$f"; fi; done; }
 for f in "$P" "$C"; do rm -f "$f.bak"; if [ -f "$f" ]; then cp -p "$f" "$f.bak"; fi; done
 %(write_p)s%(write_c)s
 set +e
-OUT=$(nginx -t 2>&1); rc=$?
+OUT=$("$NG" -t 2>&1); rc=$?
 if [ $rc -ne 0 ]; then printf '%%s\n' "$OUT" | tail -5; restore; echo SIGHT_NGINX=TEST_FAIL; exit 0; fi
-if pgrep -x nginx >/dev/null 2>&1; then nginx -s reload 2>&1 || systemctl reload nginx 2>&1 || { echo SIGHT_NGINX=RELOAD_FAIL; exit 0; }
-else (systemctl enable nginx >/dev/null 2>&1; systemctl start nginx 2>&1) || nginx 2>&1 || { echo SIGHT_NGINX=START_FAIL; exit 0; }; fi
+ngx_running(){ pgrep -x nginx >/dev/null 2>&1 && return 0; for c in /proc/[0-9]*/comm; do [ "$(cat "$c" 2>/dev/null)" = nginx ] && return 0; done; return 1; }
+if ngx_running; then "$NG" -s reload 2>&1 || systemctl reload "$SVC" 2>&1 || { echo SIGHT_NGINX=RELOAD_FAIL; exit 0; }
+else (systemctl enable "$SVC" >/dev/null 2>&1; systemctl start "$SVC" 2>&1) || "$NG" 2>&1 || { echo SIGHT_NGINX=START_FAIL; exit 0; }; fi
 echo SIGHT_NGINX=OK
 ''' % {"proxy": shlex.quote(n["proxy"]), "conf": shlex.quote(n["conf"]),
        "write_p": heredoc(n["proxy"], proxy), "write_c": heredoc(n["conf"], conf)}
@@ -5611,8 +5814,12 @@ echo SIGHT_NGINX=OK
 def _entry_probe(r, port, server_name):
     """入口生效后从入口机本机访问一次 /api/health/live。"""
     hn = "" if server_name in ("", "_") else server_name
-    code, o, _ = r.run("curl -s --noproxy '*' -m 8 -o /dev/null -w '%%{http_code}' %s http://127.0.0.1:%d/api/health/live"
-                       % (("-H " + shlex.quote("Host: " + hn)) if hn else "", port), timeout=20)
+    host_hdr = hn or "127.0.0.1"
+    code, o, _ = r.run(
+        "if command -v curl >/dev/null 2>&1; then curl -s --noproxy '*' -m 8 -o /dev/null -w '%%{http_code}' -H %s http://127.0.0.1:%d/api/health/live; "
+        "else exec 3<>/dev/tcp/127.0.0.1/%d && printf 'GET /api/health/live HTTP/1.0\\r\\nHost: %%s\\r\\n\\r\\n' %s >&3 "
+        "&& timeout 8 head -1 <&3 | cut -d' ' -f2; fi" % (shlex.quote("Host: " + host_hdr), port, port, shlex.quote(host_hdr)),
+        timeout=20)
     return o.strip()[-3:]
 
 
@@ -6512,7 +6719,7 @@ def api_fs(qs):
         d = str(p)
     if not p.is_dir():
         raise DeployError("文件夹不存在：%s" % d)
-    exts = {"package": (".zip", ".jar"), "jdk": (".tar.gz", ".tgz")}.get(kind)
+    exts = {"package": (".zip", ".jar"), "jdk": (".tar.gz", ".tgz"), "nginx": (".tar.gz",)}.get(kind)
     entries = []
     try:
         items = list(p.iterdir())
@@ -6668,6 +6875,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(api_packages())
             if u.path == "/api/jdks":
                 return self._json([_file_item(f) for f in find_jdk_archives()])
+            if u.path == "/api/nginxpkgs":
+                return self._json(api_nginx_pkgs())
             if u.path == "/api/fs":
                 return self._json(api_fs(qs))
             m = re.match(r"^/api/jobs/(\w+)/events$", u.path)

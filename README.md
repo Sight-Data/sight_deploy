@@ -75,7 +75,7 @@ SightReport / SightWall / Sight DataLink / Sight 移动网关的产品安装包�
 - **同机多实例**（只用于 SightReport 集群）：已安装的 SightReport 卡片上「再装一个实例」：同一台服务器上再装一套（单独的目录 `/opt/sight-report-<实例名>`、端口、系统服务 `sight-report-<实例名>`），需要 2.0.117 及以上的完整安装包。
 - **集群**（只支持 SightReport，SightWall 只做单实例部署。几个实例连同一个外部数据库、在管理台开启集群模式，前面一个 nginx 入口）：
   - 识别：刷新状态时记下每个实例的数据库地址指纹（只存指纹，不存地址），同一个库的实例 ≥2 个时侧栏提示「归为一个集群」；也可以手工新建。
-  - 入口：选一台服务器做入口，部署助手装 / 检查 nginx（≥1.18，系统源安装），只写自己的两个文件 `/etc/nginx/conf.d/sight-<集群>.conf`、`/etc/nginx/sight/<集群>-proxy.conf`，不改主配置；写入后 `nginx -t`，通过才重载，不通过恢复上一份。上游就是集群的实例表；未就绪（503）的实例自动换一台，`/assets/` 在新旧版本间 404 也换一台，`/api/machine/` 不经入口暴露，WebSocket 日志不记查询参数（令牌）。实例可以手工「摘下 / 放回入口」。
+  - 入口：选一台服务器做入口，部署助手检查 nginx（≥1.18）；没有时可选从系统软件源安装，或用官网提供的**离线 nginx 包**（x86_64 / ARM64，静态编译、不依赖系统库，这台电脑下载后经 SSH 上传，装到 `/opt/sight-nginx`、系统服务 `sight-nginx`；软件源装不上时自动建议改用它；版本过低时提醒升级）。部署助手只写自己的两个文件 `/etc/nginx/conf.d/sight-<集群>.conf`、`/etc/nginx/sight/<集群>-proxy.conf`，不改主配置；写入后 `nginx -t`，通过才重载，不通过恢复上一份。上游就是集群的实例表；未就绪（503）的实例自动换一台，`/assets/` 在新旧版本间 404 也换一台，`/api/machine/` 不经入口暴露，WebSocket 日志不记查询参数（令牌）。实例可以手工「摘下 / 放回入口」。
   - 扩容：在选定的服务器上装一个新实例，数据库连接（`data/work/database.config` / `MR_DB_*`）和整组加密配置（`SIGHTDATA_*_KEY`、`SIGHTDATA_CRYPTO_AES_GCM`）从已有实例拷过去，写进新实例的 `sight.env`（600），**不走安装向导**；就绪后挂进入口，插件一并拷过去。新机器会给出机器身份（`install.sh identity`），用于重签集群授权。
   - 集群升级：新包的 `release.json` 声明了可混跑的最低版本（`rollingFrom`），且所有实例都不低于它 → 滚动升级：逐个实例「从入口摘下 → 停止（实例内完成下线）→ 备份并升级 → 等 `/api/health/ready` 且版本对上 → 放回」；否则整体停机升级（全停 → 升第一个执行数据库迁移 → 再升其余）。某个实例失败就停在那里、不放回入口，已升级的不自动回滚。
   - 集群页：每个实例的版本、就绪状态、leader、加密配置是否一致（只在本机比较散列），入口 nginx 的状态与经入口访问是否正常。
@@ -123,6 +123,7 @@ SightReport / SightWall / Sight DataLink / Sight 移动网关的产品安装包�
 | 安装记录 | 安装目录下的 `.sight-deploy.json`（版本、端口、启动参数） |
 | 同机多实例 | 安装目录下 `.sight-instance`（一行实例名）；实例 `b` 的服务名 `<服务>-b`、默认目录 `<目录>-b`；实例级配置在 `sight.env`（600） |
 | 集群入口 | 入口服务器上 `/etc/nginx/conf.d/sight-<集群>.conf` 与 `/etc/nginx/sight/<集群>-proxy.conf`（上一份留 `.bak`）；升级中的实例写成 `server … down;` |
+| 离线 nginx | `/opt/sight-nginx`（程序、`conf/nginx.conf`——已存在时升级不覆盖、`licenses/`、`VERSION`），运行账号 `sight-nginx`，系统服务 `sight-nginx`，日志 `/var/log/sight-nginx/`、logrotate `/etc/logrotate.d/sight-nginx`。包由 sight-data 仓库 `scripts/nginx/build-release.sh` 构建，官网下载项 `dl-nginx-linux-amd64` / `dl-nginx-linux-arm64` |
 
 支持的服务器：x86_64 / aarch64 的 Linux，有无 systemd 都可以（没有 systemd 时以后台进程方式运行）。Sight 移动网关另支持龙芯 loongarch64，但必须有 systemd。
 
