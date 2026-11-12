@@ -735,7 +735,7 @@ function loadOnline(force) {
   return S.onlineP;
 }
 function onlineNewer(pid, installed) {
-  var o = S.online && S.online.products && S.online.products[pid];
+  var o = S.online && S.online.products && S.online.products[baseOf(pid)];
   return o && installed && verCmp(o.latest, installed) > 0 ? o : null;
 }
 function autoCheckOn() { return !(S.state && S.state.settings && S.state.settings.auto_check === false); }
@@ -800,8 +800,14 @@ function applyBusy() {
 function refreshState() {
   return api('GET', '/api/state').then(function (st) { S.state = st; return st; });
 }
-function productName(id) { return S.state && S.state.products[id] ? S.state.products[id].name : id; }
-function productInfo(id) { return (S.state && S.state.products && S.state.products[id]) || {}; }
+function productName(id) {
+  var ps = S.state && S.state.products, inst = String(id || '').split('@')[1];
+  if (ps && ps[id]) return ps[id].name;
+  if (ps && inst && ps[baseOf(id)]) return ps[baseOf(id)].name + '（实例 ' + inst + '）';
+  return id;
+}
+function baseOf(id) { return String(id || '').split('@')[0]; }
+function productInfo(id) { var ps = S.state && S.state.products; return (ps && (ps[id] || ps[baseOf(id)])) || {}; }
 function isGw(id) { return productInfo(id).kind === 'gateway'; }
 var ARCH_LABEL = { amd64: 'x86_64', arm64: 'ARM64', loong64: '龙芯' };
 function archTag(a) { return a ? '<span class="tag gray">' + esc(ARCH_LABEL[a] || a) + '</span>' : ''; }
@@ -1356,7 +1362,7 @@ function gatewayCard(p) {
 function productCard(p, hostRec) {
   var id = p.product, pn = p.name || productName(id);
   if (isGw(id)) return gatewayCard(p);
-  var port = (S.state.products[id] || {}).port;
+  var port = productInfo(id).port;
   if (!p.installed) {
     return '<div class="card off"><div class="ch"><div class="pico">' + ico('box') + '</div><div><h2>' + esc(pn) + '</h2></div><div class="sp"></div><span class="badge gray">未安装</span></div>' +
       '<div class="offbody">这台服务器上还没有安装 ' + esc(pn) + '。' + (port ? '默认端口 ' + port + '。' : '') +
@@ -1397,6 +1403,7 @@ function productCard(p, hostRec) {
     '<div class="ca"><button class="btn primary" type="button" data-job="1" data-act="deploy" data-p="' + esc(id) + '">升级</button>' +
     '<button class="btn" type="button" data-job="1" data-act="svc" data-a="restart" data-p="' + esc(id) + '">重启</button>' +
     (isOn ? '<button class="btn" type="button" data-job="1" data-act="svc" data-a="stop" data-p="' + esc(id) + '">停止</button>' : '<button class="btn" type="button" data-job="1" data-act="svc" data-a="start" data-p="' + esc(id) + '">启动</button>') +
+    (productInfo(id).instances ? '<button class="btn" type="button" data-job="1" data-act="addinst" data-p="' + esc(baseOf(id)) + '" title="在这台服务器上再装一套（同机多实例，配合 nginx 可不停机升级）">再装一个实例</button>' : '') +
     '<span class="grow"></span><button class="btn" type="button" data-job="1" data-act="logs" data-p="' + esc(id) + '">日志</button>' +
     '<button class="btn" type="button" data-job="1" data-act="rollback" data-p="' + esc(id) + '">回滚</button></div></div>';
 }
@@ -1419,7 +1426,10 @@ function renderMain() {
   var body;
   if (res) {
     var byId = {}; res.products.forEach(function (p) { byId[p.product] = p; });
-    body = '<div class="cards" style="' + (loading ? 'opacity:.6;transition:opacity .2s' : '') + '">' + Object.keys(st.products).map(function (id) {
+    // 按状态结果的顺序：同机多实例紧跟在它的基础产品后面；没查到的基础产品按未安装显示
+    var order = res.products.map(function (p) { return p.product; });
+    Object.keys(st.products).forEach(function (id) { if (order.indexOf(id) < 0) order.push(id); });
+    body = '<div class="cards" style="' + (loading ? 'opacity:.6;transition:opacity .2s' : '') + '">' + order.map(function (id) {
       return productCard(byId[id] || { product: id, name: productName(id), installed: false }, hs);
     }).join('') + '</div>';
   } else if (err) {
@@ -1474,16 +1484,17 @@ function selectHost(name) {
 /* ---------- flows ---------- */
 
 /* install / upgrade: step 1 choose package, step 2 choose servers */
-function deployFlow(hostName, productId) {
-  var pk = buildPicker({ kind: 'package', prefer: productId || null, autoSelect: !!productId, arch: productId && isGw(productId) ? hostArch(hostName) : null, onChange: function (s) { syncNext(); } });
+function deployFlow(hostName, productId, opts) {
+  opts = opts || {};
+  var pk = buildPicker({ kind: 'package', prefer: productId ? baseOf(productId) : null, autoSelect: !!productId, arch: productId && isGw(productId) ? hostArch(hostName) : null, onChange: function (s) { syncNext(); } });
   var M1;
   function syncNext() { if (M1 && M1.btn.next) M1.btn.next.disabled = !pk.get() || pk.isUploading(); }
   function step1() {
     var body = h('div', null, [pk.el]);
     M1 = openModal({
-      title: productId ? '选择 ' + productName(productId) + ' 安装包' : '选择安装包', sub: '第 1 步，共 2 步', cls: 'w760', body: body, dismiss: true, enter: 'next',
+      title: opts.instance ? '选择安装包 · 新实例 ' + productName(productId + '@' + opts.instance) : productId ? '选择 ' + productName(productId) + ' 安装包' : '选择安装包', sub: '第 1 步，共 2 步', cls: 'w760', body: body, dismiss: true, enter: 'next',
       actions: [{ label: '取消', onClick: function (M) { M.close(); } },
-        { label: '下一步', key: 'next', kind: 'primary', disabled: !pk.get(), onClick: function (M) { var s0 = pk.get(); if (productId && s0.product && s0.product !== productId) { toast('这是 ' + productName(s0.product) + ' 的安装包，不能用来升级 ' + productName(productId) + '，请重新选择'); return; } var ha = hostArch(hostName); if (s0.arch && ha && s0.arch !== ha) { toast('这个安装包是 ' + (ARCH_LABEL[s0.arch] || s0.arch) + ' 的，' + hostName + ' 是 ' + (ARCH_LABEL[ha] || ha) + ' 服务器，请换成 ' + (ARCH_LABEL[ha] || ha) + ' 的安装包'); return; } if (s0.online && isBusy()) { toast('正在读取服务器状态，请等几秒再点「下一步」'); return; } M.close(); if (s0.online) fetchThenStep2(s0); else step2(s0); } }]
+        { label: '下一步', key: 'next', kind: 'primary', disabled: !pk.get(), onClick: function (M) { var s0 = pk.get(); if (productId && s0.product && s0.product !== baseOf(productId)) { toast('这是 ' + productName(s0.product) + ' 的安装包，不能用来升级 ' + productName(productId) + '，请重新选择'); return; } var ha = hostArch(hostName); if (s0.arch && ha && s0.arch !== ha) { toast('这个安装包是 ' + (ARCH_LABEL[s0.arch] || s0.arch) + ' 的，' + hostName + ' 是 ' + (ARCH_LABEL[ha] || ha) + ' 服务器，请换成 ' + (ARCH_LABEL[ha] || ha) + ' 的安装包'); return; } if (s0.online && isBusy()) { toast('正在读取服务器状态，请等几秒再点「下一步」'); return; } M.close(); if (s0.online) fetchThenStep2(s0); else step2(s0); } }]
     });
     $('.mb', M1.md).style.minHeight = '320px';
   }
@@ -1528,13 +1539,40 @@ function deployFlow(hostName, productId) {
       var names = S.state.hosts.map(function (x) { return x.name; }).filter(function (k) { return picked[k]; });
       if (!names.length) return;
       M.close();
-      startJob('deploy', { hosts: names, package: pkg.path, product: productId || null }, {
-        title: '安装 / 升级 · ' + pkg.name, productName: pkg.product ? productName(pkg.product) : (productId ? productName(productId) : '系统'), failTitle: '安装 / 升级没有完成'
+      startJob('deploy', { hosts: names, package: pkg.path, product: productId || null, instance: opts.instance || undefined }, {
+        title: (opts.instance ? '安装新实例 ' + opts.instance + ' · ' : '安装 / 升级 · ') + pkg.name, productName: pkg.product ? productName(pkg.product) : (productId ? productName(productId) : '系统'), failTitle: '安装 / 升级没有完成'
       });
     }
     sync();
   }
   step1();
+}
+
+/* 同机多实例：先起实例名，再走正常的选包 → 选服务器流程（deploy 带 instance） */
+function addInstanceFlow(hostName, baseId) {
+  var res = S.status[hostName], used = {};
+  ((res && res.products) || []).forEach(function (p) { if (p.installed && baseOf(p.product) === baseId) used[String(p.product).split('@')[1] || ''] = true; });
+  var sug = 'b';
+  for (var c = 98; c < 123 && used[String.fromCharCode(c)]; c++) sug = String.fromCharCode(c + 1);
+  var inp = h('input', { type: 'text', value: sug, maxlength: '16', class: 'inp mono', 'data-testid': 'instance-name' });
+  var err = h('div', { class: 'note bad', style: 'margin:10px 0 0;display:none' });
+  var body = h('div', null, [
+    h('div', { class: 'note info', style: 'margin:0 0 14px', html: ico('help') + '<div>在 <b>' + esc(hostName) + '</b> 上再装一套 ' + esc(productName(baseId)) +
+      '：单独的安装目录、端口和系统服务（服务名 <span class="mono">' + esc(productInfo(baseId).service || baseId) + '-实例名</span>）。几个实例连同一个外部数据库并开启集群，配合 nginx 入口就能不停机升级。需要 2.0.117 及以上版本的完整安装包（.zip）。</div>' }),
+    h('div', { style: 'font-weight:600;margin-bottom:8px' }, ['实例名']), inp,
+    h('div', { class: 'help', style: 'color:var(--muted);font-size:12.5px;margin-top:6px' }, ['小写字母、数字与 -，以字母或数字开头，最多 16 个字符。']), err
+  ]);
+  openModal({
+    title: '再装一个实例', cls: 'w600', body: body, dismiss: true, enter: 'next',
+    actions: [{ label: '取消', onClick: function (M) { M.close(); } },
+      { label: '下一步：选择安装包', key: 'next', kind: 'primary', onClick: function (M) {
+        var v = inp.value.trim();
+        var bad = !/^[a-z0-9][a-z0-9-]{0,15}$/.test(v) ? '实例名不合法：小写字母、数字与 -，以字母或数字开头，最多 16 个字符' : used[v] ? '这台服务器上已经有实例「' + v + '」了' : '';
+        if (bad) { err.textContent = bad; err.style.display = ''; return; }
+        M.close(); deployFlow(hostName, baseId, { instance: v });
+      } }]
+  });
+  setTimeout(function () { inp.focus(); inp.select(); }, 0);
 }
 
 function serviceAction(host, pid, action) {
@@ -1833,6 +1871,7 @@ document.addEventListener('click', function (e) {
     case 'editpw': if (hs) openEditPw(hs); break;
     case 'delhost': if (hs) deleteHost(hs); break;
     case 'deploy': deployFlow(S.sel, p || null); break;
+    case 'addinst': addInstanceFlow(S.sel, p); break;
     case 'svc': serviceAction(S.sel, p, t.getAttribute('data-a')); break;
     case 'logs': openLogs(S.sel, p); break;
     case 'rollback': openRollback(S.sel, p); break;

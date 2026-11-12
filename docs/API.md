@@ -27,7 +27,8 @@
      "products": {"sight-report": {"install_dir": "/opt/sight-report", "port": 9091, "version": "2.0.71"}}}
   ],
   "products": {"sight-report": {"name": "SightReport", "port": 9091, "dir": "/opt/sight-report", "zip_prefix": "sight-report",
-                               "setup_path": "/setup", "setup_token": false, "rolling_upgrade": true, "schema_versioned": false},
+                               "setup_path": "/setup", "setup_token": false, "rolling_upgrade": true, "schema_versioned": false,
+                               "kind": "java", "instances": true, "service": "sight-report"},
                "sight-wall": {...},
                "sight-datalink": {"name": "Sight DataLink", "port": 18680, "dir": "/opt/sight-datalink", "zip_prefix": "sight-datalink",
                               "setup_path": "/", "setup_token": true, "rolling_upgrade": false, "schema_versioned": true},
@@ -107,7 +108,7 @@
 | `edit_host` | `name, password` 或 `name, key_passphrase` | `{"name": ...}` |
 | `test_host` | `name` | `{"root": true}` |
 | `status` | `host` | 见下 |
-| `deploy` | `hosts: [名字...], package: 本机路径, product`（可选：从产品卡点的是哪个产品，包不对时直接失败） | `{"results": [{"host": "生产-1", "status": "完成/跳过/失败/取消", "url": "http://..."}]}`；Sight DataLink 升级后持续 60 秒处于 `mode=waiting`（连不上元数据库）按未就绪处理：`fail` 事件「服务已启动但连不上元数据库（等待模式…）」+ `info`「最近一次连接错误：…」（健康检查的 `lastError`，口令打码），随后照常显示日志并 `confirm` 是否回滚；首次安装还可能有 `mode`（`setup` 安装向导 / `waiting` 等元数据库）、`setup_token`（从服务日志取到的初始化令牌）、`token_hint`（没取到令牌时的说明，如「令牌为部署时设置的 FDL_SETUP_TOKEN」）；移动网关的结果项另有 `gateway`（见下「Sight 移动网关」），升级 SightReport 后若助手里登记的某台服务器的移动网关版本不同，结果项有 `gateway_notices: [{"host", "gateway", "target", "text"}]`（`text` 形如「移动网关需同步升级到 2.0.96：前置机 上的移动网关现在是 2.0.95 …」），同时时间线上有 `warn` |
+| `deploy` | `hosts: [名字...], package: 本机路径, product`（可选：从产品卡点的是哪个产品，包不对时直接失败；可以是实例键 `sight-report@b`），`instance`（可选：装 / 升级同机的哪个实例，见下「同机多实例」） | `{"results": [{"host": "生产-1", "status": "完成/跳过/失败/取消", "url": "http://..."}]}`；Sight DataLink 升级后持续 60 秒处于 `mode=waiting`（连不上元数据库）按未就绪处理：`fail` 事件「服务已启动但连不上元数据库（等待模式…）」+ `info`「最近一次连接错误：…」（健康检查的 `lastError`，口令打码），随后照常显示日志并 `confirm` 是否回滚；首次安装还可能有 `mode`（`setup` 安装向导 / `waiting` 等元数据库）、`setup_token`（从服务日志取到的初始化令牌）、`token_hint`（没取到令牌时的说明，如「令牌为部署时设置的 FDL_SETUP_TOKEN」）；移动网关的结果项另有 `gateway`（见下「Sight 移动网关」），升级 SightReport 后若助手里登记的某台服务器的移动网关版本不同，结果项有 `gateway_notices: [{"host", "gateway", "target", "text"}]`（`text` 形如「移动网关需同步升级到 2.0.96：前置机 上的移动网关现在是 2.0.95 …」），同时时间线上有 `warn` |
 | `service` | `host, product, action("start"/"stop"/"restart")` | `{}` |
 | `logs` | `host, product, lines(默认200)` | `{"text": "日志文本"}` |
 | `follow_logs` | `host, product` | 不会自己结束；通过 `log` 事件推送新行，用户点「停止」→ cancel |
@@ -198,6 +199,16 @@ Sight DataLink 的数据库描述来自 `data/datalink.properties` 的 `DB_URL`�
 
 `POST /api/jobs/<id>/cancel` → 请求中止。说明：升级的关键步骤在服务器后台执行，取消只是「停止等待」，后端会在时间线里说明。
 
+### 同机多实例
+
+`instances=true` 的产品（SightReport、SightWall）可以在同一台服务器上装几套，用于同机集群（配合 nginx 入口不停机升级）。
+
+- **产品键**：实例 `b` 的键是 `<产品>@b`，如 `sight-report@b`；基础实例（老的那套）键不变。`service` / `logs` / `follow_logs` / `list_backups` / `rollback` 的 `product` 直接传实例键。
+- **实例名**：`^[a-z0-9][a-z0-9-]{0,15}$`。实例 `b` 的默认安装目录 `<dir>-b`、系统服务 `<service>-b`，新装时默认端口 = 基础端口 + 1（端口被占会照常询问）。
+- **探测**：`status` 列出 `/etc/systemd/system/<service>-*.service` 找到的实例（以及 `hosts.json` 里登记过的），结果的 `products` 里实例项紧跟在基础产品后面，另带 `base`（基础产品键）、`instance`（实例名）。安装目录下的 `.sight-instance` 记着实例名，定位已有安装时核对它，不会把实例 b 的目录当成基础实例。
+- **安装包要求**：需要 2.0.117 起的完整安装包（`.zip`，带 `bin/sight-common.sh`，`install.sh --instance`）；旧包传 `instance` 直接失败：「同机多实例需要 2.0.117 及以上版本的完整安装包（.zip）」。
+- 安装时助手在安装目录写 `.sight-instance`，并给 `install.sh` 加 `--instance <名字>`。
+
 ### Sight 移动网关
 
 非 Java 产品，`deploy` / `service` / `logs` / `follow_logs` / `list_backups` / `rollback` / `status` 都按 `product: "sight-mobile-gateway"` 走同一批接口，差别：
@@ -220,7 +231,7 @@ Sight DataLink 的数据库描述来自 `data/datalink.properties` 的 `DB_URL`�
 2. **服务器详情**（右侧）：顶部名字/地址 +「刷新」「修改密码」「删除」；每个产品一张卡（SightReport、SightWall、Sight DataLink，按 `/api/state` 的 `products`）：
    - 未安装：灰卡 +「安装」按钮。
    - 已安装：状态徽标（运行中 / 启动中或无响应 / 未运行）、版本、访问地址（可点击，新窗口打开）、目录、端口、服务方式、Java、数据库、健康（未初始化时提示去 `setup_url` 或 `/setup`；`mode=setup` 徽标「安装向导」并提示需要初始化令牌；`mode=waiting` 徽标「等待数据库」并说明服务在自动重试；`admin_initialized=false` 提示去「初始化管理员」）、备份数、磁盘剩余。
-     按钮：「升级」「重启」「停止 / 启动」「日志」「回滚」。
+     按钮：「升级」「重启」「停止 / 启动」「日志」「回滚」；`instances=true` 的产品另有「再装一个实例」（先问实例名，默认第一个没用过的字母 b、c…，校验格式与重名，再走「安装 / 升级」流程，`deploy` 带 `instance`）。同机多实例各一张卡，标题「SightReport（实例 b）」，按 `status` 结果的顺序排在基础产品后面。
 3. **安装 / 升级**：打开「选择安装包」对话框（顶部是「官网最新版」条目——选中后点「下一步」才跑 `download_package`，下完再进第 2 步；本机已有同版本时不再显示官网条目；下面是自动发现列表，按时间倒序，显示产品+版本+大小+目录；「浏览…」文件浏览器；拖入区域，拖进来先上传再选中）；
    然后「选择服务器」（默认当前服务器，可多选做滚动升级，说明“多台会依次处理，某台失败会询问是否继续”；`rolling_upgrade=false` 的产品多选时显示集群升级顺序的提醒）→ 开始 `deploy` 任务。
    从产品卡点「安装/升级」时，安装包列表优先显示该产品的包。

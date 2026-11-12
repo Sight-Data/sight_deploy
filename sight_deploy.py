@@ -102,6 +102,7 @@ def _sight_product(key, name, port, start_class, site_id):
         "owned_dirs": None,                 # 交给运行账号的内容：None = 整个安装目录；否则只给这几个子目录，程序文件归 root
         "site_id": site_id,                 # 官网下载中心条目 id
         "rolling_upgrade": True,            # 多台服务器可以依次滚动升级
+        "instances": True,                  # 支持同机多实例（产品包 2.0.117 起的 install.sh --instance）
         "schema_versioned": False,          # 健康检查报告 schemaVersion，升级 / 回滚时核对
         "waiting_mode": False,              # 健康检查有 mode=waiting（服务已启动但连不上元数据库，自动重试）
         "db_backup_hint": "升级前请先备份数据库，或在 SightReport / SightWall 管理台「系统管理 › 备份」创建一次完整备份。",
@@ -136,6 +137,7 @@ PRODUCTS = {
         "owned_dirs": ("data", "logs"),
         "site_id": "dl-datalink",
         "rolling_upgrade": False,           # 多台共用一个外部库（集群）时不能自动滚动升级
+        "instances": False,
         "schema_versioned": True,           # Flyway：外部库的表结构升级不可逆
         "waiting_mode": True,               # 连不上元数据库时 mode=waiting：安装时照常提示，升级时持续一段时间算失败
         "db_backup_hint": "Sight DataLink 用 Flyway 升级元数据库结构，外部库升级后不能只靠回滚程序恢复。",
@@ -166,7 +168,7 @@ PRODUCTS[GATEWAY] = {
     "health": "/healthz",                   # 隧道端口上的 GET /healthz（无需鉴权），返回 {"agents":n}
     "setup_path": None, "setup_token": False, "setup_hint": "", "db_none_desc": "", "db_reader": None,
     "version_api": None, "needs_fonts": False, "owned_dirs": None, "waiting_mode": False,
-    "rolling_upgrade": True, "schema_versioned": False,
+    "rolling_upgrade": True, "schema_versioned": False, "instances": False,
     "log_files": ("logs/gateway.log",), "follow_log": "logs/gateway.log", "follow_journal": True,
     "site_id": None,                        # 官网按架构分三个下载项，见 GATEWAY_ARCHES[...]["site_id"]
     # 下面几项是 Java 产品才用的，留空值只为让通用代码按字段读取时不出错
@@ -177,6 +179,69 @@ PRODUCTS[GATEWAY] = {
 
 def is_gateway(product):
     return (PRODUCTS.get(product) or {}).get("kind") == "gateway"
+
+
+# ---- 同机多实例（SightReport / SightWall，产品包 2.0.117 起的 install.sh 支持 --instance）
+# 产品键可以带实例名：「sight-report@b」= 同一台机器上的另一套 SightReport，服务名 sight-report-b、默认目录
+# /opt/sight-report-b，实例名记在安装目录的 .sight-instance。查这种键时 PRODUCTS 返回一份派生的产品描述，
+# 其余流程（探测、安装、升级、备份、日志……）照常按产品描述走。见 sight-data 仓库 docs/集群部署与集群入口-设计.md §3.2。
+INSTANCE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,15}$")
+INSTANCE_FILE = ".sight-instance"
+
+
+def split_instance(key):
+    """「sight-report@b」→ ("sight-report", "b")；不带实例名 → (key, "")。"""
+    base, _, inst = (key or "").partition("@")
+    return base, inst
+
+
+def instance_key(base, inst):
+    return "%s@%s" % (base, inst) if inst else base
+
+
+def supports_instances(product):
+    base, _ = split_instance(product)
+    P = dict.get(PRODUCTS, base)
+    return bool(P) and bool(P.get("instances"))
+
+
+class _ProductTable(dict):
+    """产品描述表：基础产品照常存；带实例名的键按需派生（不存进表里，遍历 PRODUCTS 时只看到基础产品）。"""
+
+    def _derive(self, key):
+        base, inst = split_instance(key)
+        if not inst or not INSTANCE_RE.match(inst):
+            raise KeyError(key)
+        P = dict.get(self, base)
+        if not P or not P.get("instances"):
+            raise KeyError(key)
+        d = dict(P)
+        d.update({"base": base, "instance": inst, "service": "%s-%s" % (P["service"], inst),
+                  "dir": "%s-%s" % (P["dir"], inst), "name": "%s（实例 %s）" % (P["name"], inst)})
+        return d
+
+    def __getitem__(self, key):
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        return self._derive(key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, key):
+        if dict.__contains__(self, key):
+            return True
+        try:
+            self._derive(key)
+            return True
+        except KeyError:
+            return False
+
+
+PRODUCTS = _ProductTable(PRODUCTS)
 
 
 def svc_of(product):
@@ -711,6 +776,8 @@ class Package:
         self.files = []  # [(相对路径, 本地路径, 大小, sha256)]
         self.full = False
         self.arch = None  # 只有移动网关的包有：amd64 / arm64 / loong64
+        self.supports_instances = False  # 启停脚本是否支持同机多实例（包里有 sight-common.sh）
+        self.release = {}  # 包根目录 release.json：{"product", "version", "rollingFrom"}
         try:
             self._load()
         except BaseException:  # 包括用户点「停止」：解压出来的临时文件（几百 MB）要清掉
@@ -754,6 +821,14 @@ class Package:
                     members.append((rel, dest))
             jar_local = self.tmp / Path(jar_name).name
             self.full = any(r == "install.sh" for r, _ in members)
+            # 2.0.117 起：启停脚本支持同机多实例（install.sh --instance），并带发行信息 release.json
+            self.supports_instances = any(r == "sight-common.sh" for r, _ in members)
+            rel = next((loc for r, loc in members if r == "release.json"), None)
+            if rel:
+                try:
+                    self.release = json.loads(Path(rel).read_text(encoding="utf-8"))
+                except Exception:
+                    self.release = {}
         else:
             raise DeployError("不支持的安装包格式：%s（需要 .zip 或 .jar）" % p.name)
 
@@ -818,6 +893,25 @@ class Package:
     @property
     def name(self):
         return PRODUCTS[self.product]["name"]
+
+    @property
+    def rolling_from(self):
+        """本版本可以与哪个版本及以上的节点混跑（滚动升级）；包里没声明为 None。"""
+        v = (self.release or {}).get("rollingFrom")
+        return v if isinstance(v, str) and v.strip() else None
+
+    def use_instance(self, inst):
+        """把这个包用于某个实例（同机多实例）：之后按「产品@实例」的产品描述安装 / 升级。"""
+        if not inst:
+            return
+        if not INSTANCE_RE.match(inst):
+            raise DeployError("实例名「%s」不合法：小写字母数字与 -，以字母数字开头，不超过 16 个字符" % inst)
+        if not supports_instances(self.product):
+            raise DeployError("%s 不支持同机多实例" % self.name)
+        if not self.supports_instances:
+            raise DeployError("这个版本（%s）的安装包还不支持同机多实例" % self.version,
+                              "同机多实例需要 2.0.117 及以上版本的完整安装包（.zip）")
+        self.product = instance_key(split_instance(self.product)[0], inst)
 
     @property
     def jar_sha(self):
@@ -1622,17 +1716,32 @@ true
 
 DETECT_SH = r'''
 SVC=__SVC__; JAR=__JAR__
+# 每个候选都带上目录里 .sight-instance 的实例名（同机多实例：进程扫描会扫到别的实例，按实例名过滤）
+inst(){ [ -f "$1/.sight-instance" ] && head -1 "$1/.sight-instance" | tr -d '[:space:]'; }
 u="/etc/systemd/system/$SVC.service"
-if [ -f "$u" ]; then w=$(sed -n 's/^WorkingDirectory=//p' "$u" | head -1); [ -n "$w" ] && echo "cand=$w|unit"; fi
+if [ -f "$u" ]; then w=$(sed -n 's/^WorkingDirectory=//p' "$u" | head -1); [ -n "$w" ] && echo "cand=$w|unit|$(inst "$w")"; fi
 for p in $(pgrep -f -- "$JAR" 2>/dev/null); do
   e=$(readlink "/proc/$p/exe" 2>/dev/null); case "$e" in */java) ;; *) continue;; esac
   c=$(readlink "/proc/$p/cwd" 2>/dev/null)
   a=$(tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null | grep -m1 -- "$JAR")
-  case "$a" in /*) echo "cand=$(dirname "$a")|proc";; *) [ -n "$c" ] && echo "cand=$c|proc";; esac
+  case "$a" in /*) d=$(dirname "$a");; *) d="$c";; esac
+  [ -n "$d" ] && echo "cand=$d|proc|$(inst "$d")"
 done
 for d in /opt/$SVC /opt/sight/$SVC /opt/sight-data/$SVC /usr/local/$SVC /data/$SVC /data/sight/$SVC /app/$SVC \
          /srv/$SVC /root/$SVC /home/*/$SVC /opt/*/$SVC; do
-  [ -f "$d/$JAR" ] && echo "cand=$d|dir"
+  [ -f "$d/$JAR" ] && echo "cand=$d|dir|$(inst "$d")"
+done
+true
+'''
+
+# 同机多实例：列出本机已注册的实例服务（<服务>-<实例>.service），以及它们目录里登记的实例名
+INSTANCES_SH = r'''
+SVC=__SVC__; JAR=__JAR__
+for u in /etc/systemd/system/$SVC-*.service; do
+  [ -f "$u" ] || continue
+  w=$(sed -n 's/^WorkingDirectory=//p' "$u" | head -1)
+  [ -n "$w" ] && [ -f "$w/$JAR" ] && [ -f "$w/.sight-instance" ] || continue
+  echo "instance=$(head -1 "$w/.sight-instance" | tr -d '[:space:]')|$w"
 done
 true
 '''
@@ -1713,14 +1822,40 @@ def probe_env(r, product, install_dir, port):
 
 def find_installs(r, product):
     p = PRODUCTS[product]
+    want = p.get("instance") or ""
     code, o, _ = r.run(render(DETECT_SH, svc=p["service"], jar=p["jar"]), sudo=True, timeout=60)
+    return parse_install_candidates(o, want)
+
+
+def parse_install_candidates(output, want_instance):
+    """DETECT_SH 的输出 → [(目录, 来源)]，只留实例名与 want_instance 相同的（基础产品要求目录里没有实例名）。"""
     cands = []
-    for item in as_list(parse_kv(o).get("cand")):
-        d, _, src = item.partition("|")
-        d = d.rstrip("/")
-        if d and d not in [c[0] for c in cands]:
+    for item in as_list(parse_kv(output).get("cand")):
+        parts = item.split("|")
+        d = parts[0].rstrip("/")
+        src = parts[1] if len(parts) > 1 else ""
+        inst = parts[2] if len(parts) > 2 else ""
+        if d and inst == want_instance and d not in [c[0] for c in cands]:
             cands.append((d, src))
     return cands
+
+
+def list_instances(r, product):
+    """本机已注册的同机多实例 → {实例名: 目录}（基础产品键；移动网关没有实例）。"""
+    if not supports_instances(product):
+        return {}
+    p = PRODUCTS[product]
+    code, o, _ = r.run(render(INSTANCES_SH, svc=p["service"], jar=p["jar"]), sudo=True, timeout=60)
+    return parse_instances(o)
+
+
+def parse_instances(output):
+    out_ = {}
+    for item in as_list(parse_kv(output).get("instance")):
+        inst, _, d = item.partition("|")
+        if INSTANCE_RE.match(inst or "") and d:
+            out_.setdefault(inst, d.rstrip("/"))
+    return out_
 
 
 def inspect_install(r, product, install_dir):
@@ -2316,7 +2451,7 @@ def _print_task_line(line):
 def staging_dir(r, product, inst_dir):
     if r.is_root:
         return posix_join(inst_dir, ".sight-staging")
-    return posix_join(r.home(), ".sight-staging", product)
+    return posix_join(r.home(), ".sight-staging", PRODUCTS[product]["service"])
 
 
 def upload_package(r, pkg, staging):
@@ -2539,9 +2674,11 @@ def do_install(ctx, r, pkg):
         if v["xmx"] and not re.match(r"^\d+[gGmM]$", v["xmx"]):
             return "最大堆内存格式如 4g、8g、8192m，或留空"
         return None
+    # 同机多实例：默认端口顺延（端口被占时下面还会再问）
+    default_port = P["port"] + 1 if P.get("instance") else P["port"]
     vals = ask_form("安装 %s %s 到 %s" % (pkg.name, pkg.version, r.label()), [
         {"key": "dir", "label": "安装目录", "default": P["dir"]},
-        {"key": "port", "label": "服务端口", "default": str(P["port"]), "type": "number"},
+        {"key": "port", "label": "服务端口", "default": str(default_port), "type": "number"},
         {"key": "xmx", "label": "最大堆内存", "default": "", "placeholder": "留空 = 按服务器内存自适应",
          "help": "如 4g、8g。留空时程序按服务器可用内存的 75% 自动设置"},
     ], validate)
@@ -2556,8 +2693,8 @@ def do_install(ctx, r, pkg):
 
     if env.get("unit") == "1" and env.get("unit_dir", "").rstrip("/") not in ("", inst_dir):
         raise DeployError("这台服务器已有 %s 系统服务，指向 %s" % (P["service"], env["unit_dir"]),
-                          "同一台服务器每个产品只能注册一个系统服务。要升级它请直接用「升级」；"
-                          "确实要另装一套，请先在原目录执行 sudo ./uninstall.sh")
+                          "要升级它请直接用「升级」；要在同一台服务器上再装一套，用产品卡上的「再装一个实例」"
+                          "（同机多实例）；确实要换目录重装，请先在原目录执行 sudo ./uninstall.sh")
     blocking = env_report(env, inst_dir, port, pkg)
     if blocking:
         raise DeployError("环境不满足：" + "；".join(blocking))
@@ -2597,6 +2734,9 @@ def do_install(ctx, r, pkg):
     s += "mkdir -p %s\n" % shlex.quote(inst_dir)
     s += "{ " + copy_files_script(pkg, staging, inst_dir, owner) + "; } || { echo '复制程序文件失败' >&2; exit 1; }\n"
     s += heredoc(posix_join(inst_dir, MARKER), marker)
+    if P.get("instance"):
+        # 实例名先写好：后台进程方式不经过 install.sh，启停脚本靠它认出自己是哪个实例
+        s += "printf '%%s\\n' %s > %s\n" % (shlex.quote(P["instance"]), shlex.quote(posix_join(inst_dir, INSTANCE_FILE)))
     s += "mkdir -p %s/logs %s/data\n" % (shlex.quote(inst_dir), shlex.quote(inst_dir))
     s += "chmod 600 %s\n" % shlex.quote(posix_join(inst_dir, MARKER))
     if owner != "root":
@@ -2612,8 +2752,10 @@ def do_install(ctx, r, pkg):
         else:
             s += "rm -f %s\n" % posix_join(dropin_dir, DROPIN_NAME)
         jvm_env = ("JVM_XMX=%s " % shlex.quote(xmx)) if xmx else ""
-        s += "cd %s && env PATH=%s:\"$PATH\" %sbash ./install.sh install prod\n" % (
-            shlex.quote(inst_dir), shlex.quote(java_home + "/bin"), jvm_env)
+        # 同机多实例：install.sh --instance 记下实例名（.sight-instance），注册 <服务>-<实例>.service
+        inst_arg = (" --instance " + shlex.quote(P["instance"])) if P.get("instance") else ""
+        s += "cd %s && env PATH=%s:\"$PATH\" %sbash ./install.sh install prod%s\n" % (
+            shlex.quote(inst_dir), shlex.quote(java_home + "/bin"), jvm_env, inst_arg)
         r.run(s, sudo=True, check=True, what="安装", timeout=300, on_line=logline)
     else:
         start_env = dict(env_vars)
@@ -2783,7 +2925,8 @@ def backup_dir_for(ctx, r, product, inst_dir):
 
 def default_backup_dir(inst_dir, product):
     parent = posixdir(inst_dir.rstrip("/")) or "/"
-    return posix_join(parent if parent else "/", "sight-backups", product)
+    # 按服务名分目录：基础产品的服务名就是产品键（与老版本一致）；实例是 sight-report-b
+    return posix_join(parent if parent else "/", "sight-backups", PRODUCTS[product]["service"])
 
 
 def do_upgrade(ctx, r, pkg, inst):
@@ -3342,8 +3485,11 @@ def locate_install(ctx, r, product, quiet=False, ask_user=True):
     saved = (ctx.host_product(r, product) or {}).get("install_dir")
     cands = find_installs(r, product)
     if saved:
-        code, o, _ = r.run("[ -f %s ] && echo yes" % shlex.quote(posix_join(saved, P["jar"])), sudo=True)
-        if "yes" in o and saved not in [c[0] for c in cands]:
+        # 记录的目录还在、且实例名对得上（基础产品要求目录里没有 .sight-instance）
+        code, o, _ = r.run("[ -f %s ] && echo \"yes=$(head -1 %s 2>/dev/null | tr -d '[:space:]')\"" % (
+            shlex.quote(posix_join(saved, P["jar"])), shlex.quote(posix_join(saved, INSTANCE_FILE))), sudo=True)
+        same_instance = parse_kv(o).get("yes", None) == (P.get("instance") or "")
+        if "yes=" in o and same_instance and saved not in [c[0] for c in cands]:
             cands.append((saved, "saved"))  # 系统服务 / 运行中的优先
     if not cands:
         return None
@@ -4870,6 +5016,23 @@ def _get_install(ctx, r, product):
     return inst
 
 
+def status_product_keys(ctx, r):
+    """状态页要查的产品：所有基础产品，加上本机已注册的实例、以及助手里记过的实例（如后台进程方式运行的）。
+    实例紧跟在它的基础产品后面。"""
+    saved = set(((ctx.store.get(r.alias) or {}).get("products") or {}).keys()) if r.alias else set()
+    keys = []
+    for base, P in PRODUCTS.items():
+        keys.append((base, P))
+        if not supports_instances(base):
+            continue
+        found = set(list_instances(r, base))
+        found |= {split_instance(k)[1] for k in saved if split_instance(k)[0] == base and split_instance(k)[1]}
+        for inst in sorted(i for i in found if INSTANCE_RE.match(i)):
+            key = instance_key(base, inst)
+            keys.append((key, PRODUCTS[key]))
+    return keys
+
+
 def job_status(ctx, p):
     r = open_host(ctx.store, p.get("host"))
     try:
@@ -4878,7 +5041,7 @@ def job_status(ctx, p):
         res = {"host": r.alias, "address": "%s@%s" % (r.user, r.host),
                "os": " / ".join(x for x in o.strip().splitlines() if x), "products": [],
                "arch": gateway_arch_of(first.split()[-1] if first.split() else "")}  # 移动网关选安装包用：amd64 / arm64 / loong64
-        for prod, P in PRODUCTS.items():
+        for prod, P in status_product_keys(ctx, r):
             inst = locate_install(ctx, r, prod, quiet=True, ask_user=False)
             if not inst:
                 res["products"].append({"product": prod, "name": P["name"], "installed": False})
@@ -4908,6 +5071,8 @@ def job_status(ctx, p):
                     "last_backup": "%s（%s）" % (bs[0]["time"], bs[0]["version"]) if bs else ""}
             if h and h.get("mode") == "CLUSTER":
                 item["cluster_nodes"] = h.get("activeNodes")
+            if P.get("instance"):
+                item["base"], item["instance"] = P["base"], P["instance"]  # 同机多实例
             if h and h.get("mode") in ("setup", "waiting", "normal"):
                 item["mode"] = h["mode"]  # Sight DataLink：setup = 安装向导，waiting = 等元数据库
             if h and "adminInitialized" in h:
@@ -4934,9 +5099,11 @@ def job_deploy(ctx, p):
     want = p.get("product")  # 用户点的是哪个产品的「升级」；从「安装 / 升级」总入口进来时为空
     results = []
     try:
-        if want in PRODUCTS and pkg.product != want:
+        if want in PRODUCTS and pkg.product != split_instance(want)[0]:
             raise DeployError("选错了安装包：这是 %s 的包，但你要升级的是 %s（没有对服务器做任何改动）" % (
                 pkg.name, PRODUCTS[want]["name"]), "请重新选择 %s 的安装包" % PRODUCTS[want]["name"])
+        # 同机多实例：从实例卡点进来（product 带 @实例），或「再装一个实例」（instance 参数）
+        pkg.use_instance(p.get("instance") or (split_instance(want)[1] if want in PRODUCTS else ""))
         if len(hosts) > 1 and not PRODUCTS[pkg.product]["rolling_upgrade"]:
             step("多台服务器：%s 不做自动滚动升级" % pkg.name)
             warn("如果这几台是 %s 集群（共用一个外部元数据库），不能边运行边逐台升级" % pkg.name)
@@ -4966,7 +5133,7 @@ def job_deploy(ctx, p):
                 for k in ("mode", "setup_token", "token_hint", "gateway"):  # Sight DataLink 安装向导：模式与初始化令牌；移动网关：接入信息
                     if (res or {}).get(k):
                         item[k] = res[k]
-                if res and pkg.product == "sight-report":
+                if res and split_instance(pkg.product)[0] == "sight-report":
                     # 升级 / 安装 SightReport 之后：助手里登记的移动网关版本与它不一致，就提醒同步升级
                     notices = gateway_sync_notices(ctx.store.snapshot().get("hosts"), pkg.version)
                     for n in notices:
@@ -5395,7 +5562,8 @@ def api_state():
             "products": {k: {"name": v["name"], "port": v["port"], "dir": v["dir"], "zip_prefix": v["zip_prefix"],
                              "setup_path": v["setup_path"], "setup_token": v["setup_token"],
                              "rolling_upgrade": v["rolling_upgrade"], "schema_versioned": v["schema_versioned"],
-                             "kind": v.get("kind", "java"), "tunnel_port": v.get("tunnel_port")}
+                             "kind": v.get("kind", "java"), "tunnel_port": v.get("tunnel_port"),
+                             "instances": bool(v.get("instances")), "service": v.get("service")}
                          for k, v in PRODUCTS.items()},
             "log_path": str(LOG.path or "")}
 
