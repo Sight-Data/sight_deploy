@@ -1200,6 +1200,7 @@ function bannerText(j) {
     case 'cluster_expand': return '扩容完成：新实例已入群' + (r.identity ? '，请重签授权' : '');
     case 'cluster_entry': return '入口已生效';
     case 'cluster_redis_check': return '所有节点服务器都能连上 Redis';
+    case 'cluster_shared_dir': return (r.migrated && r.migrated.length ? r.migrated.length + ' 个实例已改用共享目录 ' : '共享目录已是 ') + (r.shared_dir || '') + (r.conflicts && r.conflicts.length ? '（' + r.conflicts.length + ' 个同名文件冲突，见上面的清单）' : '');
     case 'cluster_redis_install': return r.installed ? '本机 Redis 已装好，请保存密码' : '本机 Redis 可用';
     case 'rollback': return '回滚已完成';
     case 'service': return '操作已完成';
@@ -1629,6 +1630,7 @@ function renderCluster(name) {
     '<button class="btn" type="button" data-job="1" data-act="clentry">配置入口</button>' +
     '<button class="btn" type="button" data-job="1" data-act="clexpand">' + ico('plus') + '扩容</button>' +
     '<button class="btn" type="button" data-job="1" data-act="clredis">检查 Redis</button>' +
+    '<button class="btn" type="button" data-job="1" data-act="clshared">共享目录</button>' +
     '<button class="btn text-danger" type="button" data-act="cldel">删除</button></div></div>' +
     '<div class="main-act"><button class="btn primary lg" type="button" data-job="1" data-act="clupgrade">' + ico('upload') + '集群升级</button>' +
     '<div class="hint">能滚动就逐个升级（不停服），否则整体停机升级</div></div></div>';
@@ -1656,6 +1658,12 @@ function renderCluster(name) {
   if (!rd.host) note('warn', 'bang', '还没有记录 Redis 地址。集群的会话、选主、分布式锁、跨节点广播都靠 Redis（有了 nginx 也不能去掉）：点「检查 Redis」填地址并检查各服务器能否连上' +
     '；也可以让部署助手' + '<a href="#" data-act="clredisinst">' + (oneHost ? '装一个本机 Redis' : '选一台服务器装 Redis（Valkey）') + '</a>。');
   else note('info', 'help', 'Redis：<span class="mono">' + esc(rd.host + ':' + (rd.port || 6379)) + '</span>（会话与协调中心，它停了所有实例一起受影响）。<a href="#" data-act="clredis">重新检查</a>');
+  if (!c.shared_dir) note('warn', 'bang', '还没有设置<b>共享目录</b>：每个实例各用自己安装目录下的 data/，在一个实例上传的字体、驱动、地图、备份，另一个实例上没有。<a href="#" data-act="clshared">设置共享目录</a>（同一台服务器用本机目录即可，多台服务器要挂载同一个 NFS）。');
+  else if (st) {
+    var offSd = st.instances.filter(function (x) { return !x.error && (x.shared_dir || '') !== c.shared_dir; });
+    if (offSd.length) note('warn', 'bang', offSd.map(function (x) { return esc(x.host) + (String(x.product).split('@')[1] ? ' 实例 ' + esc(String(x.product).split('@')[1]) : ''); }).join('、') +
+      ' 没有用集群的共享目录 <span class="mono">' + esc(c.shared_dir) + '</span>（' + offSd.map(function (x) { return x.shared_dir ? esc(x.shared_dir) : '未设置'; }).join('、') + '）。<a href="#" data-act="clshared">重新设置共享目录</a>会把它们一起改过来。');
+  }
   if (!e.host) note('info', 'help', '还没有设置入口：点「编辑」选一台服务器做入口（装 nginx），再点「配置入口」。入口放在某个实例所在的服务器上时，那台宕机 = 整体不可用。');
   var ent = '';
   if (e.host) {
@@ -1745,7 +1753,7 @@ function openClusterEdit(name, preset) {
     h('div', { style: 'display:grid;grid-template-columns:120px 1fr;gap:12px' }, [row('入口端口', portI), row('域名（server_name）', snI)]),
     row('对外地址', puI, '用户访问的地址（有外层负载均衡 / HTTPS 时填）；同时请在管理台「集群」里填同一个地址'),
     row('Redis 地址', rdI, '集群的会话、选主、分布式锁、跨节点广播都靠 Redis（nginx 只分流量，替代不了）。填各节点服务器能访问到的地址；只用于「检查 Redis」与扩容前的检查，密码不保存。'),
-    row('共享目录', sdI, '扩容时写进新实例的 MR_SHARED_DIR'), row('移动网关服务器', gwS, '集群升级后只提醒这一台的移动网关同步升级'), err
+    row('共享目录', sdI, '只改记录；要让已有实例改用它（并迁移文件），请用集群页的「共享目录」按钮'), row('移动网关服务器', gwS, '集群升级后只提醒这一台的移动网关同步升级'), err
   ]);
   openModal({
     title: name ? '编辑集群 ' + name : '新建集群', cls: 'w760', body: body, dismiss: true, enter: 'save',
@@ -1826,6 +1834,27 @@ function clusterExpandFlow(name) {
         startJob('cluster_expand', { cluster: name, host: host, instance: v || undefined, package: pkg.path }, { title: '扩容 · ' + name + ' → ' + host + (v ? ' 实例 ' + v : ''), failTitle: '扩容没有完成',
           onClose: function () { delete S.clStatus[name]; refreshState().then(function () { renderSide(); loadClusterStatus(name); }); }, noRefresh: true });
       });
+    } }]
+  });
+}
+function clusterSharedFlow(name) {
+  var c = clusters()[name] || {}, hs = {}; (c.instances || []).forEach(function (m) { hs[m.host] = 1; });
+  var multi = Object.keys(hs).length > 1;
+  var inp = h('input', { type: 'text', class: 'inp mono', value: c.shared_dir || (multi ? '/mnt/sight-shared/' + name : '/opt/sight-shared/' + name) });
+  var err = h('div', { class: 'note bad', style: 'margin:10px 0 0;display:none' });
+  var body = h('div', null, [
+    h('div', { class: 'note info', style: 'margin:0 0 14px', html: ico('help') + '<div>集群里每个实例都要看到同一份字体、驱动、地图、移动端素材、AI 文档和备份。设置后，部署助手<b>逐个实例</b>：' + (c.entry && c.entry.host ? '从入口摘下 → ' : '') + '停止 → 把它原来的这些目录合并进共享目录 → 写入 <span class="mono">MR_SHARED_DIR</span> → 启动并等就绪' + (c.entry && c.entry.host ? ' → 放回入口' : '') + '。<br>' +
+      (multi ? '多台服务器：请先把<b>同一个 NFS 目录</b>挂载到每台服务器的同一路径（建议 hard 挂载），部署助手会先确认各台看到的是同一个目录。' : '实例都在同一台服务器上：填一个本机目录即可。') + '<br>同名文件内容不同时保留修改时间较新的那份并列出清单；原目录不删除。插件不放共享目录。</div>' }),
+    h('div', { style: 'font-weight:600;margin-bottom:6px' }, ['共享目录（服务器上的绝对路径）']), inp, err
+  ]);
+  openModal({
+    title: '共享目录 · ' + name, cls: 'w600', body: body, dismiss: true, enter: 'ok',
+    actions: [{ label: '取消', onClick: function (M) { M.close(); } }, { label: '开始', key: 'ok', kind: 'primary', onClick: function (M) {
+      var v = inp.value.trim().replace(/\/+$/, '');
+      if (!/^\/[A-Za-z0-9._\/-]+$/.test(v)) { err.textContent = '请填服务器上的绝对路径（字母、数字、. _ - /）'; err.style.display = ''; return; }
+      M.close();
+      startJob('cluster_shared_dir', { cluster: name, shared_dir: v }, { title: '共享目录 · ' + name, failTitle: '共享目录没有设置好', noRefresh: true,
+        onClose: function () { delete S.clStatus[name]; refreshState().then(function () { renderSide(); loadClusterStatus(name); }); } });
     } }]
   });
 }
@@ -2190,6 +2219,7 @@ document.addEventListener('click', function (e) {
         if (y) startJob('cluster_redis_install', { cluster: n }, { title: '安装 Redis · ' + n, failTitle: 'Redis 没有装好', noRefresh: true,
           onClose: function () { refreshState().then(function () { renderSide(); renderMain(); }); } }); }); })(S.cl); break;
     case 'clupgrade': clusterUpgradeFlow(S.cl); break;
+    case 'clshared': clusterSharedFlow(S.cl); break;
     case 'clup': clusterEntryJob(S.cl, { up: [t.getAttribute('data-m')] }, '放回入口 · ' + S.cl); break;
     case 'cldown': uiConfirm({ title: '从入口摘下这个实例？', yes: '摘下', lines: ['入口不再把新请求分给它（实例本身照常运行）。维护完成后点「放回入口」。'] }).then(function (y) { if (y) clusterEntryJob(S.cl, { down: [t.getAttribute('data-m')] }, '摘下实例 · ' + S.cl); }); break;
     case 'svc': serviceAction(S.sel, p, t.getAttribute('data-a')); break;

@@ -241,6 +241,10 @@ Sight DataLink 的数据库描述来自 `data/datalink.properties` 的 `DB_URL`�
 | `cluster_expand` | `cluster, host, instance?, package` | 从集群里第一个没摘下的实例读数据库连接与加密配置（`secret_out`，不进日志）；来源不是集群模式 / 包版本不同会 `confirm`；照常 `do_install`（会问目录、端口），在 `install.sh` 之前把机密经 stdin 写进新实例的 `sight.env` 与 `data/work/database.config`（600）；等就绪 → 拷插件（有的话，重启一次）→ 新机器跑 `install.sh identity` → 记进集群 → 挂进入口。返回 `{"host", "product", "url", "identity"}` |
 | `cluster_upgrade` | `cluster, package` | 预检读各实例版本（有实例比包新 → 失败，不做降级；都已是这个版本 → 直接成功）。`rolling_decision(rollingFrom, 各实例版本)`；滚动且没有入口时 `confirm`；集群层面一次 `confirm`（已备份数据库），之后各实例的升级不再逐台问。滚动：每个实例 `down` → 重载 → `do_upgrade` → 等 `/api/health/ready` 200 且版本对上 → 放回 → 重载；失败停在该实例、不放回，错误里列出已升级的实例。整体停机：全停 → 逐个升级 → 原本已是新版本的实例重新启动。返回 `{"upgraded": [...], "rolling": true/false/null}`；集群登记了移动网关时只提醒那一台同步升级 |
 
+| `cluster_shared_dir` | `cluster, shared_dir` | 设置 / 更换集群共享目录（`MR_SHARED_DIR`，sight-data 设计文档 §5.5「迁移」）。先逐个实例读当前值与要合并的文件数（实例的 start.sh 读不到 `sight.env`——2.0.117 以前的包——直接失败）；多台服务器时在第一台写探测文件、其余各台读回，不一致就失败（要挂同一个 NFS）；`confirm` 一次。之后逐个实例：有入口且还有别的实例在服务 → 摘下 → 停止 → 把它原来的目录（`data/fonts` 等，见 `SHARED_SUBDIRS`；已在用别的共享目录时从那里）合并进新目录（`cp -a -u`：新的为准；同名不同内容列为冲突；原目录不删；`temp/export` 不迁移）→ 交给运行账号并验证它能写 → `MR_SHARED_DIR` 写进 `sight.env`（600）→ 启动 → 等就绪 → 放回。合并失败时按原配置重新启动、不改 `sight.env`；某个实例没就绪就停在那里、不放回。全部完成后记进集群记录。返回 `{"shared_dir", "migrated": [实例], "conflicts": ["服务器 产品：名字/路径"]}` |
+
+`cluster_status` 的每个实例另有 `shared_dir`（它 `sight.env` / 单元里的 `MR_SHARED_DIR`，没设为 null）；集群页据此提示「某实例没用集群的共享目录」。`cluster_expand`：集群记录有共享目录就写给新实例；没有时沿用来源实例的值；都没有时 `warn` 并 `confirm`（建议先设置）。同机多实例安装时，这台服务器上已有 Sight 实例在跑且没填最大堆：`warn` 内存会超订，并 `confirm` 用建议值（可用内存的 75% ÷ 实例数）。
+
 另外：`deploy` 单独升级一个属于多实例集群的实例时，先 `warn` 再 `confirm`（建议用集群升级）；升级 SightReport 后的移动网关提醒（`gateway_notices`），该实例属于登记了 `gateway` 的集群时只针对那一台。
 
 ### Sight 移动网关

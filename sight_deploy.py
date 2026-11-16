@@ -2720,6 +2720,16 @@ def do_install(ctx, r, pkg, seed=None):
         if env.get("pkg") and confirm("尝试在线安装字体库 fontconfig（服务器需能访问软件源；装不上也不影响启动）？", False):
             install_fonts(r, env["pkg"])
 
+    if not xmx and P.get("instance") and env.get("mem_mb"):
+        # 同机多实例：每个实例不设堆都按「可用内存的 75%」自适应，两个以上加起来就超出物理内存
+        _, o_, _ = r.run("pgrep -f 'java .*sight-[a-z]+\\.jar' | wc -l", timeout=30)
+        others = _int((o_ or "0").strip()) or 0
+        if others >= 1:
+            sug = max(1, int(_int(env["mem_mb"]) * 0.75 / 1024 / (others + 1)))
+            warn("这台服务器上已有 %d 个 Sight 实例在运行：不设最大堆时每个都按可用内存的 75%% 自适应，加起来会超出物理内存（%s MB）"
+                 % (others, env["mem_mb"]))
+            if confirm("给这个实例设固定堆 %dg？（已有实例也建议设：安装目录下 sight.env 加 JVM_XMX=%dg 后重启）" % (sug, sug), True):
+                xmx = "%dg" % sug
     if xmx and env.get("mem_mb") and _mem_of(xmx) > _int(env["mem_mb"]) * 0.9:
         warn("堆内存 %s 接近或超过服务器总内存 %s MB" % (xmx, env["mem_mb"]))
     use_systemd = env.get("systemd") == "1"
@@ -6520,7 +6530,8 @@ def parse_instance_secrets(o):
     env = {k: merged[k] for k in CRYPTO_KEYS + DB_ENV_KEYS if merged.get(k) not in (None, "")}
     opts = " ".join([merged.get("JVM_OPTS", ""), merged.get("JAVA_OPTS", ""), unit])
     return {"env": env, "dbconf": parts.get("dbconf") or None,
-            "jvm_props": bool(re.search(r"-D(sightdata\.|mr\.db\.)", opts))}
+            "jvm_props": bool(re.search(r"-D(sightdata\.|mr\.db\.)", opts)),
+            "shared_dir": (merged.get("MR_SHARED_DIR") or "").strip().rstrip("/") or None}
 
 
 def crypto_fingerprint(env):
@@ -6640,6 +6651,7 @@ def _member_status(ctx, m):
         try:
             sec = read_instance_secrets(r, m["product"], inst["dir"])
             it["crypto_fp"] = crypto_fingerprint(sec["env"])
+            it["shared_dir"] = sec.get("shared_dir")
         except DeployError:
             pass
         ctx.store.set_product(r.alias, m["product"], {"install_dir": inst["dir"], "port": inst["port"],
@@ -6774,6 +6786,13 @@ def job_cluster_expand(ctx, p):
     env = dict(sec["env"])
     if rec.get("shared_dir"):
         env["MR_SHARED_DIR"] = rec["shared_dir"]
+    elif sec.get("shared_dir"):
+        env["MR_SHARED_DIR"] = sec["shared_dir"]
+    else:
+        warn("这个集群还没有设置共享目录：每个实例各用自己安装目录下的 data/（字体、驱动、地图、备份），"
+             "在一个实例上传的文件，另一个实例上没有")
+        if not confirm("建议先在集群页「共享目录」设置好（同一台服务器用本机目录即可，多台服务器用 NFS），再扩容。仍要继续？", False):
+            raise UserAbort()
 
     step("检查新服务器能否连上 Redis")
     tg, rres = redis_preflight(ctx, name, rec, [host])
@@ -6862,6 +6881,257 @@ def copy_plugins(ctx, src, src_dir, r, product, inst):
         warn("插件没有拷贝成功：%s。请手工把来源实例 plugins/ 下的文件拷到 %s/plugins/ 并重启" % (e, inst["dir"]))
     finally:
         shutil.rmtree(tmp_local, ignore_errors=True)
+
+
+# ==================== 共享目录（设计文档 §5.5「迁移」） ====================
+# 产品 SharedPaths.MAPPING 里登记的目录：安装目录下的相对路径 → 共享目录下的名字。
+# temp/export 是导出临时文件（下载完就清理），不迁移。
+SHARED_SUBDIRS = (("data/fonts", "fonts"), ("data/drivers", "drivers"), ("data/geo", "geo"),
+                  ("data/mobile-brand", "mobile-brand"), ("data/mobile-vendor", "mobile-vendor"),
+                  ("data/work/screen-assets", "screen-assets"), ("data/sf-attachments", "sf-attachments"),
+                  ("data/sf-export-zip", "sf-export-zip"), ("data/ai-docs", "ai-docs"), ("data/backups", "backups"))
+
+# 读一个实例「要迁移的东西」：当前 MR_SHARED_DIR（sight.env / 单元环境）、各目录文件数与字节数、能否读 sight.env。
+SHARED_SCAN_SH = r'''
+D=%(dir)s; SVC=%(svc)s
+cur=""
+[ -f "$D/sight.env" ] && cur=$(grep -m1 '^MR_SHARED_DIR=' "$D/sight.env" | cut -d= -f2-)
+if [ -z "$cur" ] && command -v systemctl >/dev/null 2>&1; then
+  cur=$(systemctl show -p Environment "$SVC" 2>/dev/null | tr ' ' '\n' | sed -n 's/^MR_SHARED_DIR=//p' | head -1)
+fi
+cur=${cur%%\"}; cur=${cur#\"}
+printf '@@cur %%s\n' "$cur"
+# 2.0.117 起 start.sh 经 sight-common.sh（安装目录下）自己读 sight.env；更老的只能靠单元里的 EnvironmentFile
+if [ -f "$D/sight-common.sh" ] || [ -f "$D/bin/sight-common.sh" ] || { command -v systemctl >/dev/null 2>&1 && systemctl cat "$SVC" 2>/dev/null | grep -q '^EnvironmentFile=.*sight.env'; }; then
+  echo "@@envok 1"; else echo "@@envok 0"; fi
+src_of(){ if [ -n "$cur" ]; then printf '%%s/%%s' "$cur" "$2"; else printf '%%s/%%s' "$D" "$1"; fi; }
+for p in %(pairs)s; do
+  rel=${p%%%%:*}; name=${p#*:}; s=$(src_of "$rel" "$name")
+  if [ -d "$s" ]; then
+    n=$(find "$s" -type f 2>/dev/null | wc -l | tr -d ' ')
+    b=$(du -sk "$s" 2>/dev/null | cut -f1)
+    printf '@@dir %%s %%s %%s\n' "$name" "${n:-0}" "$(( ${b:-0} * 1024 ))"
+  fi
+done
+'''
+
+# 停服后合并：把实例原来的目录（或原来的共享目录）合并进新的共享目录。同名文件内容不同 → 记为冲突，
+# 保留修改时间较新的那份（cp -u）；原目录不删，留着以防万一。
+SHARED_MERGE_SH = r'''
+D=%(dir)s; S=%(shared)s; OLD=%(old)s; OWNER=%(owner)s
+mkdir -p "$S" || { echo "@@err 不能创建共享目录 $S"; exit 3; }
+for p in %(pairs)s; do
+  rel=${p%%%%:*}; name=${p#*:}
+  if [ -n "$OLD" ]; then src="$OLD/$name"; else src="$D/$rel"; fi
+  dst="$S/$name"
+  [ -d "$src" ] || continue
+  [ "$(cd "$src" && pwd -P)" = "$(mkdir -p "$dst" && cd "$dst" && pwd -P)" ] && continue
+  ( cd "$src" && find . -type f -print0 ) | while IFS= read -r -d '' f; do
+    if [ -f "$dst/$f" ] && ! cmp -s "$src/$f" "$dst/$f"; then printf '@@conflict %%s/%%s\n' "$name" "${f#./}"; fi
+  done
+  cp -a -u "$src/." "$dst/" || { echo "@@err 复制 $src 失败"; exit 4; }
+  printf '@@merged %%s %%s\n' "$name" "$(find "$src" -type f | wc -l | tr -d ' ')"
+done
+if [ "$OWNER" != "root" ]; then chown -R "$OWNER": "$S" 2>/dev/null || echo "@@warn 不能把共享目录交给运行账号 $OWNER（NFS 开了 root_squash 时常见），请在 NFS 服务器上给它写权限"; fi
+probe="$S/.sight-deploy-write-probe"
+if [ "$OWNER" != "root" ] && command -v runuser >/dev/null 2>&1; then runuser -u "$OWNER" -- sh -c ": > '$probe' && rm -f '$probe'" || echo "@@err 运行账号 $OWNER 不能写共享目录 $S"
+else : > "$probe" && rm -f "$probe" || echo "@@err 不能写共享目录 $S"; fi
+'''
+
+
+def _shared_pairs():
+    return " ".join(shlex.quote("%s:%s" % (a, b)) for a, b in SHARED_SUBDIRS)
+
+
+def parse_shared_scan(o):
+    """SHARED_SCAN_SH 的输出 → {"cur": str, "env_ok": bool, "dirs": [(名字, 文件数, 字节数)]}（纯函数）。"""
+    res = {"cur": "", "env_ok": False, "dirs": []}
+    for line in (o or "").splitlines():
+        if line.startswith("@@cur"):
+            res["cur"] = line[5:].strip()
+        elif line.startswith("@@envok"):
+            res["env_ok"] = line.split()[-1] == "1"
+        elif line.startswith("@@dir "):
+            parts = line.split()
+            if len(parts) == 4:
+                res["dirs"].append((parts[1], _int(parts[2]) or 0, _int(parts[3]) or 0))
+    return res
+
+
+def parse_shared_merge(o):
+    """SHARED_MERGE_SH 的输出 → {"merged": [(名字, 文件数)], "conflicts": [...], "warns": [...], "errors": [...]}（纯函数）。"""
+    res = {"merged": [], "conflicts": [], "warns": [], "errors": []}
+    for line in (o or "").splitlines():
+        if line.startswith("@@merged "):
+            parts = line.split()
+            res["merged"].append((parts[1], _int(parts[2]) if len(parts) > 2 else 0))
+        elif line.startswith("@@conflict "):
+            res["conflicts"].append(line[11:])
+        elif line.startswith("@@warn "):
+            res["warns"].append(line[7:])
+        elif line.startswith("@@err "):
+            res["errors"].append(line[6:])
+    return res
+
+
+def validate_shared_dir(sd):
+    sd = (sd or "").strip().rstrip("/")
+    if not sd or not sd.startswith("/"):
+        return None, "共享目录请填服务器上的绝对路径"
+    if not re.match(r"^/[A-Za-z0-9._/-]+$", sd) or "/../" in sd + "/" or "/./" in sd + "/":
+        return None, "共享目录路径只能包含字母、数字、. _ - /"
+    if sd in ("/", "/opt", "/data", "/mnt", "/home", "/var", "/tmp", "/root", "/usr", "/etc"):
+        return None, "不能直接用 %s，请用它下面的一个子目录" % sd
+    return sd, None
+
+
+def _fmt_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return ("%d %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
+        n /= 1024.0
+
+
+def job_cluster_shared_dir(ctx, p):
+    """设置 / 更换集群共享目录（MR_SHARED_DIR）：逐个实例「摘下 → 停 → 把它原来的目录合并进共享目录 → 写 sight.env
+    → 启动 → 等就绪 → 放回」。不整体停服；某个实例失败就停在那里（不放回入口）。见设计文档 §5.5「迁移」。"""
+    name = p.get("cluster")
+    rec = _cluster(ctx, name)
+    sd, err = validate_shared_dir(p.get("shared_dir") or rec.get("shared_dir"))
+    if err:
+        raise DeployError(err)
+    members = rec.get("instances") or []
+    if not members:
+        raise DeployError("集群里还没有实例")
+    hosts = sorted({m["host"] for m in members})
+
+    step("检查各实例")
+    scans = []
+    for m in members:
+        r = open_host(ctx.store, m["host"])
+        try:
+            inst = _get_install(ctx, r, m["product"])
+            svc = PRODUCTS[m["product"]]["service"]
+            code, o, e = r.run(SHARED_SCAN_SH % {"dir": shlex.quote(inst["dir"]), "svc": shlex.quote(svc),
+                                                  "pairs": _shared_pairs()}, sudo=True, timeout=120)
+            sc = parse_shared_scan(o)
+            if not sc["env_ok"]:
+                raise DeployError("%s 上的实例（%s）版本太旧：读不到 sight.env" % (m["host"], inst["dir"]),
+                                  "先把它升级到 2.0.117 及以上，再设置共享目录")
+            scans.append((m, inst, sc))
+            files = sum(d[1] for d in sc["dirs"])
+            size = sum(d[2] for d in sc["dirs"])
+            now = sc["cur"] or "未设置（用安装目录下的 data/）"
+            ok("%s %s：当前 %s；要合并 %d 个文件（%s）" % (m["host"], productName_(m["product"]), now, files, _fmt_size(size)))
+        finally:
+            r.close()
+    todo = [(m, inst, sc) for m, inst, sc in scans if sc["cur"].rstrip("/") != sd]
+    if not todo:
+        ok("所有实例都已经在用 %s" % sd)
+        _set_cluster_shared(ctx, name, sd)
+        return {"shared_dir": sd, "migrated": []}
+
+    if len(hosts) > 1:
+        step("确认各服务器看到的是同一个共享目录（NFS）")
+        token = uuid.uuid4().hex
+        probe = posix_join(sd, ".sight-deploy-probe-" + token[:12])
+        r0 = open_host(ctx.store, hosts[0])
+        try:
+            r0.run("mkdir -p %s && printf %%s %s > %s" % (shlex.quote(sd), token, shlex.quote(probe)), sudo=True,
+                   check=True, what="写入探测文件")
+        finally:
+            r0.close()
+        try:
+            for h in hosts[1:]:
+                rh = open_host(ctx.store, h)
+                try:
+                    code, o, _ = rh.run("cat %s 2>/dev/null" % shlex.quote(probe), sudo=True, timeout=30)
+                finally:
+                    rh.close()
+                if o.strip() != token:
+                    raise DeployError("%s 上的 %s 与 %s 上的不是同一个目录" % (h, sd, hosts[0]),
+                                      "多台服务器的集群要把同一个 NFS 目录挂载到每台服务器的同一路径（建议 hard 挂载）")
+                ok("%s 能看到 %s 写入的探测文件" % (h, hosts[0]))
+        finally:
+            r0 = open_host(ctx.store, hosts[0])
+            try:
+                r0.run("rm -f %s" % shlex.quote(probe), sudo=True)
+            finally:
+                r0.close()
+
+    has_entry = bool((rec.get("entry") or {}).get("host"))
+    live_members = [m for m in members if not m.get("down")]
+    detail = ["共享目录：%s" % sd,
+              "逐个实例处理：%s停止 → 把它原来的字体、驱动、地图、备份等合并进共享目录 → 写入 MR_SHARED_DIR → 启动并等就绪%s" % (
+                  "从入口摘下 → " if has_entry else "", " → 放回入口" if has_entry else ""),
+              "同名文件内容不同时保留修改时间较新的那份，并列出清单；原目录不删除",
+              "导出临时文件（temp/export）不迁移"]
+    if not has_entry and len(live_members) > 1:
+        detail.append("这个集群还没有入口：处理某个实例时，直接访问它的用户会短暂中断")
+    if len(live_members) <= 1:
+        detail.append("只有一个实例在服务：处理期间（约 1 分钟）系统不可用")
+    if not confirm("把 %d 个实例改用共享目录 %s？" % (len(todo), sd), True, detail=detail):
+        raise UserAbort()
+
+    migrated, all_conflicts = [], []
+    for i, (m, inst, sc) in enumerate(todo, 1):
+        mid = member_id(m)
+        label = "%s %s" % (m["host"], productName_(m["product"]))
+        step("（%d/%d）%s" % (i, len(todo), label))
+        took_down = False
+        if has_entry and not m.get("down") and len([x for x in _cluster(ctx, name)["instances"] if not x.get("down")]) > 1:
+            set_down(ctx, name, mid, True)
+            entry_apply(ctx, name, quiet=True)
+            took_down = True
+        r = open_host(ctx.store, m["host"])
+        try:
+            s = svc_functions(m["product"], inst["dir"], inst["owner"], inst["unit"], inst["profile"], start_env_of(inst))
+            r.run(s + "stop_svc && say 已停止\n", sudo=True, check=True, what="停止", timeout=300, on_line=_print_task_line)
+            out("合并到共享目录 …")
+            code, o, e = r.run(SHARED_MERGE_SH % {"dir": shlex.quote(inst["dir"]), "shared": shlex.quote(sd),
+                                                   "old": shlex.quote(sc["cur"] if sc["cur"] and sc["cur"].rstrip("/") != sd else ""),
+                                                   "owner": shlex.quote(inst["owner"] or "root"), "pairs": _shared_pairs()},
+                               sudo=True, timeout=3600)
+            mg = parse_shared_merge(o)
+            for w in mg["warns"]:
+                warn(w)
+            if code != 0 or mg["errors"]:
+                r.run(s + "start_svc\n", sudo=True, timeout=300, on_line=_print_task_line)
+                raise DeployError("合并到共享目录失败：%s" % ("；".join(mg["errors"]) or (e.strip() or o.strip())[-300:]),
+                                  "实例已按原配置重新启动（没有改 MR_SHARED_DIR）")
+            for n_, c_ in mg["merged"]:
+                ok("%s：%d 个文件" % (n_, c_))
+            if mg["conflicts"]:
+                warn("%d 个同名文件内容不同，保留了修改时间较新的那份：%s%s" % (
+                    len(mg["conflicts"]), "、".join(mg["conflicts"][:10]), " …" if len(mg["conflicts"]) > 10 else ""))
+                all_conflicts += ["%s：%s" % (label, c) for c in mg["conflicts"]]
+            seed = push_seed(r, seed_payload({"MR_SHARED_DIR": sd}, None))
+            r.run(seed_apply_script(seed, inst["dir"], inst["owner"] or "root"), sudo=True, check=True, what="写入 sight.env")
+            ok("已写入 sight.env：MR_SHARED_DIR=%s" % sd)
+            r.run(s + "start_svc && say 已启动\n", sudo=True, check=True, what="启动", timeout=300, on_line=_print_task_line)
+            if not wait_ready(r, inst["port"], None, ctx.settings["health_timeout"]):
+                show_logs(r, m["product"], inst["dir"], inst["unit"])
+                raise DeployError("%s 改用共享目录后没有就绪%s" % (label, "，没有放回入口" if took_down else ""),
+                                  "看上面的日志；常见原因：运行账号对共享目录没有写权限、共享目录属于另一个环境（.sight-cluster-id 不同）")
+            ok("已就绪")
+        finally:
+            r.close()
+        if took_down:
+            set_down(ctx, name, mid, False)
+            entry_apply(ctx, name, quiet=True)
+        migrated.append(mid)
+    _set_cluster_shared(ctx, name, sd)
+    ok("集群共享目录已设置为 %s；之后扩容的实例会自动使用它" % sd)
+    info("各实例原来的目录（data/fonts 等）没有删除，确认无误后可以手工清理")
+    return {"shared_dir": sd, "migrated": migrated, "conflicts": all_conflicts}
+
+
+def _set_cluster_shared(ctx, name, sd):
+    with ctx.store.lock:
+        c = (ctx.store.data.get("clusters") or {}).get(name)
+        if c is not None:
+            c["shared_dir"] = sd
+            ctx.store.save()
 
 
 def rolling_decision(rolling_from, versions):
@@ -7110,13 +7380,15 @@ JOB_HANDLERS = {
     "cluster_upgrade": job_cluster_upgrade,
     "cluster_redis_check": job_cluster_redis_check,
     "cluster_redis_install": job_cluster_redis_install,
+    "cluster_shared_dir": job_cluster_shared_dir,
 }
 JOB_TITLES = {"add_host": "添加服务器", "edit_host": "修改密码", "test_host": "测试连接", "status": "查询状态",
               "deploy": "安装 / 升级", "service": "启停服务", "logs": "查看日志", "follow_logs": "实时日志",
               "list_backups": "读取备份列表", "rollback": "回滚",
               "download_package": "下载安装包", "download_tool": "下载新版部署助手", "gateway_show": "查看移动网关接入信息",
               "cluster_status": "读取集群状态", "cluster_entry": "配置集群入口", "cluster_expand": "集群扩容",
-              "cluster_upgrade": "集群升级", "cluster_redis_check": "检查 Redis", "cluster_redis_install": "安装 Redis"}
+              "cluster_upgrade": "集群升级", "cluster_redis_check": "检查 Redis", "cluster_redis_install": "安装 Redis",
+              "cluster_shared_dir": "设置共享目录"}
 
 
 class Job:
